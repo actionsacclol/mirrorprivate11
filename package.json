@@ -103,6 +103,11 @@
   "build": {
     "appId": "cc.krypt.mirror",
     "productName": "Krypto Mirror",
+    "copyright": "Copyright © 2026 Krypt — krypt.cc",
+    "extraMetadata": {
+      "description": "Krypto Mirror — local-first Solana copy trading by Krypt"
+    },
+    "afterAllArtifactBuild": "scripts/after-artifact-checksums.cjs",
     "files": [
       "dist/**",
       "dist-electron/**",
@@ -132,6 +137,7 @@
         "nsis"
       ],
       "icon": "resources/krypt.ico",
+      "publisherName": "Krypt",
       "artifactName": "${productName}-Setup-${version}.${ext}"
     },
     "nsis": {

@@ -1,0 +1,279 @@
+// The IPC contract, checked at the source: what preload SENDS is what main
+// READS, in the same order.
+//
+// This exists because of a bug that shipped and sat unnoticed: preload sent
+// `(chain, label)` to `evm:wallet:generate` and main read `(label)`, so the
+// chain name became the wallet's label; `import` read the chain name as the
+// private key and always failed; `rename` and `remove` read it as the id and
+// always answered "No such wallet". Nothing typechecks an ipcRenderer.invoke
+// against its ipcMain.handle — the channel is a string and the arguments are
+// `unknown` — so the only thing that can catch a slot shift is a test that
+// reads both files and compares.
+//
+// It reads SOURCE, deliberately. A runtime harness would need Electron; this
+// needs a regex and runs in 10 ms, and the shape it checks is simple enough
+// that the regex is the honest tool.
+
+import assert from 'node:assert';
+import fs from 'node:fs';
+
+let passed = 0;
+const ok = (label) => {
+  console.log(`  ok   ${label}`);
+  passed += 1;
+};
+
+const preload = fs.readFileSync(new URL('../electron/preload.ts', import.meta.url), 'utf8');
+const ipc = fs.readFileSync(new URL('../electron/ipc.ts', import.meta.url), 'utf8');
+
+/** The positional arguments preload passes after the channel name. */
+function sent(channel) {
+  const re = new RegExp(`ipcRenderer\\.invoke\\('${channel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}'([^)]*)\\)`);
+  const m = re.exec(preload);
+  assert.ok(m, `preload invokes ${channel}`);
+  return m[1]
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    // `label ?? ''` is still the `label` slot.
+    .map((s) => s.replace(/\s*\?\?.*$/, ''));
+}
+
+/** The parameter names main's handler declares after the event. */
+function read(channel) {
+  const re = new RegExp(`ipcMain\\.handle\\('${channel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}',\\s*(?:async\\s*)?\\(([^)]*)\\)`);
+  const m = re.exec(ipc);
+  assert.ok(m, `main handles ${channel}`);
+  return m[1]
+    .split(',')
+    .map((s) => s.trim().split(':')[0].trim())
+    .filter((s) => s && s !== '_e' && s !== '_event' && s !== 'e');
+}
+
+const CHANNELS = {
+  // The five that were wrong, and the shape they must all share now.
+  'evm:wallet:generate': ['chain', 'label'],
+  'evm:wallet:import': ['chain', 'secret', 'label'],
+  'evm:wallet:select': ['chain', 'id'],
+  'evm:wallet:rename': ['chain', 'id', 'label'],
+  'evm:wallet:remove': ['chain', 'id'],
+  // Today's new ones, pinned before they can drift the same way.
+  'evm:sellAll': ['chain'],
+  'swap:balance': ['mint', 'chain'],
+  'swap:quote': ['raw'],
+  'swap:execute': ['raw', 'simulateOnly'],
+  'bridge:quote': ['raw'],
+  // quoteId since 2026-10-02: a send names the quote the page showed.
+  'bridge:send': ['raw', 'simulateOnly', 'quoteId'],
+  // The All-in-One wallet's move between chains (2026-10-01).
+  'aio:moveQuote': ['raw'],
+  'aio:moveSend': ['raw', 'simulateOnly', 'quoteId'],
+  // Buy anywhere (2026-10-02): one object each, quote id inside.
+  'aio:buyPlan': ['raw'],
+  'aio:buy': ['raw'],
+  'launch:upload': ['filePath', 'fields'],
+  'launch:preview': ['raw'],
+  'launch:send': ['raw'],
+  // $Krypto Mode (2026-09-25).
+  'kryptoMode:pause': ['id'],
+  'kryptoMode:resume': ['id'],
+  'kryptoMode:goLive': ['id'],
+  'kryptoMode:sellAll': ['id'],
+  'kryptoMode:withdraw': ['id'],
+  'kryptoMode:remove': ['id'],
+  'kryptoMode:setLimits': ['id', 'patch'],
+  'kryptoTrader:fit': ['mint', 'opts'],
+  'kryptoTrader:open': ['raw'],
+  'kryptoTrader:pause': ['id'],
+  'kryptoTrader:resume': ['id'],
+  'kryptoTrader:goLive': ['id'],
+  'kryptoTrader:sellAll': ['id'],
+  'kryptoTrader:setEnvelope': ['id', 'patch'],
+  'kryptoTrader:setLimits': ['id', 'patch'],
+  'kryptoTrader:remove': ['id'],
+  'kryptoTrader:reconcile': ['id'],
+  'kryptoTrader:adopt': ['id'],
+  // Profiles (2026-09-26). Ids only, never paths.
+  'profiles:list': [],
+  'profiles:create': ['name'],
+  'profiles:duplicate': ['name', 'copyWallets'],
+  'profiles:rename': ['id', 'name'],
+  'profiles:remove': ['id'],
+  'profiles:open': ['id'],
+  'profiles:shortcut': ['id'],
+  // The scorecard and the pre-registered test (2026-10-25).
+  'scout:scorecard': ['chain', 'sizeSol'],
+  'scout:preregSettle': ['week', 'force'],
+};
+
+for (const [channel, expected] of Object.entries(CHANNELS)) {
+  const s = sent(channel);
+  const r = read(channel);
+  assert.equal(s.length, r.length, `${channel}: preload sends ${s.length} argument(s) [${s}], main reads ${r.length} [${r}]`);
+  assert.equal(r.length, expected.length, `${channel}: main reads ${r.length}, expected ${expected.length} [${expected}]`);
+  // Names may differ between the two sides (preload says `draft`, main says
+  // `raw`); COUNT and the position of `chain` are what a slot shift breaks.
+  const sc = s.indexOf('chain');
+  const rc = r.indexOf('chain');
+  assert.equal(sc, rc, `${channel}: preload puts chain at ${sc}, main reads it at ${rc}`);
+  ok(`${channel} — ${s.length} argument(s), chain at ${sc === -1 ? 'n/a' : sc}, both sides agree`);
+}
+
+{
+  // Every handler that takes a chain must validate it with chainOf, so a
+  // string that is not a chain is refused rather than indexed.
+  for (const channel of Object.keys(CHANNELS).filter((c) => CHANNELS[c].includes('chain'))) {
+    const start = ipc.indexOf(`ipcMain.handle('${channel}'`);
+    const body = ipc.slice(start, start + 600);
+    // The Scout's chains are their own list (solana, evm…), checked against SCOUT_CHAINS.
+    assert.ok(/chainOf\(chain\)|=== 'robinhood' \|\| chain === 'bnb'|SCOUT_CHAINS\.includes\(chain as ScoutChain\)/.test(body), `${channel} validates its chain argument`);
+  }
+  ok('every chain-taking handler validates the chain before using it');
+}
+
+{
+  // The second way the two sides drift, and the one that actually shipped:
+  // main REBUILDS the renderer's object field by field ("the renderer's
+  // object is a claim"), and a field left out of that rebuild is silently
+  // dropped. It had happened three times before anyone went looking —
+  // `maxCopiesPerMinute` (fixed when a user noticed their rate limit did
+  // nothing), then `chain` on BOTH save handlers: a script written on the BNB
+  // tab was stored as a Solana script, and a copy config on an EVM chain was
+  // judged by Solana's address rules and refused a valid 0x leader, so
+  // following a leader on Robinhood or BNB was impossible from the form that
+  // offers it. `walletId` went the same way — the wallet picked to copy with
+  // fell back to the active signer.
+  //
+  // A field the renderer can set must be READ by the handler that rebuilds it.
+  const REBUILDERS = [
+    {
+      channel: 'automation:save',
+      until: 'automation:remove',
+      source: '../shared/automation.ts',
+      type: 'UserScript',
+      // Ids and timestamps are assigned by main, and arming a script is its
+      // own confirmed act (automation:setEnabled). `bundled` (a script that
+      // ships with the app) is set only by automation.seedBundled — the
+      // registry keeps it and never takes it from the window (2026-09-27).
+      ownedByMain: ['createdAt', 'updatedAt', 'enabled', 'bundled'],
+    },
+    {
+      channel: 'copy:save',
+      until: 'copy:remove',
+      source: '../shared/copytrade.ts',
+      type: 'CopyConfig',
+      // The engine's pause and the per-wallet stop's count start (2026-10-23)
+      // are set in main only — a renderer must not be able to clear a pause.
+      ownedByMain: ['createdAt', 'lossStopFrom', 'pausedReason', 'pausedAt'],
+    },
+    // The other three rebuilders. All complete when this was written
+    // (2026-09-18) - they are here so the NEXT field added to one of these
+    // types cannot be forgotten on the way across, which is the only way
+    // this bug has ever happened.
+    {
+      channel: 'templates:save',
+      until: 'templates:delete',
+      source: '../shared/orderTemplates.ts',
+      type: 'OrderTemplate',
+      ownedByMain: [],
+      chainless: true,
+    },
+    {
+      channel: 'orders:create',
+      until: 'orders:cancel',
+      source: '../shared/orders.ts',
+      type: 'NewOrderRequest',
+      ownedByMain: [],
+      chainless: true,
+    },
+    {
+      channel: 'alerts:create',
+      until: 'alerts:remove',
+      source: '../shared/alerts.ts',
+      type: 'NewAlertRequest',
+      ownedByMain: [],
+      chainless: true,
+    },
+  ];
+
+  for (const r of REBUILDERS) {
+    const src = fs.readFileSync(new URL(r.source, import.meta.url), 'utf8');
+    const at = src.indexOf(`export interface ${r.type} {`);
+    assert.ok(at > 0, `${r.source} declares ${r.type}`);
+    const iface = src.slice(at, src.indexOf('\n}', at));
+    const fields = [...iface.matchAll(/^\s{2}(\w+)\??:/gm)].map((m) => m[1]);
+    if (!r.chainless) {
+      assert.ok(fields.includes('chain'), `${r.type} has a chain field to check for`);
+    }
+    const start = ipc.indexOf(`ipcMain.handle('${r.channel}'`);
+    const end = ipc.indexOf(`ipcMain.handle('${r.until}'`);
+    assert.ok(start > 0 && end > start, `found the ${r.channel} handler body`);
+    const body = ipc.slice(start, end);
+    // Each handler names the incoming payload differently - `r`, `t`,
+    // `req`. Read the binding out of `const <name> = raw as ...` rather
+    // than assuming one, so this pin does not quietly stop checking a
+    // handler that renamed a local.
+    const bind = new RegExp('const (\\w+) = raw as').exec(body);
+    assert.ok(bind, `${r.channel} binds the raw payload to a local`);
+    const v = bind[1];
+    const owned = new Set(r.ownedByMain);
+    const checked = fields.filter((f) => !owned.has(f));
+    for (const f of checked) {
+      assert.ok(body.includes(`${v}.${f}`), `${r.channel} reads ${v}.${f} — a ${r.type} field it drops is a field the user silently loses`);
+    }
+    // Reading it is not enough: `chain` was read, validated, and then left out
+    // of the object that was actually saved.
+    if (!r.chainless) {
+      assert.ok(/\n\s+chain[,:]/.test(body), `${r.channel} puts the chain INTO the object it saves, not just into a local`);
+    }
+    ok(`${r.channel} rebuilds every user-set ${r.type} field (${checked.length} of them)${r.chainless ? '' : ' and saves the chain'}`);
+  }
+}
+
+{
+  // The third way the two sides drift, and the one that shipped most
+  // recently: a channel main ANSWERS that preload never EXPOSES. Nothing
+  // typechecks it — global.d.ts is written by hand, and a renderer call to
+  // an entry preload lacks throws a TypeError, which any try/catch around an
+  // IPC call swallows. 'krypto:holding' lived that way for three days: the
+  // fee waiver worked in main while the Hub card told a holder their wallets
+  // were "not checked yet" (2026-09-19).
+  const handled = [...ipc.matchAll(/ipcMain\.handle\('([^']+)'/g)].map((m) => m[1]);
+  const invoked = [...preload.matchAll(/ipcRenderer\.invoke\('([^']+)'/g)].map((m) => m[1]);
+  const handledSet = new Set(handled);
+  const invokedSet = new Set(invoked);
+  // Handlers nothing in the renderer calls. An entry here is a claim that
+  // the handler is DEAD, not that the gap is fine — remove the handler or
+  // add the bridge, and take it off this list either way.
+  const UNCALLED = ['recorder:usage'];
+  const unreachable = handled.filter((c) => !invokedSet.has(c) && !UNCALLED.includes(c));
+  assert.deepEqual(unreachable, [], `main handles ${unreachable.join(', ')} but preload never invokes it — the renderer cannot reach it`);
+  for (const c of UNCALLED) {
+    assert.ok(handledSet.has(c) && !invokedSet.has(c), `${c} is no longer an uncalled handler — take it off UNCALLED`);
+  }
+  const unhandled = invoked.filter((c) => !handledSet.has(c));
+  assert.deepEqual(unhandled, [], `preload invokes ${unhandled.join(', ')} but main never handles it`);
+  ok(`every handled channel is reachable from preload and every invoked one is handled (${handled.length} channels, ${UNCALLED.length} known dead)`);
+}
+
+// T29 (Krypto Trader): every TraderOptions field survives IPC. The open
+// handler hands the raw object to the module, whose traderOptionsOf rebuilds
+// it field by field — so that function must read r.<field> for every field
+// of the type, and nothing else may build the options.
+{
+  const src = fs.readFileSync(new URL('../shared/kryptoTrader.ts', import.meta.url), 'utf8');
+  const at = src.indexOf('export interface TraderOptions {');
+  const fields = [...src.slice(at, src.indexOf('\n}', at)).matchAll(/^\s{2}(\w+)\??:/gm)].map((m) => m[1]);
+  assert.ok(fields.length >= 14, `found the TraderOptions fields (${fields.length})`);
+  const fn = src.slice(src.indexOf('export function traderOptionsOf('), src.indexOf('export function traderOptionProblems('));
+  for (const f of fields) assert.ok(fn.includes(`r.${f}`), `traderOptionsOf reads r.${f} — a field it drops is one the user silently loses`);
+  const start = ipc.indexOf("ipcMain.handle('kryptoTrader:open'");
+  const body = ipc.slice(start, ipc.indexOf("ipcMain.handle('kryptoTrader:pause'"));
+  assert.ok(body.includes('kryptoTrader.open(raw)'), 'the open handler passes the raw payload to the module');
+  const eng = fs.readFileSync(new URL('../electron/engine/kryptoTrader.ts', import.meta.url), 'utf8');
+  const open = eng.slice(eng.indexOf('export async function open('), eng.indexOf('// ─── controls'));
+  assert.ok(open.includes('traderOptionsOf(raw)'), 'and open() builds the options from traderOptionsOf alone');
+  ok(`kryptoTrader:open keeps every TraderOptions field (${fields.length}) — T29`);
+}
+
+console.log(`\nipccontract: ${passed}/${passed} passed`);

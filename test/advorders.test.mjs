@@ -1,0 +1,573 @@
+// Advanced-order state machine tests.
+//
+// This module signs real transactions, so the properties below are the ones
+// that decide whether a bug costs money:
+//
+//   • an order leaves `armed` at most once (no double sell);
+//   • a met condition that CANNOT execute does not consume the order
+//     (protection is not silently spent);
+//   • a restart brings orders back paused, never armed;
+//   • a trailing stop never triggers on the same tick that sets a new peak;
+//   • a market-cap trigger never falls back to comparing a SOL price.
+
+import assert from 'node:assert';
+import * as ord from './.advorders.mjs';
+import { validateOrder, triggerPriceSol, describeOrder } from './.ordersshared.mjs';
+
+// The runner AWAITS every case and runs them one at a time. Most of these
+// tests are async and they all share this module's global order list, so a
+// fire-and-forget runner would both interleave state between cases and let
+// failed assertions escape as unhandled rejections — which is exactly what
+// it did on the first run here, printing "22 passed" over a real failure.
+let passed = 0;
+const cases = [];
+const test = (name, fn) => {
+  cases.push({ name, fn });
+};
+
+async function run() {
+  for (const c of cases) {
+    try {
+      await c.fn();
+      console.log(`ok  ${c.name}`);
+      passed++;
+    } catch (err) {
+      console.log(`FAIL ${c.name}\n     ${err.message}`);
+      process.exitCode = 1;
+    }
+  }
+  console.log(`advorders: ${passed}/${cases.length} tests passed`);
+}
+
+const MINT = 'OrderMint111111111111111111111111111111111';
+/** The wallet the test host signs with. Orders are bound to it at creation:
+ *  an order written on another wallet sells another bag. */
+const WALLET = 'WalletAAA1111111111111111111111111111111111';
+
+/** A host that records what it was asked to do. */
+function makeHost(over = {}) {
+  const calls = { buys: [], sells: [], toasts: [], logs: [], changed: 0 };
+  return {
+    calls,
+    host: {
+      buy: async (mint, sol) => {
+        calls.buys.push({ mint, sol });
+        return over.buyResult ?? { ok: true, message: 'bought', signature: 'sigbuy' };
+      },
+      sell: async (mint, percent) => {
+        calls.sells.push({ mint, percent });
+        return over.sellResult ?? { ok: true, message: 'sold', signature: 'sigsell' };
+      },
+      blockedReason: () => over.blockedReason ?? null,
+      owner: () => (over.owner === undefined ? WALLET : over.owner),
+      buyBlockedReason: () => over.buyBlockedReason ?? null,
+      maxLiveSol: () => over.maxLiveSol ?? 1,
+      log: (level, line) => calls.logs.push({ level, line }),
+      toast: (level, message) => calls.toasts.push({ level, message }),
+      changed: () => { calls.changed++; },
+    },
+  };
+}
+
+function setup(over = {}) {
+  ord._reset();
+  const h = makeHost(over);
+  ord.attach(h.host);
+  return h;
+}
+
+const mk = (kind, triggerValue, opts = {}) =>
+  ord.create(
+    {
+      mint: MINT,
+      symbol: 'TEST',
+      kind,
+      triggerValue,
+      triggerBasis: opts.basis ?? (['take_profit', 'stop_loss', 'trailing_stop'].includes(kind) ? 'pct' : 'price_sol'),
+      amount: opts.amount ?? (kind === 'limit_buy' || kind === 'buy_on_migration' ? 0.1 : 50),
+    },
+    { referencePriceSol: opts.ref ?? 0.001 },
+  );
+
+// ── Validation ────────────────────────────────────────────────────────
+
+test('validation rejects impossible orders', () => {
+  const base = { mint: MINT, symbol: 'T', triggerBasis: 'pct', amount: 50 };
+  assert.equal(validateOrder({ ...base, kind: 'stop_loss', triggerValue: 0 }).ok, false);
+  assert.equal(validateOrder({ ...base, kind: 'stop_loss', triggerValue: 100 }).ok, false);
+  assert.equal(validateOrder({ ...base, kind: 'take_profit', triggerValue: -5 }).ok, false);
+  assert.equal(validateOrder({ ...base, kind: 'trailing_stop', triggerValue: 150 }).ok, false);
+  assert.equal(validateOrder({ ...base, kind: 'stop_loss', triggerValue: null }).ok, false);
+  assert.equal(validateOrder({ ...base, kind: 'stop_loss', triggerValue: 30, amount: 0 }).ok, false);
+  assert.equal(validateOrder({ ...base, kind: 'stop_loss', triggerValue: 30, amount: 101 }).ok, false);
+  assert.equal(validateOrder({ ...base, kind: 'stop_loss', triggerValue: 30 }).ok, true);
+});
+
+test('conditional orders need no trigger value', () => {
+  const r = validateOrder({ mint: MINT, symbol: 'T', kind: 'sell_on_dev_sell', triggerValue: null, triggerBasis: 'pct', amount: 100 });
+  assert.equal(r.ok, true);
+});
+
+test('a percentage order cannot be created without a reference price', () => {
+  setup();
+  const r = ord.create(
+    { mint: MINT, symbol: 'T', kind: 'stop_loss', triggerValue: 30, triggerBasis: 'pct', amount: 100 },
+    { referencePriceSol: null },
+  );
+  assert.equal(r.ok, false, 'should refuse — it would sit armed forever and never fire');
+});
+
+test('a buy over the per-trade cap is refused at creation', () => {
+  setup({ maxLiveSol: 0.05 });
+  const r = mk('limit_buy', 0.0005, { amount: 0.5 });
+  assert.equal(r.ok, false);
+  assert.match(r.message, /cap/i);
+});
+
+// ── Triggering ────────────────────────────────────────────────────────
+
+test('stop loss fires below the reference, not above', async () => {
+  const h = setup();
+  mk('stop_loss', 30, { ref: 0.001, amount: 100 });
+  ord.onTick({ mint: MINT, priceSol: 0.0008, mcapUsd: null }); // −20%, no
+  assert.equal(h.calls.sells.length, 0);
+  ord.onTick({ mint: MINT, priceSol: 0.0007, mcapUsd: null }); // −30%, yes
+  await new Promise((r) => setImmediate(r));
+  assert.equal(h.calls.sells.length, 1);
+  assert.equal(h.calls.sells[0].percent, 100);
+});
+
+test('take profit fires above the reference', async () => {
+  const h = setup();
+  mk('take_profit', 50, { ref: 0.001, amount: 25 });
+  ord.onTick({ mint: MINT, priceSol: 0.0014, mcapUsd: null });
+  assert.equal(h.calls.sells.length, 0);
+  ord.onTick({ mint: MINT, priceSol: 0.0015, mcapUsd: null });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(h.calls.sells.length, 1);
+  assert.equal(h.calls.sells[0].percent, 25);
+});
+
+test('an order fires AT MOST ONCE even under a burst of ticks', async () => {
+  const h = setup();
+  mk('stop_loss', 20, { ref: 0.001, amount: 100 });
+  for (let i = 0; i < 50; i++) ord.onTick({ mint: MINT, priceSol: 0.0005, mcapUsd: null });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(h.calls.sells.length, 1, 'a 50-tick burst must produce exactly one sell');
+  assert.equal(ord.all()[0].state, 'filled');
+});
+
+test('trailing stop tracks the peak and never fires on the tick that sets it', async () => {
+  const h = setup();
+  mk('trailing_stop', 20, { ref: 0.001, amount: 100 });
+  ord.onTick({ mint: MINT, priceSol: 0.002, mcapUsd: null }); // new peak
+  ord.onTick({ mint: MINT, priceSol: 0.004, mcapUsd: null }); // new peak
+  assert.equal(h.calls.sells.length, 0);
+  assert.equal(ord.all()[0].peakPriceSol, 0.004);
+  ord.onTick({ mint: MINT, priceSol: 0.0033, mcapUsd: null }); // −17.5% from peak
+  assert.equal(h.calls.sells.length, 0);
+  ord.onTick({ mint: MINT, priceSol: 0.0032, mcapUsd: null }); // −20% from peak
+  await new Promise((r) => setImmediate(r));
+  assert.equal(h.calls.sells.length, 1);
+});
+
+test('a market-cap trigger never falls back to the SOL price', async () => {
+  const h = setup();
+  // 60000 USD target. The SOL price (0.001) is far BELOW that number, so a
+  // buggy fallback comparing price to trigger would fire a limit_sell never,
+  // and a limit_buy instantly. Assert the limit_buy does not fire.
+  mk('limit_buy', 60_000, { basis: 'mcap_usd', amount: 0.1 });
+  for (let i = 0; i < 5; i++) ord.onTick({ mint: MINT, priceSol: 0.001, mcapUsd: null });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(h.calls.buys.length, 0, 'no market cap means no market-cap decision');
+  ord.onTick({ mint: MINT, priceSol: 0.001, mcapUsd: 55_000 });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(h.calls.buys.length, 1);
+});
+
+test('conditional orders fire on the event, with no usable price', async () => {
+  const h = setup();
+  ord.create(
+    { mint: MINT, symbol: 'T', kind: 'sell_on_dev_sell', triggerValue: null, triggerBasis: 'pct', amount: 100 },
+    { referencePriceSol: null },
+  );
+  ord.onTick({ mint: MINT, priceSol: 0, mcapUsd: null }); // nothing observed
+  assert.equal(h.calls.sells.length, 0);
+  ord.onTick({ mint: MINT, priceSol: 0, mcapUsd: null, creatorSold: true });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(h.calls.sells.length, 1, 'a migration/dev-sell event must not need a price');
+});
+
+test('orders for other mints are untouched', async () => {
+  const h = setup();
+  mk('stop_loss', 20, { ref: 0.001, amount: 100 });
+  ord.onTick({ mint: 'OtherMint11111111111111111111111111111111', priceSol: 0.0000001, mcapUsd: null });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(h.calls.sells.length, 0);
+});
+
+// ── The money-critical property ───────────────────────────────────────
+
+test('a met condition that CANNOT execute does not consume the order', async () => {
+  const h = setup({ blockedReason: 'live execution is off in settings' });
+  mk('stop_loss', 20, { ref: 0.001, amount: 100 });
+  ord.onTick({ mint: MINT, priceSol: 0.0005, mcapUsd: null });
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(h.calls.sells.length, 0, 'nothing should have been sold');
+  const o = ord.all()[0];
+  assert.equal(o.state, 'armed', 'the order MUST still be armed — the user still expects protection');
+  assert.match(o.note, /NOT executed/);
+  assert.ok(h.calls.toasts.some((t) => t.level === 'warn'), 'the user must be told, loudly');
+});
+
+test('once unblocked, the still-armed order fires', async () => {
+  const over = { blockedReason: 'the engine is not armed' };
+  ord._reset();
+  const calls = { sells: [], toasts: [] };
+  ord.attach({
+    buy: async () => ({ ok: true, message: 'ok' }),
+    sell: async (mint, percent) => { calls.sells.push({ mint, percent }); return { ok: true, message: 'sold', signature: 's' }; },
+    blockedReason: () => over.blockedReason,
+    buyBlockedReason: () => null,
+    maxLiveSol: () => 1,
+    log: () => {},
+    toast: (level, message) => calls.toasts.push({ level, message }),
+    changed: () => {},
+  });
+  mk('stop_loss', 20, { ref: 0.001, amount: 100 });
+
+  ord.onTick({ mint: MINT, priceSol: 0.0005, mcapUsd: null });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(calls.sells.length, 0);
+
+  over.blockedReason = null; // user turns live execution on
+  ord.onTick({ mint: MINT, priceSol: 0.0005, mcapUsd: null });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(calls.sells.length, 1, 'protection resumes the moment it can');
+});
+
+test('a breaker blocks a BUY but never a SELL', async () => {
+  // A circuit breaker that stops someone closing a position turns a stop
+  // loss into a trap, so buyBlockedReason applies to buys only.
+  const h = setup({ buyBlockedReason: 'entries are paused (loss limit)' });
+  mk('stop_loss', 20, { ref: 0.001, amount: 100 });
+  mk('limit_buy', 0.0005, { amount: 0.1 });
+
+  ord.onTick({ mint: MINT, priceSol: 0.0005, mcapUsd: null });
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(h.calls.sells.length, 1, 'the sell must go through');
+  assert.equal(h.calls.buys.length, 0, 'the buy must be refused');
+  const buy = ord.all().find((o) => o.kind === 'limit_buy');
+  assert.equal(buy.state, 'failed');
+  assert.match(buy.note, /entries are paused/);
+});
+
+test('a failed execution is NOT retried', async () => {
+  const h = setup({ sellResult: { ok: false, message: 'relayer rejected trade' } });
+  mk('stop_loss', 20, { ref: 0.001, amount: 100 });
+  for (let i = 0; i < 20; i++) ord.onTick({ mint: MINT, priceSol: 0.0005, mcapUsd: null });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(h.calls.sells.length, 1, 'exactly one attempt — a retry against unknown state double-spends');
+  assert.equal(ord.all()[0].state, 'failed');
+});
+
+// Rate-limit swarm 2026-09-06: a refusal BEFORE broadcast by a rate limit
+// has no post-broadcast state to double-spend against, so the order goes
+// back to armed (bounded) instead of dying with the stop-loss still needed.
+test('a rate-limited refusal before broadcast re-arms the order', async () => {
+  const h = setup({ sellResult: { ok: false, message: 'Simulation call failed: RPC HTTP 429' } });
+  mk('stop_loss', 20, { ref: 0.001, amount: 100 });
+  ord.onTick({ mint: MINT, priceSol: 0.0005, mcapUsd: null });
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(h.calls.sells.length, 1);
+  const o = ord.all()[0];
+  assert.equal(o.state, 'armed', 'nothing was broadcast, so the order is armed again');
+  assert.match(o.note, /rate limited/);
+  assert.ok(h.calls.toasts.some((t) => t.level === 'warn' && /rate limited/.test(t.message)), 'the user is told');
+  ord.onTick({ mint: MINT, priceSol: 0.0005, mcapUsd: null });
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(h.calls.sells.length, 2, 'the next tick fires it again');
+});
+
+test('re-arming after rate limits is bounded, then the order fails with the reason', async () => {
+  const h = setup({ sellResult: { ok: false, message: 'jupiter: quote: jupiter: rate limited (429) — pausing 20s' } });
+  mk('stop_loss', 20, { ref: 0.001, amount: 100 });
+  for (let i = 0; i < 8; i++) {
+    ord.onTick({ mint: MINT, priceSol: 0.0005, mcapUsd: null });
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  assert.equal(h.calls.sells.length, 6, 'five re-arms, then the sixth failure is final');
+  const o = ord.all()[0];
+  assert.equal(o.state, 'failed');
+  assert.match(o.note, /rate limited/);
+});
+
+// A signature means something was broadcast: a 429 seen AFTER that (a
+// status poll, say) must never re-arm — §5 applies in full.
+test('a rate-limited failure WITH a signature is never re-armed', async () => {
+  const h = setup({ sellResult: { ok: false, message: 'confirm: RPC HTTP 429', signature: 'sigX' } });
+  mk('stop_loss', 20, { ref: 0.001, amount: 100 });
+  for (let i = 0; i < 5; i++) {
+    ord.onTick({ mint: MINT, priceSol: 0.0005, mcapUsd: null });
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  assert.equal(h.calls.sells.length, 1);
+  assert.equal(ord.all()[0].state, 'failed');
+});
+
+// ── Lifecycle ─────────────────────────────────────────────────────────
+
+test('cancel stops an armed order from firing', async () => {
+  const h = setup();
+  const r = mk('stop_loss', 20, { ref: 0.001, amount: 100 });
+  ord.cancel(r.order.id);
+  ord.onTick({ mint: MINT, priceSol: 0.0000001, mcapUsd: null });
+  await new Promise((r2) => setImmediate(r2));
+  assert.equal(h.calls.sells.length, 0);
+  assert.equal(ord.all()[0].state, 'cancelled');
+});
+
+test('an expired order does not fire', async () => {
+  const h = setup();
+  ord.create(
+    { mint: MINT, symbol: 'T', kind: 'stop_loss', triggerValue: 20, triggerBasis: 'pct', amount: 100, expiresAt: Date.now() - 1000 },
+    { referencePriceSol: 0.001 },
+  );
+  ord.onTick({ mint: MINT, priceSol: 0.0000001, mcapUsd: null });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(h.calls.sells.length, 0);
+  assert.equal(ord.all()[0].state, 'expired');
+});
+
+test('restored orders come back PAUSED and do not evaluate', async () => {
+  const h = setup();
+  ord._load([
+    { id: 'a', mint: MINT, symbol: 'T', kind: 'stop_loss', state: 'paused', triggerValue: 20,
+      triggerBasis: 'pct', amount: 100, referencePriceSol: 0.001, peakPriceSol: null, owner: WALLET,
+      createdAt: 1, updatedAt: 1, triggeredAt: null, note: null, signature: null, expiresAt: null },
+  ]);
+  ord.onTick({ mint: MINT, priceSol: 0.0000001, mcapUsd: null });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(h.calls.sells.length, 0, 'a paused order must never fire on its own');
+  assert.equal(ord.pausedCount(), 1);
+});
+
+test('resume re-arms paused orders and resets a stale trailing peak', async () => {
+  const h = setup();
+  ord._load([
+    { id: 'a', mint: MINT, symbol: 'T', kind: 'trailing_stop', state: 'paused', triggerValue: 20,
+      triggerBasis: 'pct', amount: 100, referencePriceSol: 0.001, peakPriceSol: 0.05, owner: WALLET,
+      createdAt: 1, updatedAt: 1, triggeredAt: null, note: null, signature: null, expiresAt: null },
+  ]);
+  ord.resumePaused();
+  const o = ord.all()[0];
+  assert.equal(o.state, 'armed');
+  // The peak is CLEARED, not reset to the reference. The reference was
+  // captured when the order was written and says nothing about the price
+  // now: a token that fell 80% while the app was closed would resume with a
+  // reference far above the market and sell on the first tick. An empty peak
+  // adopts the first price actually observed.
+  assert.equal(o.peakPriceSol, null, 'a peak from an unobserved window is not knowledge');
+  ord.onTick({ mint: MINT, priceSol: 0.001, mcapUsd: null });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(h.calls.sells.length, 0, 'resuming must not immediately dump the position');
+});
+
+test('a trailing stop resumed after a crash does not sell into the drop it slept through', async () => {
+  const h = setup();
+  ord._load([
+    { id: 'a', mint: MINT, symbol: 'T', kind: 'trailing_stop', state: 'paused', triggerValue: 20,
+      triggerBasis: 'pct', amount: 100, referencePriceSol: 0.001, peakPriceSol: 0.001, owner: WALLET,
+      createdAt: 1, updatedAt: 1, triggeredAt: null, note: null, signature: null, expiresAt: null },
+  ]);
+  ord.resumePaused();
+  // The market fell 80% while the app was closed. A 20% trailing stop
+  // measured from the stale 0.001 is instantly satisfied — but the app never
+  // saw that peak, so it has no business calling this a 20% drawdown.
+  ord.onTick({ mint: MINT, priceSol: 0.0002, mcapUsd: null });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(h.calls.sells.length, 0, 'the first tick after a resume sets the peak, it does not trigger');
+  assert.equal(ord.all()[0].peakPriceSol, 0.0002, 'the peak is what we actually saw');
+  ord.onTick({ mint: MINT, priceSol: 0.00016, mcapUsd: null }); // −20% from the OBSERVED peak
+  await new Promise((r) => setImmediate(r));
+  assert.equal(h.calls.sells.length, 1, 'once it has a real peak it protects normally');
+});
+
+test('an order pauses when the active wallet is not the one it was written on', async () => {
+  const h = setup({ owner: 'WalletBBB2222222222222222222222222222222222' });
+  ord._load([
+    { id: 'a', mint: MINT, symbol: 'T', kind: 'stop_loss', state: 'armed', triggerValue: 20,
+      triggerBasis: 'pct', amount: 100, referencePriceSol: 0.001, peakPriceSol: null, owner: WALLET,
+      createdAt: 1, updatedAt: 1, triggeredAt: null, note: null, signature: null, expiresAt: null },
+  ]);
+  ord.onTick({ mint: MINT, priceSol: 0.0005, mcapUsd: null });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(h.calls.sells.length, 0, 'it would have sold the bag in another wallet');
+  assert.equal(ord.all()[0].state, 'paused');
+  assert.match(ord.all()[0].note, /different wallet/);
+});
+
+test('an order with no recorded wallet pauses rather than guessing', async () => {
+  const h = setup();
+  ord._load([
+    { id: 'a', mint: MINT, symbol: 'T', kind: 'stop_loss', state: 'armed', triggerValue: 20,
+      triggerBasis: 'pct', amount: 100, referencePriceSol: 0.001, peakPriceSol: null, owner: null,
+      createdAt: 1, updatedAt: 1, triggeredAt: null, note: null, signature: null, expiresAt: null },
+  ]);
+  ord.onTick({ mint: MINT, priceSol: 0.0005, mcapUsd: null });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(h.calls.sells.length, 0);
+  assert.equal(ord.all()[0].state, 'paused', 'an order written before wallets were recorded fails closed');
+});
+
+test('resume leaves an order written on another wallet paused', () => {
+  setup({ owner: 'WalletBBB2222222222222222222222222222222222' });
+  ord._load([
+    { id: 'a', mint: MINT, symbol: 'T', kind: 'stop_loss', state: 'paused', triggerValue: 20,
+      triggerBasis: 'pct', amount: 100, referencePriceSol: 0.001, peakPriceSol: null, owner: WALLET,
+      createdAt: 1, updatedAt: 1, triggeredAt: null, note: null, signature: null, expiresAt: null },
+  ]);
+  const r = ord.resumePaused();
+  assert.equal(r.resumed, 0, 'nothing was re-armed');
+  assert.equal(ord.all()[0].state, 'paused', 'it would only pause again on the next tick');
+  assert.match(r.message, /check/i, 'the count says some orders still need the user');
+});
+
+test('an order paused mid-execution reads as interrupted; a plain restart pause does not', () => {
+  // Scripts re-place restart-paused orders from bot.orders(); the one that
+  // was executing when the app stopped may have landed and must be told apart.
+  const base = { mint: MINT, symbol: 'T', kind: 'take_profit', triggerValue: 100, triggerBasis: 'pct', amount: 50,
+    referencePriceSol: 0.001, peakPriceSol: null, owner: WALLET, createdAt: 1, updatedAt: 1, triggeredAt: null, signature: null, expiresAt: null };
+  assert.equal(ord.wasInterrupted({ ...base, state: 'paused', note: 'The app closed while this order was executing. Check your wallet before resuming.' }), true);
+  assert.equal(ord.wasInterrupted({ ...base, state: 'paused', note: 'Paused when the app restarted — review and resume.' }), false);
+  assert.equal(ord.wasInterrupted({ ...base, state: 'filled', note: 'The app closed while this order was executing. Check your wallet before resuming.' }), false);
+});
+
+test('two rungs on one mint do not both size off the same balance', async () => {
+  // ordertemplates pins that a take-profit ladder sells a share of what is
+  // LEFT (40 then 50). Both rungs size off a balance read at build time, so
+  // a tick that satisfies both would sell 40% + 50% of the SAME bag — 90%
+  // where the ladder meant 70%, and at 50/50/100 the whole position. One
+  // sell per mint at a time; the other stays armed for the next tick.
+  const h = setup();
+  mk('take_profit', 40, { ref: 0.001, amount: 40 });
+  mk('take_profit', 100, { ref: 0.001, amount: 50 });
+
+  ord.onTick({ mint: MINT, priceSol: 0.0025, mcapUsd: null }); // +150%: both are satisfied
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(h.calls.sells.length, 1, 'only one sell may be in flight against a position');
+  const states = ord.all().map((o) => o.state).sort();
+  assert.deepEqual(states, ['armed', 'filled'], 'the rung that did not fire is still protecting, not spent');
+
+  ord.onTick({ mint: MINT, priceSol: 0.0025, mcapUsd: null }); // the next tick, nothing in flight
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+  assert.equal(h.calls.sells.length, 2, 'the second rung fires once the first is done');
+});
+
+test('a filled 100% stop expires the take-profit rungs it left behind', async () => {
+  // 09-24: a stop sold KIM and MEMELESS, and their 2x/4x rungs stayed ARMED
+  // for hours on coins nobody held — a rug never reaches 2x, so the rungs
+  // never fired, never hit the empty-bag check, and piled up toward the cap.
+  const h = setup();
+  const stop = mk('stop_loss', 60, { ref: 0.001, amount: 100 });
+  mk('take_profit', 100, { ref: 0.001, amount: 50 });
+  mk('take_profit', 300, { ref: 0.001, amount: 50 });
+  mk('limit_buy', 0.0001, { amount: 0.1 });
+  assert.ok(stop.ok);
+
+  ord.onTick({ mint: MINT, priceSol: 0.0003, mcapUsd: null }); // −70%: the stop fires
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+
+  const by = (k) => ord.all().filter((o) => o.kind === k).map((o) => o.state);
+  assert.deepEqual(by('stop_loss'), ['filled']);
+  assert.deepEqual(by('take_profit'), ['expired', 'expired'], 'the rungs are closed with the position');
+  assert.match(ord.all().find((o) => o.kind === 'take_profit').note, /Position closed/);
+  assert.equal(h.calls.buys.length, 0);
+  assert.notEqual(by('limit_buy')[0], 'expired', 'a limit buy is a new position, not this one');
+});
+
+test('a partial or unconfirmed sell leaves the other rungs armed', async () => {
+  // 50% leaves a bag the other rung still protects.
+  let h = setup();
+  mk('take_profit', 100, { ref: 0.001, amount: 50 });
+  mk('stop_loss', 60, { ref: 0.001, amount: 100 });
+  ord.onTick({ mint: MINT, priceSol: 0.0021, mcapUsd: null });
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(ord.all().map((o) => o.state).sort(), ['armed', 'filled']);
+
+  // A 100% sell that was broadcast but not confirmed may not have landed —
+  // stripping the position's other orders then would leave it naked.
+  h = setup({ sellResult: { ok: false, pending: true, message: 'unconfirmed', signature: 'sigpending' } });
+  mk('stop_loss', 60, { ref: 0.001, amount: 100 });
+  mk('take_profit', 100, { ref: 0.001, amount: 50 });
+  ord.onTick({ mint: MINT, priceSol: 0.0003, mcapUsd: null });
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+  assert.equal(ord.all().find((o) => o.kind === 'take_profit').state, 'armed');
+});
+
+test('closing one wallet\'s position leaves another wallet\'s orders alone', async () => {
+  const h = setup();
+  mk('stop_loss', 60, { ref: 0.001, amount: 100 });
+  mk('take_profit', 100, { ref: 0.001, amount: 50 });
+  // The rung was written on a different wallet (rule 7) — it is not this
+  // position's, so closing this one says nothing about that bag.
+  ord._load(ord.all().map((o) => (o.kind === 'take_profit' ? { ...o, owner: 'WalletBBB1111111111111111111111111111111111' } : o)));
+  ord.onTick({ mint: MINT, priceSol: 0.0003, mcapUsd: null });
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+  assert.equal(h.calls.sells.length, 1);
+  assert.notEqual(ord.all().find((o) => o.kind === 'take_profit').state, 'expired');
+});
+
+test('an order that was mid-flight at shutdown is NOT auto-resumed', () => {
+  setup();
+  ord._load([
+    { id: 'a', mint: MINT, symbol: 'T', kind: 'stop_loss', state: 'paused', triggerValue: 20,
+      triggerBasis: 'pct', amount: 100, referencePriceSol: 0.001, peakPriceSol: null, owner: WALLET,
+      createdAt: 1, updatedAt: 1, triggeredAt: 2,
+      note: 'The app closed while this order was executing. Check your wallet before resuming.',
+      signature: null, expiresAt: null },
+  ]);
+  ord.resumePaused();
+  assert.equal(ord.all()[0].state, 'paused', 'the tx may already have landed — a human must check');
+});
+
+// ── Display helpers ───────────────────────────────────────────────────
+
+test('triggerPriceSol resolves the chart line for each kind', () => {
+  const base = { mint: MINT, symbol: 'T', amount: 100, referencePriceSol: 0.001, peakPriceSol: null,
+    createdAt: 1, updatedAt: 1, triggeredAt: null, note: null, signature: null, expiresAt: null, state: 'armed', id: 'x' };
+  assert.equal(triggerPriceSol({ ...base, kind: 'limit_sell', triggerBasis: 'price_sol', triggerValue: 0.002 }), 0.002);
+  assert.equal(triggerPriceSol({ ...base, kind: 'take_profit', triggerBasis: 'pct', triggerValue: 50 }), 0.0015);
+  assert.ok(Math.abs(triggerPriceSol({ ...base, kind: 'stop_loss', triggerBasis: 'pct', triggerValue: 30 }) - 0.0007) < 1e-12);
+  assert.equal(triggerPriceSol({ ...base, kind: 'trailing_stop', triggerBasis: 'pct', triggerValue: 20, peakPriceSol: 0.004 }), 0.0032);
+  assert.equal(triggerPriceSol({ ...base, kind: 'sell_on_dev_sell', triggerBasis: 'pct', triggerValue: null }), null);
+  assert.equal(triggerPriceSol({ ...base, kind: 'limit_buy', triggerBasis: 'mcap_usd', triggerValue: 50000 }), null);
+});
+
+test('describeOrder says what will happen for every kind', () => {
+  const base = { mint: MINT, symbol: 'T', referencePriceSol: 0.001, peakPriceSol: null,
+    createdAt: 1, updatedAt: 1, triggeredAt: null, note: null, signature: null, expiresAt: null, state: 'armed', id: 'x' };
+  const cases = [
+    [{ ...base, kind: 'limit_buy', triggerBasis: 'mcap_usd', triggerValue: 50000, amount: 0.5 }, /Buy 0\.5 SOL at or below \$50,000 market cap/],
+    [{ ...base, kind: 'limit_sell', triggerBasis: 'price_sol', triggerValue: 0.002, amount: 50 }, /Sell 50% at or above 0\.002 SOL/],
+    [{ ...base, kind: 'take_profit', triggerBasis: 'pct', triggerValue: 100, amount: 25 }, /Sell 25% at \+100%/],
+    [{ ...base, kind: 'stop_loss', triggerBasis: 'pct', triggerValue: 20, amount: 100 }, /Sell 100% at .20%/],
+    [{ ...base, kind: 'trailing_stop', triggerBasis: 'pct', triggerValue: 15, amount: 100 }, /falls 15% from its peak/],
+    [{ ...base, kind: 'sell_on_dev_sell', triggerBasis: 'pct', triggerValue: null, amount: 100 }, /if the creator sells/],
+    [{ ...base, kind: 'sell_on_migration', triggerBasis: 'pct', triggerValue: null, amount: 100 }, /when it migrates/],
+    [{ ...base, kind: 'buy_on_migration', triggerBasis: 'pct', triggerValue: null, amount: 0.2 }, /Buy 0\.2 SOL when it migrates/],
+  ];
+  for (const [o, re] of cases) assert.match(describeOrder(o), re, o.kind);
+});
+
+await run();

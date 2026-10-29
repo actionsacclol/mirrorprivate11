@@ -1,0 +1,41 @@
+WEBVTT
+
+1
+00:00:00.967 --> 00:00:09.989
+Krypto Mirror runs with no keys at all. Keys make it faster and unlock a little more data. Every key lives in one place: Settings, under API keys.
+
+2
+00:00:10.694 --> 00:00:18.004
+Helius first. It is the biggest speed upgrade: trades are heard sooner and copies land faster, and the free plan is enough.
+
+3
+00:00:18.726 --> 00:00:28.113
+Get a free key at helius.dev: create an account, open the dashboard, and copy the API key. You can paste the key itself or the whole RPC URL.
+
+4
+00:00:28.820 --> 00:00:33.152
+Paste it here and save. The app shows only the last four characters afterwards.
+
+5
+00:00:35.800 --> 00:00:41.589
+Check the key asks Helius directly and tells you whether it works. The key goes to Helius and nowhere else.
+
+6
+00:00:42.407 --> 00:00:49.365
+The meter under it tracks this month’s credits and the share the app may spend on chain reads. The free plan gives a million a month.
+
+7
+00:00:50.067 --> 00:01:01.523
+Jupiter is free too. A key moves every quote off lite-api.jup.ag, which Jupiter is retiring, onto api.jup.ag. Make one at portal.jup.ag.
+
+8
+00:01:02.244 --> 00:01:08.605
+Birdeye is optional: sub-minute price candles, holder lists and trade history. Everything else works without it.
+
+9
+00:01:09.371 --> 00:01:16.753
+GIPHY and Tenor only matter for callout GIFs on pump.fun. Alchemy, for Robinhood Chain, is set under EVM chains.
+
+10
+00:01:19.516 --> 00:01:26.422
+Keys are stored on this machine only, never sent to Krypt, and stripped from recordings. Replace or remove one any time.

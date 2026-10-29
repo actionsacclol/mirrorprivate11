@@ -1,0 +1,393 @@
+// Settings persistence — guidelines §5.8/§5.9: userData only, atomic
+// writes, and ALWAYS merge loaded JSON over defaults (old saves lack new
+// fields; never trust persisted JSON even though we wrote it).
+
+import { app } from 'electron';
+import fs from 'node:fs';
+import path from 'node:path';
+import { DEFAULT_SETTINGS, SETTINGS_REVISION, type AppSettings } from '@shared/types';
+import { isLocaleId } from '@shared/i18n';
+import { isAioSpeed } from '@shared/aioSpeed';
+import { isSkinId, isThemeId } from '@shared/theme';
+import { webhookUrlProblem } from '@shared/webhook';
+import { logger } from './logger';
+
+let cached: AppSettings | null = null;
+
+/**
+ * One-time safety migration for saves written before a default was corrected.
+ *
+ * mergeState() merges persisted values OVER defaults — correct for not losing
+ * user choices, but it means a dangerous default that ships fixed never
+ * reaches anyone who already has the old value on disk. Three flags were
+ * default-ON and should not have been (2026-08-16 product swarm §8); each is
+ * forced off exactly once, then the revision stamp stops it re-firing so the
+ * user can turn any of them back on and have it stick.
+ *
+ * Returns true if anything changed (the caller persists).
+ */
+function migrateUnsafe(s: AppSettings, fromRevision: number): boolean {
+  if (fromRevision >= SETTINGS_REVISION) return false;
+
+  if (fromRevision < 2) {
+    // Market-dumped EVERY SPL token in the wallet — not just this session's
+    // positions — on the ordinary Stop button, at up to 15% slippage.
+    s.execution.autoSellOnExit = false;
+    // Decides which accounts a SIGNED instruction touches, with no golden
+    // fixtures. Opt in from the Execution page once that coverage exists.
+    s.execution.localTxBuild = false;
+    // Outbound connection publishing engine state, against a "No telemetry"
+    // promise in the README.
+    s.discordRpcEnabled = false;
+  }
+
+  if (fromRevision < 3) {
+    // The live breakers shipped ON (2 losses / 0.03 SOL) from the sniper
+    // era and flipped a manual trader to Paper after two ordinary losing
+    // trades (2026-08-29). Only the OLD DEFAULTS are turned off — a user who
+    // chose their own numbers keeps them.
+    if (s.execution.maxLiveConsecutiveLosses === 2) s.execution.maxLiveConsecutiveLosses = 0;
+    if (s.execution.maxLiveSessionLossSol === 0.03) s.execution.maxLiveSessionLossSol = 0;
+  }
+
+  if (fromRevision < 4) {
+    // Revision 2 turned the local builder OFF "until coverage exists". It
+    // does now: the derived layout is pinned against real landed trades
+    // (test/fixtures/pump-derived-layout.json) and every local build is
+    // simulated before signing with the relayer as fallback. Local is the
+    // fast path — one batched account read instead of a third-party HTTP
+    // build (~400 ms measured) — and pays no relayer fee, so it is on for
+    // everyone (2026-09-01, user's call).
+    s.execution.localTxBuild = true;
+  }
+
+  if (fromRevision < 5) {
+    // Runner alerts replace paper auto-entry (2026-09-02). A saved strategy
+    // from before has neither field; fill both with the defaults.
+    if (!s.strategy.runnerAlerts) s.strategy.runnerAlerts = { ...DEFAULT_SETTINGS.strategy.runnerAlerts };
+    if (typeof s.strategy.paperEntries !== 'boolean') s.strategy.paperEntries = false;
+  }
+
+  if (fromRevision < 6) {
+    // Discord Rich Presence is ON by default from 3.0.0, and revision 2 had
+    // explicitly turned it OFF for everyone. Leaving that alone would mean the
+    // feature is "on by default" for new installs only and silently off for
+    // every existing user — the worst of both.
+    //
+    // It publishes to the Discord client on this machine and nothing reaches
+    // us; the privacy policy says so in those words, and TERMS_VERSION moves
+    // with this change so the sentence a user accepted still matches what the
+    // software does. The switch is in Settings and turning it off is one click.
+    s.discordRpcEnabled = true;
+  }
+
+  if (fromRevision < 7) {
+    // 5.4.0 (2026-09-27): onboarding runs once more for every existing
+    // install, so the keys step's new Jupiter field — and the auto-swap and
+    // scripting changes the ready screen points at — reach people who set
+    // up on an older build. The flow is safe to replay: the legal gate is
+    // skipped when the terms are already accepted, the referral field is
+    // prefilled from the saved answer and left alone when untouched, and
+    // every other step is "skip or save". The stamp stops it re-firing.
+    s.onboarded = false;
+  }
+  if (fromRevision < 8) {
+    // 2026-10-28: Krypto Mirror's AI connection moves off Krypto Bot's port.
+    // The fork saved 8787 as its default, so with both apps installed the
+    // second to switch on never listened. Only a connection that was never
+    // switched on is moved — a port someone chose and uses stays theirs.
+    if (s.mcp && !s.mcp.enabled && s.mcp.port === 8787) s.mcp = { ...s.mcp, port: 8797 };
+  }
+
+  s.settingsRevision = SETTINGS_REVISION;
+  return true;
+}
+
+function file(): string {
+  return path.join(app.getPath('userData'), 'settings.json');
+}
+
+function mergeState(loaded: Partial<AppSettings> | null): AppSettings {
+  const d = DEFAULT_SETTINGS;
+  if (!loaded || typeof loaded !== 'object') return structuredClone(d);
+  // `evm` was FLAT for one day (2026-09-08: enabled/rpcUrl/apiKey at the top
+  // level, Robinhood only). The per-chain split on 09-09 would otherwise read
+  // a flat save as "no Robinhood block" and hand the user an empty Alchemy
+  // key while their real one sat in a field nothing reads. Lift, then drop.
+  function mergeEvm(saved: unknown): AppSettings['evm'] {
+    const e = (saved && typeof saved === 'object' ? (saved as Record<string, unknown>) : {}) as Partial<AppSettings['evm']> & { enabled?: unknown; rpcUrl?: unknown; apiKey?: unknown };
+    const flat = !e.robinhood && (typeof e.rpcUrl === 'string' || typeof e.apiKey === 'string' || typeof e.enabled === 'boolean');
+    const lifted = flat
+      ? {
+          enabled: typeof e.enabled === 'boolean' ? e.enabled : d.evm.robinhood.enabled,
+          rpcUrl: typeof e.rpcUrl === 'string' ? e.rpcUrl : d.evm.robinhood.rpcUrl,
+          apiKey: typeof e.apiKey === 'string' ? e.apiKey : d.evm.robinhood.apiKey,
+        }
+      : {};
+    const merged = {
+      ...d.evm,
+      ...e,
+      // `runnerAlerts` is merged a level deeper than the rest: a settings
+      // file written before the filters existed has no such key at all, and
+      // one written by a half-finished save could have some of it. Either way
+      // the missing fields come from the defaults rather than from undefined.
+      robinhood: { ...d.evm.robinhood, ...lifted, ...(e.robinhood ?? {}), runnerAlerts: { ...d.evm.robinhood.runnerAlerts, ...(e.robinhood?.runnerAlerts ?? {}) } },
+      bnb: { ...d.evm.bnb, ...(e.bnb ?? {}), runnerAlerts: { ...d.evm.bnb.runnerAlerts, ...(e.bnb?.runnerAlerts ?? {}) } },
+    } as AppSettings['evm'] & { enabled?: unknown; rpcUrl?: unknown; apiKey?: unknown };
+    delete merged.enabled;
+    delete merged.rpcUrl;
+    delete merged.apiKey;
+    return merged;
+  }
+  // execHttpUrl is DERIVED by resolveRpc() and embeds the API key — if a
+  // resolved rpc object ever reaches this boundary, drop it so the key is
+  // stored once (its own field) and never duplicated into settings.json.
+  const rpc = { ...d.rpc, ...(loaded.rpc ?? {}) };
+  delete rpc.execHttpUrl;
+  // The Helius feed socket is derived too (key + heliusFeedSocket, appended
+  // by resolveRpc). A resolved copy that reached the store — every RPC save
+  // until 2026-09-08 — is dropped here, and duplicates with it.
+  rpc.extraWssUrls = [
+    ...new Set((rpc.extraWssUrls ?? []).filter((u) => typeof u === 'string' && !/helius-rpc\.com/i.test(u) && !/api-key=/i.test(u))),
+  ];
+  // `autoLive` (autonomous real trading) was removed 2026-08-16. Drop it from
+  // old saves so it never round-trips back into settings.json.
+  const execution = { ...d.execution, ...(loaded.execution ?? {}) } as AppSettings['execution'] & { autoLive?: boolean };
+  delete execution.autoLive;
+  // `data.providers` is itself a map, so a plain one-level spread would let
+  // a save written before a provider existed drop that provider's default.
+  const data = {
+    ...d.data,
+    ...(loaded.data ?? {}),
+    providers: { ...d.data.providers, ...(loaded.data?.providers ?? {}) },
+  };
+  // Hotkey bindings are a LIST, so a plain merge would keep a stale saved
+  // array forever. Saved bindings win where the id still exists; new default
+  // bindings are appended so a future release can add one.
+  const savedBindings = loaded.hotkeys?.bindings ?? [];
+  const hotkeys = {
+    ...d.hotkeys,
+    ...(loaded.hotkeys ?? {}),
+    bindings: d.hotkeys.bindings.map((def) => savedBindings.find((b) => b.id === def.id) ?? def),
+  };
+  return {
+    settingsRevision: loaded.settingsRevision ?? 0,
+    // A save written before languages existed has no locale; 'system' is the
+    // default and asks the OS, so an upgrading user gets their own language
+    // rather than being pinned to English by the absence of a field.
+    locale: isLocaleId(loaded.locale) ? loaded.locale : d.locale,
+    // Same shape as the locale: a save from before themes existed, or one
+    // carrying a theme this build does not ship, falls back to the default
+    // rather than leaving <html> with an attribute no CSS block matches.
+    theme: isThemeId(loaded.theme) ? loaded.theme : d.theme,
+    // And the look: a save from before looks existed renders Classic, which
+    // is exactly what it looked like when it was saved.
+    skin: isSkinId(loaded.skin) ? loaded.skin : d.skin,
+    alerts: { ...d.alerts, ...(loaded.alerts ?? {}) },
+    hotkeys,
+    // Merged per bot so a saved token and owner survive, while a newly added
+    // field picks up its default rather than reading as undefined.
+    bots: {
+      telegram: { ...d.bots.telegram, ...(loaded.bots?.telegram ?? {}) },
+      discord: { ...d.bots.discord, ...(loaded.bots?.discord ?? {}) },
+      // A save written before chat trading existed gets the safe default
+      // (everything off) rather than undefined.
+      trading: { ...d.bots.trading, ...(loaded.bots?.trading ?? {}) },
+    },
+    // The AI connection. A save from before it existed gets the shipped
+    // default — off, read-only, no token — rather than undefined, and the
+    // budget is merged field by field so a later field added to it does not
+    // arrive missing on an upgrading install.
+    mcp: {
+      ...d.mcp,
+      ...(loaded.mcp ?? {}),
+      budget: { ...d.mcp.budget, ...(loaded.mcp?.budget ?? {}) },
+    },
+    rpc,
+    strategy: {
+      ...d.strategy,
+      ...(loaded.strategy ?? {}),
+      runnerAlerts: { ...d.strategy.runnerAlerts, ...(loaded.strategy?.runnerAlerts ?? {}) },
+    },
+    execution,
+    data,
+    ai: { ...d.ai, ...(loaded.ai ?? {}) },
+    // A save written before the EVM rail existed has no block, and one
+    // written before BNB has no `bnb`; every field picks up its default
+    // rather than reading as undefined. Per-chain blocks merge one level
+    // deeper so a saved Robinhood key survives a new BNB default.
+    evm: mergeEvm(loaded.evm),
+    referrer: typeof loaded.referrer === 'string' ? loaded.referrer : d.referrer,
+    onboarded: loaded.onboarded ?? d.onboarded,
+    // Read field by field rather than spread: a stored acceptance carrying a
+    // stale `version` must survive to BE compared, and fail the comparison,
+    // rather than being replaced by the default and looking like a fresh one.
+    multiWallet: {
+      acceptedAt: typeof loaded.multiWallet?.acceptedAt === 'number' ? loaded.multiWallet.acceptedAt : 0,
+      version: typeof loaded.multiWallet?.version === 'string' ? loaded.multiWallet.version : '',
+    },
+    autoCallout: {
+      // Absent = the default (on, with Krypto Mirror's lines — shared/calloutAuto.ts);
+      // a saved choice either way is kept.
+      enabled: typeof loaded.autoCallout?.enabled === 'boolean' ? loaded.autoCallout.enabled : d.autoCallout.enabled,
+      text: typeof loaded.autoCallout?.text === 'string' ? loaded.autoCallout.text : d.autoCallout.text,
+      minBuySol: typeof loaded.autoCallout?.minBuySol === 'number' ? loaded.autoCallout.minBuySol : 0,
+      // On unless switched off: a settings file from before 09-22 has no key.
+      likeOwn: loaded.autoCallout?.likeOwn !== false,
+      // A hand-edited file cannot aim this anywhere but Discord.
+      discordWebhookUrl:
+        typeof loaded.autoCallout?.discordWebhookUrl === 'string' && !webhookUrlProblem(loaded.autoCallout.discordWebhookUrl)
+          ? loaded.autoCallout.discordWebhookUrl.trim()
+          : '',
+      onLaunch: loaded.autoCallout?.onLaunch !== false,
+      launchMinUsd:
+        typeof loaded.autoCallout?.launchMinUsd === 'number' && loaded.autoCallout.launchMinUsd >= 0 ? loaded.autoCallout.launchMinUsd : 2,
+    },
+    watchOnBuy: loaded.watchOnBuy ?? d.watchOnBuy,
+    recorderEnabled: loaded.recorderEnabled ?? d.recorderEnabled,
+    scannersAutoStart: loaded.scannersAutoStart ?? d.scannersAutoStart,
+    launch: {
+      // Both fields fail CLOSED: an unreadable or half-written launch block
+      // leaves the launcher off, never on.
+      enabled: typeof loaded.launch?.enabled === 'boolean' ? loaded.launch.enabled : d.launch.enabled,
+      walletId: typeof loaded.launch?.walletId === 'string' ? loaded.launch.walletId : d.launch.walletId,
+      evmWalletId: typeof loaded.launch?.evmWalletId === 'string' ? loaded.launch.evmWalletId : d.launch.evmWalletId,
+    },
+    // Fails CLOSED like the launcher's: a half-written or unreadable block
+    // leaves bridging off, never on.
+    bridge: {
+      enabled: typeof loaded.bridge?.enabled === 'boolean' ? loaded.bridge.enabled : d.bridge.enabled,
+    },
+    // The float fails CLOSED like the bridge: a half-written block never
+    // starts moving money in the background.
+    aio: {
+      speed: isAioSpeed(loaded.aio?.speed) ? loaded.aio.speed : d.aio.speed,
+      floatEnabled: loaded.aio?.floatEnabled === true,
+      floatUsd:
+        typeof loaded.aio?.floatUsd === 'number' && Number.isFinite(loaded.aio.floatUsd) && loaded.aio.floatUsd >= 5 && loaded.aio.floatUsd <= 1_000
+          ? loaded.aio.floatUsd
+          : d.aio.floatUsd,
+    },
+    reduceEffects: loaded.reduceEffects ?? d.reduceEffects,
+    hardwareAcceleration: loaded.hardwareAcceleration ?? d.hardwareAcceleration,
+    recorderDir: loaded.recorderDir ?? d.recorderDir,
+    recorderMaxGb: typeof loaded.recorderMaxGb === 'number' ? loaded.recorderMaxGb : d.recorderMaxGb,
+    recordFirehose: loaded.recordFirehose ?? d.recordFirehose,
+    shadowDipBuy: loaded.shadowDipBuy ?? d.shadowDipBuy,
+    shadowStratLab: loaded.shadowStratLab ?? d.shadowStratLab,
+    shadowMigration: loaded.shadowMigration ?? d.shadowMigration,
+    // Always off in Krypto Mirror: Rich Presence publishes the engine's state
+    // under Krypto Bot's own Discord identity, and this app has no switch
+    // for it.
+    discordRpcEnabled: false,
+    autoStartEngine: loaded.autoStartEngine ?? d.autoStartEngine,
+    shadowMode: true, // v1 invariant — not user-flippable
+  };
+}
+
+/**
+ * Set when settings.json exists but could not be read or parsed. Falling
+ * back to defaults and writing them out would silently discard the user's
+ * RPC keys, limits and preferences, so while this is set the store serves
+ * defaults for THIS session and refuses to persist over the file.
+ */
+let loadFailure: string | null = null;
+
+/** Why settings are not being saved right now, or null when healthy. */
+export function failure(): string | null {
+  return loadFailure;
+}
+
+export function load(): AppSettings {
+  if (cached) return cached;
+  let migrated = false;
+  let text: string | null = null;
+  try {
+    text = fs.readFileSync(file(), 'utf8');
+    loadFailure = null;
+  } catch (e) {
+    // Absent is a normal first run; anything else is a read failure.
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
+      loadFailure = `${file()} could not be read (${(e as Error).message}) — your saved settings are still in it, so this session runs on defaults without overwriting them`;
+      logger.error(`settings: ${loadFailure}`);
+    }
+  }
+  if (text !== null) {
+    try {
+      const raw = JSON.parse(text) as Partial<AppSettings>;
+      const merged = mergeState(raw);
+      migrated = migrateUnsafe(merged, merged.settingsRevision);
+      cached = merged;
+    } catch (e) {
+      loadFailure = `${file()} is corrupt (${(e as Error).message}) — this session runs on defaults and will not overwrite it`;
+      logger.error(`settings: ${loadFailure}`);
+    }
+  }
+  if (!cached) {
+    cached = mergeState(null);
+    cached.settingsRevision = SETTINGS_REVISION;
+  }
+  // Persist the migration immediately: a crash before the next update() would
+  // otherwise re-apply it and silently undo a deliberate re-enable.
+  if (migrated) persist(cached);
+  return cached;
+}
+
+function persist(s: AppSettings): void {
+  // A file we could not read is a file we must not overwrite.
+  if (loadFailure) {
+    logger.warn(`settings: not saving — ${loadFailure}`);
+    return;
+  }
+  try {
+    const f = file();
+    const tmp = `${f}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(s, null, 2), 'utf8');
+    fs.renameSync(tmp, f);
+  } catch {
+    /* best-effort persistence; memory state is authoritative this session */
+  }
+}
+
+export function update(patch: Partial<AppSettings>): AppSettings {
+  const cur = load();
+  const next: AppSettings = mergeState({
+    ...cur,
+    ...patch,
+    rpc: { ...cur.rpc, ...(patch.rpc ?? {}) },
+    strategy: { ...cur.strategy, ...(patch.strategy ?? {}) },
+    execution: { ...cur.execution, ...(patch.execution ?? {}) },
+    data: {
+      ...cur.data,
+      ...(patch.data ?? {}),
+      providers: { ...cur.data.providers, ...(patch.data?.providers ?? {}) },
+    },
+    alerts: { ...cur.alerts, ...(patch.alerts ?? {}) },
+    // Field by field: a patch naming only the speed must not reset the float.
+    aio: { ...cur.aio, ...(patch.aio ?? {}) },
+    evm: {
+      ...cur.evm,
+      ...(patch.evm ?? {}),
+      robinhood: {
+        ...cur.evm.robinhood,
+        ...(patch.evm?.robinhood ?? {}),
+        runnerAlerts: { ...cur.evm.robinhood.runnerAlerts, ...(patch.evm?.robinhood?.runnerAlerts ?? {}) },
+      },
+      bnb: {
+        ...cur.evm.bnb,
+        ...(patch.evm?.bnb ?? {}),
+        runnerAlerts: { ...cur.evm.bnb.runnerAlerts, ...(patch.evm?.bnb?.runnerAlerts ?? {}) },
+      },
+    },
+    hotkeys: {
+      ...cur.hotkeys,
+      ...(patch.hotkeys ?? {}),
+      // A bindings patch REPLACES the list — the editor always sends the
+      // whole set, and merging by index would corrupt a reorder.
+      bindings: patch.hotkeys?.bindings ?? cur.hotkeys.bindings,
+    },
+  });
+  cached = next;
+  persist(next);
+  return next;
+}

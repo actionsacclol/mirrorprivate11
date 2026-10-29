@@ -1,0 +1,118 @@
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import App from './App';
+import { ToastProvider } from './state/ToastProvider';
+import { ModalProvider } from './state/ModalProvider';
+import { AppStateProvider } from './state/AppStateProvider';
+import { TerminalProvider } from './state/TerminalProvider';
+import { ErrorBoundary } from './components/ErrorBoundary';
+import { LiteMotion } from './components/LiteModeHost';
+import { initLite } from './state/liteMode';
+import { initTheme } from './state/theme';
+import { initSkin } from './state/skin';
+import { initAppearance } from './state/appearance';
+
+// Self-hosted fonts (2026-08-16): no remote font request, ever — a Google
+// fonts link would hand an IP and a timestamp to Google on every launch.
+// Krypto Mirror's look (2026-10-22) is Inter for text and headings and
+// JetBrains Mono for addresses. Latin subsets, the weights the UI sets.
+import '@fontsource/inter/latin-400.css';
+import '@fontsource/inter/latin-500.css';
+import '@fontsource/inter/latin-600.css';
+import '@fontsource/inter/latin-700.css';
+import '@fontsource/jetbrains-mono/latin-400.css';
+import '@fontsource/jetbrains-mono/latin-500.css';
+
+import './index.css';
+
+// A link or file dropped on the window must never navigate it (2026-10-23):
+// Chromium's default for a drop is to open what was dropped in this window,
+// the one carrying window.krypt. Drop zones that take files read them in
+// their own React handlers before this runs; this only cancels the browser's
+// default, it does not stop the event.
+window.addEventListener('dragover', (e) => e.preventDefault());
+window.addEventListener('drop', (e) => e.preventDefault());
+
+// Errors that escape React entirely (event handlers, timers, un-awaited
+// promises) do not reach the boundary. Log them so they show up in the
+// console page rather than vanishing; never throw from here.
+//
+// Logged as ONE string with the stack in it: main copies console errors into
+// app.log, and an Error object passed as a second argument arrived there as
+// "Error" with no stack, which made a user's report unreadable (2026-09-23).
+const described = (x: unknown): string =>
+  x instanceof Error ? (x.stack ?? `${x.name}: ${x.message}`) : typeof x === 'string' ? x : (() => {
+    try {
+      return JSON.stringify(x);
+    } catch {
+      return String(x);
+    }
+  })();
+window.addEventListener('error', (e) => {
+  // eslint-disable-next-line no-console
+  console.error(`[ui] uncaught ${described(e.error ?? e.message)}`);
+});
+window.addEventListener('unhandledrejection', (e) => {
+  // eslint-disable-next-line no-console
+  console.error(`[ui] unhandled rejection ${described(e.reason)}`);
+});
+
+// The preload exposes window.krypt before any page script runs. When it is
+// missing, this window loaded while the bridge file was not readable —
+// which is what a rebuild under a running unpackaged app does: the window
+// reloads, the preload is mid-write, and the first `window.krypt.engine`
+// read throws "Cannot read properties of undefined". The file is normally
+// back within a second, so retry once quietly before saying anything, and
+// never mount React without a bridge.
+if (!window.krypt) {
+  const root = document.getElementById('root')!;
+  const KEY = 'krypt.bridgeRetryAt';
+  const last = Number(sessionStorage.getItem(KEY) ?? 0);
+  const retriedJustNow = Date.now() - last < 10_000;
+  if (!retriedJustNow) {
+    sessionStorage.setItem(KEY, String(Date.now()));
+    setTimeout(() => window.location.reload(), 1_200);
+  } else {
+    root.innerHTML = `
+      <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:#07060d;color:#e8e6f0;font-family:system-ui,sans-serif">
+        <div style="max-width:34rem;padding:2rem;border:1px solid rgba(255,255,255,.12);border-radius:12px;background:rgba(255,255,255,.03)">
+          <div style="font-size:11px;letter-spacing:.36em;color:#c4b5fd">BRIDGE NOT LOADED</div>
+          <h2 style="margin:.4rem 0 .6rem;font-size:18px;font-weight:600">The interface cannot reach the app</h2>
+          <p style="font-size:13px;line-height:1.6;color:#b8b4c8">The preload script that connects this window to the engine did not load, so nothing on screen could talk to it. The engine itself is unaffected and still running.</p>
+          <p style="font-size:13px;line-height:1.6;color:#b8b4c8">This happens when the app's files are rebuilt while it is running. Reloading usually fixes it; if it does not, restart the app.</p>
+          <button id="krypt-reload" style="margin-top:1rem;padding:.55rem 1.1rem;border-radius:8px;border:0;background:#7c5cf6;color:#fff;font-size:13px;font-weight:600;cursor:pointer">Reload interface</button>
+        </div>
+      </div>`;
+    document.getElementById('krypt-reload')?.addEventListener('click', () => {
+      sessionStorage.removeItem(KEY);
+      window.location.reload();
+    });
+  }
+  throw new Error('window.krypt is missing — the preload did not load');
+}
+// A clean boot clears the retry mark so a later failure gets its own quiet retry.
+sessionStorage.removeItem('krypt.bridgeRetryAt');
+
+// Lite mode's class goes on <html> BEFORE React mounts, from this machine's
+// mirror of the setting — a lite user should not see one animated boot per
+// launch while settings are still on their way over IPC.
+initLite();
+initTheme();
+initSkin();
+initAppearance();
+
+ReactDOM.createRoot(document.getElementById('root')!).render(
+  <React.StrictMode>
+    <ErrorBoundary>
+      <ToastProvider>
+        <ModalProvider>
+          <AppStateProvider>
+            <TerminalProvider>
+              <LiteMotion><App /></LiteMotion>
+            </TerminalProvider>
+          </AppStateProvider>
+        </ModalProvider>
+      </ToastProvider>
+    </ErrorBoundary>
+  </React.StrictMode>,
+);

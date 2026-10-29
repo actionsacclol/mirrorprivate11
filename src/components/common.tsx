@@ -1,0 +1,596 @@
+import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
+import { cls } from '../utils/format';
+import { Check, Copy } from 'lucide-react';
+
+/**
+ * Set when a page is shown as a TAB of another (Activity › Positions,
+ * Settings › Legal …, 2026-10-22): the host already carries the title, so
+ * the page shows only its line of explanation and its actions.
+ */
+export const PageEmbedded = createContext(false);
+
+export function Page({
+  title,
+  subtitle,
+  actions,
+  children,
+}: {
+  title: string;
+  subtitle?: string;
+  actions?: ReactNode;
+  children: ReactNode;
+}) {
+  const embedded = useContext(PageEmbedded);
+  return (
+    <div className="flex flex-col h-full">
+      <div className="flex-1 overflow-auto">
+        {embedded ? (
+          (subtitle || actions) && (
+            <div className="mx-auto w-full max-w-[1240px] px-8 pt-5 pb-4 flex items-center justify-between gap-4">
+              {subtitle ? <p className="max-w-3xl text-note text-krypt-muted">{subtitle}</p> : <span />}
+              {actions && <div className="flex items-center gap-2">{actions}</div>}
+            </div>
+          )
+        ) : (
+          <div className="mx-auto w-full max-w-[1240px] px-8 pt-8 pb-5 flex items-end justify-between gap-4">
+            <div className="min-w-0">
+              <h1 className="text-[26px] font-semibold tracking-display text-white">{title}</h1>
+              {subtitle && <p className="mt-1 max-w-3xl text-[14px] text-krypt-muted">{subtitle}</p>}
+            </div>
+            {actions && <div className="flex items-center gap-2">{actions}</div>}
+          </div>
+        )}
+        <div className={cls('mx-auto w-full max-w-[1240px] px-8 pb-10', embedded && !subtitle && !actions && 'pt-5')}>{children}</div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * A page with tabs (2026-10-22): one title, a tab row, and the body below it
+ * scrolling on its own. Activity, Wallet and Settings are built on it.
+ */
+export function TabbedPage<T extends string>({
+  title,
+  subtitle,
+  tabs,
+  value,
+  onChange,
+  actions,
+  children,
+}: {
+  title: string;
+  subtitle?: string;
+  tabs: Array<{ value: T; label: ReactNode }>;
+  value: T;
+  onChange: (v: T) => void;
+  actions?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <div className="flex h-full flex-col">
+      <div className="shrink-0 border-b border-white/8">
+        <div className="mx-auto w-full max-w-[1240px] px-8 pt-8">
+          <div className="flex items-end justify-between gap-4">
+            <div className="min-w-0">
+              <h1 className="text-[26px] font-semibold tracking-display text-white">{title}</h1>
+              {subtitle && <p className="mt-1 max-w-3xl text-[14px] text-krypt-muted">{subtitle}</p>}
+            </div>
+            {actions && <div className="flex items-center gap-2">{actions}</div>}
+          </div>
+          <div className="mt-5 flex gap-6" role="tablist">
+            {tabs.map((t) => (
+              <button
+                key={t.value}
+                role="tab"
+                aria-selected={t.value === value}
+                data-testid={`tab-${t.value}`}
+                onClick={() => onChange(t.value)}
+                className={cls(
+                  '-mb-px border-b-2 pb-2.5 text-[14px] font-medium transition',
+                  t.value === value ? 'border-accent text-white' : 'border-transparent text-krypt-muted hover:text-white',
+                )}
+              >
+                {t.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+      <div className="min-h-0 flex-1">
+        <PageEmbedded.Provider value={true}>{children}</PageEmbedded.Provider>
+      </div>
+    </div>
+  );
+}
+
+export function Section({
+  title,
+  description,
+  actions,
+  children,
+}: {
+  title?: string;
+  description?: string;
+  actions?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <section className="mb-8">
+      {(title || actions) && (
+        <div className="flex items-end justify-between gap-4 mb-3">
+          <div className="min-w-0 flex-1">
+            {title && (
+              <h2 className="text-[16px] font-semibold text-white">{title}</h2>
+            )}
+            {description && <p className="text-note text-krypt-muted mt-0.5 [overflow-wrap:anywhere]">{description}</p>}
+          </div>
+          {actions && <div className="flex items-center gap-2 flex-shrink-0">{actions}</div>}
+        </div>
+      )}
+      {children}
+    </section>
+  );
+}
+
+export function Card({
+  className,
+  children,
+  hoverable,
+  padded = true,
+}: {
+  className?: string;
+  children: ReactNode;
+  hoverable?: boolean;
+  padded?: boolean;
+}) {
+  return (
+    <div
+      className={cls(
+        'plate rounded-xl',
+        padded && 'p-5',
+        hoverable && 'transition hover:!border-white/20',
+        className,
+      )}
+    >
+      {children}
+    </div>
+  );
+}
+
+export function PrimaryButton({
+  onClick,
+  disabled,
+  children,
+  className,
+  type = 'button',
+}: {
+  onClick?: () => void;
+  disabled?: boolean;
+  children: ReactNode;
+  className?: string;
+  type?: 'button' | 'submit';
+}) {
+  return (
+    <button
+      type={type}
+      onClick={onClick}
+      disabled={disabled}
+      className={cls(
+        'inline-flex items-center justify-center gap-2 rounded-lg bg-accent px-4 py-2.5 text-sm font-semibold text-[#fff] transition',
+        'hover:brightness-110 active:scale-[0.98]',
+        'disabled:cursor-not-allowed disabled:opacity-45',
+        className,
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
+export function GhostButton({
+  onClick,
+  disabled,
+  children,
+  className,
+  destructive,
+}: {
+  onClick?: () => void;
+  disabled?: boolean;
+  children: ReactNode;
+  className?: string;
+  destructive?: boolean;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className={cls(
+        'inline-flex items-center justify-center gap-2 rounded-lg border px-4 py-2.5 text-sm font-medium transition',
+        destructive
+          ? 'border-down/40 bg-down/10 text-down hover:bg-down/15'
+          : 'border-white/10 bg-raised text-white hover:border-white/20',
+        'disabled:cursor-not-allowed disabled:opacity-50',
+        className,
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
+export function IconButton({
+  onClick,
+  title,
+  children,
+  active,
+  destructive,
+  disabled,
+}: {
+  onClick?: () => void;
+  title?: string;
+  children: ReactNode;
+  active?: boolean;
+  destructive?: boolean;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      title={title}
+      disabled={disabled}
+      className={cls(
+        'h-9 w-9 rounded-lg border flex items-center justify-center transition',
+        active
+          ? 'border-accent/50 bg-accent/15 text-white'
+          : destructive
+            ? 'border-down/30 bg-down/10 text-down hover:bg-down/15'
+            : 'border-white/10 bg-raised text-krypt-muted hover:text-white hover:border-white/20',
+        'disabled:cursor-not-allowed disabled:opacity-40',
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
+export function Switch({
+  checked,
+  onChange,
+  label,
+  description,
+  disabled,
+}: {
+  checked: boolean;
+  onChange: (next: boolean) => void;
+  label: string;
+  description?: string;
+  disabled?: boolean;
+}) {
+  return (
+    <label
+      className={cls(
+        'flex items-start justify-between gap-4 rounded-xl border border-white/10 bg-black/20 px-4 py-3 cursor-pointer transition',
+        disabled ? 'opacity-50 cursor-not-allowed' : 'hover:bg-white/5 hover:border-white/20',
+      )}
+    >
+      <div>
+        <div className="text-sm font-semibold text-white">{label}</div>
+        {description && <div className="text-xs text-krypt-muted mt-1">{description}</div>}
+      </div>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={checked}
+        onClick={() => !disabled && onChange(!checked)}
+        className={cls(
+          'relative h-6 w-11 rounded-full transition flex-shrink-0 mt-0.5',
+          checked ? 'bg-accent' : 'bg-white/15',
+        )}
+      >
+        <span
+          className={cls(
+            'absolute top-0.5 h-5 w-5 rounded-full bg-[#fff] shadow transition',
+            checked ? 'left-[22px]' : 'left-0.5',
+          )}
+        />
+      </button>
+    </label>
+  );
+}
+
+/**
+ * Numeric input with a local editing buffer. Why not bind straight to the
+ * number? A controlled `value={n}` that clamps on every keystroke makes the
+ * field impossible to clear — deleting all digits parses to 0 and snaps to
+ * `min`, so you can never type a fresh value (you'd be stuck nudging arrows).
+ * Instead we keep a string buffer while focused (clear/partial input is fine),
+ * emit the parsed number live (parent may clamp for storage), and only clamp
+ * the field itself to [min,max] on blur. Re-syncs from the prop when not
+ * focused, so external changes (reset, arrows) still reflect.
+ */
+/**
+ * A single-line text field.
+ *
+ * Promoted out of Settings.tsx on 2026-09-14, where it had been private —
+ * and had already been copied once, into the runner-webhook card. Two
+ * definitions of "a text box" is how a UI ends up with two text boxes that
+ * look almost but not quite alike.
+ */
+export function TextInput({
+  value,
+  onChange,
+  placeholder,
+  mono = true,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  /** Off for prose (a label, a note); on for anything the chain produced. */
+  mono?: boolean;
+}) {
+  return (
+    <input
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      placeholder={placeholder}
+      spellCheck={false}
+      className={cls(
+        'w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-sm text-white placeholder-krypt-muted/50 outline-none transition focus:border-krypt-purple/60',
+        mono && 'font-mono',
+      )}
+    />
+  );
+}
+
+export function NumberInput({
+  value,
+  onChange,
+  min,
+  max,
+  suffix,
+  className,
+  warn,
+}: {
+  value: number;
+  onChange: (next: number) => void;
+  /** Advisory only — a value below this WARNS, it does not clamp. */
+  min?: number;
+  /** Advisory only — a value above this WARNS, it does not clamp. */
+  max?: number;
+  suffix?: string;
+  className?: string;
+  /** Custom warning for the current value; null = fine. Overrides min/max. */
+  warn?: (n: number) => string | null;
+  /** Accepted for backward compatibility; ignored now that this is a text
+   *  field with no spinner. */
+  step?: number;
+}) {
+  const fmt = (v: number): string => (Number.isFinite(v) ? String(v) : '');
+  const [text, setText] = useState<string>(() => fmt(value));
+  const focused = useRef(false);
+
+  // Reflect external value changes only while the user isn't actively editing,
+  // so a live parent update can't yank characters out from under them.
+  useEffect(() => {
+    if (!focused.current) setText(fmt(value));
+  }, [value]);
+
+  // No clamping — the user's number is accepted as typed. Commit on blur/Enter
+  // so intermediate states ("0.", "1e") never fight the keystrokes, and never
+  // write a half-typed value to the setting.
+  const commit = (): void => {
+    focused.current = false;
+    const raw = text.trim();
+    const n = Number(raw);
+    if (raw === '' || !Number.isFinite(n)) {
+      setText(fmt(value)); // genuinely not a number — revert to the last good one
+      return;
+    }
+    setText(fmt(n));
+    if (n !== value) onChange(n);
+  };
+
+  // Live warning, shown but never blocking.
+  const n = Number(text.trim());
+  const warning =
+    text.trim() === '' || !Number.isFinite(n)
+      ? null
+      : warn
+        ? warn(n)
+        : typeof min === 'number' && n < min
+          ? `Below ${min}${suffix ? ' ' + suffix : ''}`
+          : typeof max === 'number' && n > max
+            ? `Above ${max}${suffix ? ' ' + suffix : ''}`
+            : null;
+
+  return (
+    // The wrapper carries the caller's width; the control FILLS it. It used
+    // to be an inline-flex sized by its own contents, so a caller asking for
+    // w-28 got a ~150px control that spilled over whatever sat next to it
+    // (seen on the Runners header, where it covered the refresh button).
+    <div className={cls('min-w-0', className)}>
+      <div className="flex w-full items-center rounded-lg border border-white/10 bg-black/40 overflow-hidden">
+        {/* type="text" + inputMode="decimal": no spinner, no browser range
+            rejection — just a text field that happens to hold a number. */}
+        <input
+          type="text"
+          inputMode="decimal"
+          value={text}
+          onFocus={() => { focused.current = true; }}
+          onBlur={commit}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
+          className="w-full min-w-0 bg-transparent px-3 py-2 text-sm font-mono text-white outline-none"
+        />
+        {suffix && <div className="flex-shrink-0 pr-2 text-xs uppercase text-krypt-muted">{suffix}</div>}
+      </div>
+      {warning && <div className="mt-0.5 text-label text-arc-gold/90">{warning}</div>}
+    </div>
+  );
+}
+
+/**
+ * A labelled figure — the app's most-repeated element, and until 2026-09-14
+ * its least consistent.
+ *
+ * There were SEVEN of these, private to seven files, rendering the same
+ * thing four different ways: 9px or 10px labels, tracking anywhere from
+ * 0.14em to 0.18em, muted at 60 %, 70 % or full, values at 13px or 15px.
+ * Nobody could name the difference and everybody could feel it.
+ *
+ * `tone` is a text colour class, not a variant name, because callers already
+ * compute one from a sign and a union would only make them map it back.
+ */
+export function Stat({
+  label,
+  value,
+  tone,
+  hint,
+  size = 'value',
+}: {
+  label: string;
+  value: ReactNode;
+  tone?: string;
+  hint?: string;
+  /** `figure` for the one number a card is actually about. */
+  size?: 'value' | 'figure';
+}) {
+  return (
+    <div>
+      <div className="text-label text-krypt-muted">{label}</div>
+      <div
+        className={cls(
+          'mt-0.5 font-semibold tabular-nums',
+          size === 'figure' ? 'text-figure' : 'text-value',
+          tone ?? 'text-white',
+        )}
+      >
+        {value}
+      </div>
+      {hint && <div className="mt-0.5 text-label leading-relaxed text-krypt-muted/60">{hint}</div>}
+    </div>
+  );
+}
+
+/** A label and a value on one line, ruled against the right edge — the
+ *  position-panel shape. Distinct from `Field`, which holds a CONTROL. */
+export function DataRow({ label, value, tone }: { label: string; value: ReactNode; tone?: string }) {
+  return (
+    <div className="flex items-baseline justify-between gap-3 text-body">
+      <span className="text-krypt-muted/80">{label}</span>
+      <span className={cls('font-mono tabular-nums', tone ?? 'text-white/90')}>{value}</span>
+    </div>
+  );
+}
+
+/** A labelled control, with an optional line of explanation. Was three
+ *  copies under two names (`Field` in Launch and Scripts, `Row` in
+ *  Strategy) that differed only in padding. */
+export function Field({
+  label,
+  hint,
+  children,
+  inline = false,
+}: {
+  label: string;
+  hint?: string;
+  children: ReactNode;
+  /** Control beside the label (a settings row) rather than beneath it. */
+  inline?: boolean;
+}) {
+  if (inline) {
+    return (
+      <div className="flex items-center justify-between gap-4 rounded-md border border-white/10 bg-black/20 px-4 py-3">
+        <div className="min-w-0">
+          <div className="text-sm font-semibold text-white">{label}</div>
+          {hint && <div className="mt-0.5 text-xs text-krypt-muted">{hint}</div>}
+        </div>
+        {children}
+      </div>
+    );
+  }
+  return (
+    <label className="block">
+      <span className="block text-label uppercase tracking-label text-krypt-muted/70">{label}</span>
+      <div className="mt-1">{children}</div>
+      {hint && <span className="mt-1 block text-label leading-relaxed text-krypt-muted/60">{hint}</span>}
+    </label>
+  );
+}
+
+/** An address or signature you will want on your clipboard. */
+export function Copyable({ value, label }: { value: string; label?: string }) {
+  const [done, setDone] = useState(false);
+  return (
+    <button
+      onClick={() => {
+        void navigator.clipboard.writeText(value);
+        setDone(true);
+        window.setTimeout(() => setDone(false), 1200);
+      }}
+      title={label ? `Copy ${label}` : 'Copy'}
+      className="group inline-flex w-full items-center gap-2 rounded-lg border border-white/10 bg-black/40 px-3 py-2 font-mono text-sm text-white transition hover:border-krypt-purple/40"
+    >
+      <span className="truncate">{value}</span>
+      {done ? (
+        <Check className="ml-auto h-3.5 w-3.5 flex-shrink-0 text-emerald-300" />
+      ) : (
+        <Copy className="ml-auto h-3.5 w-3.5 flex-shrink-0 text-krypt-muted group-hover:text-krypt-purple" />
+      )}
+    </button>
+  );
+}
+
+/** A Section's title treatment, for a heading INSIDE a card — where a full
+ *  `Section` would add margins the card does not want. Was two byte-identical
+ *  copies in OddsPanel and SecurityPanel. */
+export function SectionHeader({ title, hint }: { title: string; hint?: string }) {
+  return (
+    <div className="flex items-center gap-3" title={hint}>
+      <h3 className="text-note font-semibold text-white whitespace-nowrap">{title}</h3>
+    </div>
+  );
+}
+
+export function Empty({
+  title,
+  message,
+  action,
+}: {
+  title: string;
+  message?: string;
+  action?: ReactNode;
+}) {
+  return (
+    <div className="flex flex-col items-center justify-center text-center py-14 px-6 rounded-xl border border-dashed border-white/12 bg-card">
+      <div className="mb-3 flex h-10 w-10 items-center justify-center rounded-full bg-accent/10 text-accent" aria-hidden="true">
+        <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><circle cx="11" cy="11" r="6.5" /><path d="m20 20-4-4" /></svg>
+      </div>
+      <div className="text-[15px] font-semibold text-white">{title}</div>
+      {message && <div className="text-sm text-krypt-muted mt-2 max-w-md">{message}</div>}
+      {action && <div className="mt-4">{action}</div>}
+    </div>
+  );
+}
+
+export function Badge({
+  children,
+  tone = 'neutral',
+}: {
+  children: ReactNode;
+  tone?: 'neutral' | 'success' | 'warn' | 'danger' | 'gradient';
+}) {
+  const styles: Record<string, string> = {
+    neutral: 'border-white/10 bg-raised text-krypt-muted',
+    success: 'border-up/30 bg-up/10 text-up',
+    warn:    'border-warn/30 bg-warn/10 text-warn',
+    danger:  'border-down/30 bg-down/10 text-down',
+    gradient:'border-accent/30 bg-accent/10 text-accent',
+  };
+  return (
+    <span className={cls('inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-label font-medium', styles[tone])}>
+      {children}
+    </span>
+  );
+}

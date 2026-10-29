@@ -1,0 +1,635 @@
+// The provider HTTP layer under a 429 — the rules the rate-limit swarm of
+// 2026-09-06 pinned after users reported being rate limited:
+//   1. a park is honoured at the FRONT of the queue, so calls already chained
+//      behind the one that 429'd never fire into it;
+//   2. Retry-After sets the park length; repeats escalate; a park is never
+//      shortened by a later, smaller answer;
+//   3. priority calls bypass the park but are spaced among themselves.
+// No network: fetch is stubbed.
+//
+// Tests 8-13 are the API swarm of 2026-09-09 §1 and §7:
+//   8-11. a refusal that arrives with a SUCCESS status is still a refusal —
+//         it parks, it never un-parks, and legitimate data is untouched;
+//   12-13. Jupiter's host, gap and window all follow the user's key.
+import assert from 'node:assert';
+import { humanWait } from './.marketshared.mjs';
+import {
+  getJson,
+  cooldownRemainingMs,
+  parseRetryAfterMs,
+  classifyBody,
+  providerLimits,
+  windowBudget,
+  windowKeysFor,
+  memo,
+  clearCache,
+  setJupiterApiKey,
+  jupiterKeyed,
+  routeShape,
+  routeCooldownMs,
+  expireCache,
+  cached,
+  putCache,
+} from './.http.mjs';
+
+let hits = [];
+let lastInit = null;
+function stubFetch(handler) {
+  hits = [];
+  lastInit = null;
+  globalThis.fetch = async (url, init) => {
+    hits.push({ url: String(url), at: Date.now() });
+    lastInit = init;
+    return handler(String(url), init, hits.length);
+  };
+}
+const res = (status, body = '{}', headers = {}) => ({
+  ok: status >= 200 && status < 300,
+  status,
+  headers: { get: (n) => headers[n.toLowerCase()] ?? null },
+  body: null,
+  text: async () => body,
+});
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ── 1. the park is checked when a queued call reaches the front ──────────
+{
+  stubFetch((_url, _init, n) => (n === 1 ? res(429) : res(200, '{"a":1}')));
+  const results = await Promise.all([
+    getJson('pumpswap', '/one'),
+    getJson('pumpswap', '/two'),
+    getJson('pumpswap', '/three'),
+    getJson('pumpswap', '/four'),
+  ]);
+  assert.equal(hits.length, 1, 'only the first call reached the host — the three behind it failed fast');
+  assert.equal(results[0].status, 429);
+  assert.match(results[0].message, /rate limited \(429\) — pausing 20s/);
+  for (const r of results.slice(1)) {
+    assert.equal(r.ok, false);
+    assert.equal(r.status, 429);
+    assert.match(r.message, /rate limited, retrying in \d+s/);
+  }
+  const cooling = cooldownRemainingMs('pumpswap');
+  assert.ok(cooling > 18_000 && cooling <= 20_000, `20 s park without Retry-After: ${cooling}`);
+  console.log('ok  queued calls do not fire into a park');
+}
+
+// ── 2. Retry-After may EXTEND the park, never shorten it ─────────────────
+//
+// Changed 2026-09-09. It used to replace the escalation outright, and two
+// shapes exploited that: GeckoTerminal answers `Retry-After: 0`, which floors
+// to 2 s and replaced 20 s — so the provider we have the least budget with
+// was re-entered fastest — and any provider repeating a short wait defeated
+// the 20 → 40 → 80 s ladder. Over-waiting only costs freshness; under-waiting
+// is what produced the 429 storms this machinery exists for.
+{
+  stubFetch(() => res(429, '', { 'retry-after': '3' }));
+  const r = await getJson('dexscreener', '/x');
+  assert.equal(r.status, 429);
+  const cooling = cooldownRemainingMs('dexscreener');
+  assert.ok(cooling > 18_000 && cooling <= 20_000, `a shorter Retry-After does not shorten the 20 s floor: ${cooling}`);
+  console.log('ok  a Retry-After shorter than our escalation does not shorten the park');
+}
+
+// A Retry-After LONGER than our escalation is still obeyed in full.
+{
+  stubFetch(() => res(429, '', { 'retry-after': '90' }));
+  const r = await getJson('birdeye', '/x');
+  assert.equal(r.status, 429);
+  const cooling = cooldownRemainingMs('birdeye');
+  assert.ok(cooling > 88_000 && cooling <= 90_000, `Retry-After: 90 → ~90 s park: ${cooling}`);
+  console.log('ok  a longer Retry-After is obeyed in full');
+}
+
+// ── 3. repeats escalate; a success clears; a smaller answer never shortens ──
+{
+  stubFetch(() => res(429));
+  let r = await getJson('jupiter', '/a');
+  assert.equal(r.status, 429);
+  assert.ok(cooldownRemainingMs('jupiter') > 18_000, 'first strike: 20 s');
+
+  // A priority call bypasses the park; its success clears it.
+  stubFetch(() => res(200, '[]'));
+  r = await getJson('jupiter', '/b', { priority: true });
+  assert.equal(r.ok, true);
+  assert.equal(cooldownRemainingMs('jupiter'), 0, 'a success clears the park');
+
+  stubFetch(() => res(429));
+  r = await getJson('jupiter', '/c', { priority: true });
+  assert.match(r.message, /pausing 40s/, 'second strike inside the decay window doubles');
+  const forty = cooldownRemainingMs('jupiter');
+  assert.ok(forty > 38_000 && forty <= 40_000, `40 s: ${forty}`);
+
+  stubFetch(() => res(429, '', { 'retry-after': '2' }));
+  r = await getJson('jupiter', '/d', { priority: true });
+  assert.ok(cooldownRemainingMs('jupiter') > 37_000, 'a later, shorter Retry-After does not shorten the park');
+  console.log('ok  parks escalate, clear on success, never shrink');
+}
+
+// ── 4. priority calls jump the park but space themselves ─────────────────
+{
+  stubFetch(() => res(200, '[]'));
+  const results = await Promise.all([
+    getJson('jupiter', '/p1', { priority: true }),
+    getJson('jupiter', '/p2', { priority: true }),
+    getJson('jupiter', '/p3', { priority: true }),
+  ]);
+  assert.ok(results.every((r) => r.ok), 'priority calls go out while the provider is parked');
+  assert.equal(hits.length, 3);
+  const gaps = [hits[1].at - hits[0].at, hits[2].at - hits[1].at];
+  assert.ok(gaps.every((g) => g >= 100), `three concurrent priority calls are spaced by the host gap: ${gaps.join(',')}`);
+  console.log('ok  priority calls are spaced among themselves');
+}
+
+// ── 5. a normal call still waits for the park to end ─────────────────────
+{
+  // Test 4's successes cleared the park; park it again through a priority
+  // call. Fourth strike inside the decay window: 160 s, capped at 120 s.
+  stubFetch(() => res(429));
+  const p = await getJson('jupiter', '/park', { priority: true });
+  assert.match(p.message, /pausing 120s/, 'escalation is capped at two minutes');
+  stubFetch(() => res(200, '[]'));
+  const r = await getJson('jupiter', '/normal');
+  assert.equal(r.ok, false);
+  assert.equal(r.status, 429);
+  assert.equal(hits.length, 0, 'no request while parked');
+  console.log('ok  non-priority calls fail fast without a request');
+}
+
+// ── 6. Retry-After parsing ───────────────────────────────────────────────
+{
+  assert.equal(parseRetryAfterMs('3'), 3_000);
+  // The parser still floors a zero at 2 s. What changed 2026-09-09 is that
+  // `park()` no longer lets that 2 s REPLACE its own 20/40/80 s escalation —
+  // GeckoTerminal answers `Retry-After: 0`, and the provider we have the
+  // least budget with was the one we re-entered fastest.
+  assert.equal(parseRetryAfterMs('0'), 2_000, 'floor: a zero cannot un-park');
+  assert.equal(parseRetryAfterMs('99999'), 120_000, 'ceiling: a hostile header cannot park for an hour');
+  assert.equal(parseRetryAfterMs('garbage'), null);
+  assert.equal(parseRetryAfterMs(null), null);
+  const date = new Date(Date.now() + 5_000).toUTCString();
+  const fromDate = parseRetryAfterMs(date);
+  assert.ok(fromDate > 3_500 && fromDate <= 5_000, `HTTP-date form: ${fromDate}`);
+  console.log('ok  Retry-After parsing');
+}
+
+// ── 7. a slow queue does not defeat the gap ──────────────────────────────
+{
+  // Two normal calls on a provider with no park: the second waits the gap.
+  stubFetch(async () => {
+    await sleep(20);
+    return res(200, '{}');
+  });
+  await Promise.all([getJson('pumpswap', '/a'), getJson('pumpswap', '/b')]).catch(() => undefined);
+  // pumpswap is still parked from test 1 — both fail fast, no hits.
+  assert.equal(hits.length, 0);
+  console.log('ok  a parked provider stays parked across the queue');
+}
+
+// ── 8. a 200 carrying a GeckoTerminal refusal parks, and never un-parks ──
+{
+  // GeckoTerminal answers a throttle with HTTP 200 and a JSON error body.
+  // Before 2026-09-09 that took the success path, which ran
+  // `blockedUntil.delete(id)` — so a polite refusal UN-PARKED a provider an
+  // honest 429 had just parked.
+  //
+  // Park it honestly first, for longer than the escalation would choose, so
+  // the assertion proves BOTH halves: the park survives, and it is not
+  // shortened by the polite refusal's own (shorter) length.
+  stubFetch(() => res(429, '', { 'retry-after': '60' }));
+  await getJson('geckoterminal', '/honest');
+  const parked = cooldownRemainingMs('geckoterminal');
+  assert.ok(parked > 55_000, `an honest 429 parked GeckoTerminal for 60 s: ${parked}`);
+
+  const refusal = JSON.stringify({
+    status: { error_code: 429, error_message: "You've exceeded the Rate Limit. Please visit our pricing page." },
+  });
+  stubFetch(() => res(200, refusal, { 'content-type': 'application/json' }));
+  const r = await getJson('geckoterminal', '/pretend', { priority: true });
+  assert.equal(hits.length, 1, 'the call went out — this is a 200, not a fail-fast');
+  assert.equal(r.ok, false, 'a 200 with a rate-limit body is NOT a success');
+  assert.equal(r.data, undefined, 'no data is handed to the caller');
+  assert.match(r.message, /rate limited/, `the message names the refusal: ${r.message}`);
+  assert.match(r.message, /exceeded the Rate Limit/, "the provider's own words are kept");
+  const after = cooldownRemainingMs('geckoterminal');
+  assert.ok(after > 55_000, `the existing park survived the polite refusal: ${after}`);
+  console.log('ok  a 200 carrying a refusal parks and does not clear an existing park');
+}
+
+// ── 9. a 200 carrying legitimate data is untouched ───────────────────────
+{
+  // The conservatism test. A false positive parks a working provider, which
+  // is worse than the bug — so a row whose own TEXT talks about rate limits
+  // must still be ordinary data.
+  const legit = JSON.stringify({
+    data: [{ symbol: 'RATELIMIT', name: 'Rate Limit', description: 'too many requests, ser' }],
+  });
+  stubFetch(() => res(200, legit, { 'content-type': 'application/json' }));
+  const r = await getJson('pumpfun', '/coins');
+  assert.equal(r.ok, true, 'legitimate data is still a success');
+  assert.equal(r.message, 'ok');
+  assert.equal(r.data.data[0].symbol, 'RATELIMIT', 'the payload is parsed and handed over unchanged');
+  assert.equal(cooldownRemainingMs('pumpfun'), 0, 'nothing was parked');
+  console.log('ok  legitimate data that talks about rate limits is left alone');
+}
+
+// ── 10. a JSON-RPC error inside a 200 ────────────────────────────────────
+{
+  // -32005 is "limit exceeded": a refusal, so it parks.
+  const limited = JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32005, message: 'Too many requests' } });
+  stubFetch(() => res(200, limited));
+  const r = await getJson('helius', '/rpc', { json: {} });
+  assert.equal(r.ok, false, 'a JSON-RPC error is not a success, whatever the HTTP status');
+  assert.match(r.message, /rate limited/);
+  const parked = cooldownRemainingMs('helius');
+  assert.ok(parked > 18_000, `a JSON-RPC rate limit takes the park path: ${parked}`);
+
+  // -32603 is an ordinary internal error: the call fails, but no park is
+  // invented — and, the point of the branch, none is cleared either.
+  const internal = JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32603, message: 'Internal error' } });
+  stubFetch(() => res(200, internal));
+  const r2 = await getJson('helius', '/rpc', { json: {}, priority: true });
+  assert.equal(r2.ok, false, 'an RPC error body never reads as success');
+  assert.match(r2.message, /Internal error/);
+  const still = cooldownRemainingMs('helius');
+  assert.ok(still > 18_000, `an error body does not clear the park either: ${still}`);
+  console.log('ok  JSON-RPC error bodies are classified, not accepted');
+}
+
+// ── 11. the classifier table itself ──────────────────────────────────────
+{
+  const json = { get: (n) => (n.toLowerCase() === 'content-type' ? 'application/json' : null) };
+  const none = { get: () => null };
+
+  // GeckoTerminal's other refusal form, the JSON:API error document.
+  assert.equal(
+    classifyBody('geckoterminal', 200, json, '{"errors":[{"status":"429","title":"Rate limit exceeded"}]}'),
+    'refused',
+  );
+  // Same shape, a different problem: not data, but not a throttle.
+  assert.equal(classifyBody('geckoterminal', 200, json, '{"errors":[{"status":"404","title":"Not found"}]}'), 'error');
+  // A JSON:API document that carries `data` is never second-guessed.
+  assert.equal(classifyBody('geckoterminal', 200, json, '{"data":[],"errors":[]}'), 'ok');
+  // A bare `error` string only counts when it names throttling...
+  assert.equal(classifyBody('dexscreener', 200, json, '{"error":"Too Many Requests"}'), 'refused');
+  // ...and never demotes a working response otherwise.
+  assert.equal(classifyBody('dexscreener', 200, json, '{"error":"no pools for this mint"}'), 'ok');
+  // An `error` field is not a JSON-RPC envelope without `jsonrpc`.
+  assert.equal(classifyBody('helius', 200, json, '{"id":1,"error":{"code":-32603,"message":"boom"}}'), 'ok');
+  assert.equal(classifyBody('helius', 200, none, '{"jsonrpc":"2.0","id":1,"error":{"code":-32603}}'), 'error');
+  // A batched RPC reply where one member was refused.
+  assert.equal(
+    classifyBody('helius', 200, none, '[{"jsonrpc":"2.0","id":1,"result":{}},{"jsonrpc":"2.0","id":2,"error":{"code":-32005,"message":"limit"}}]'),
+    'refused',
+  );
+  // Not JSON, not inspected. Too big, not inspected.
+  assert.equal(classifyBody('geckoterminal', 200, none, 'rate limit exceeded'), 'ok');
+  const huge = `{"error":"rate limit exceeded","pad":"${'x'.repeat(20_000)}"}`;
+  assert.equal(classifyBody('dexscreener', 200, none, huge), 'ok', 'a big body is data, and is waved through unread');
+  // An empty body is the "empty" success the layer already returns.
+  assert.equal(classifyBody('jupiter', 200, none, ''), 'ok');
+  console.log('ok  the refusal table matches only quoted shapes');
+}
+
+// ── 11b. swap-api.pump.fun is paced under its Cloudflare burst rule ───────
+{
+  // MEASURED 2026-09-21: the host answers `x-ratelimit-limit: 1000` but a
+  // Cloudflare rule (429, `error code: 1015`, Retry-After 34) blocks the IP
+  // for ~35 s past roughly 22 requests in a short window — 40 calls with no
+  // gap got 11 answers, 30 at 1 s lost the 23rd, 30 at 2.5 s and 3 s all
+  // answered. The Wallet Scout's scan is paced by this gap and says so on
+  // the page (SOLANA_SCAN_GAP_MS in shared/walletScout.ts, pinned equal in
+  // walletscout.test.mjs); a faster gap here is the "works for two minutes
+  // then gets limited" report coming back.
+  const ps = providerLimits('pumpswap');
+  assert.equal(ps.host, 'swap-api.pump.fun');
+  assert.equal(ps.gapMs, 2_000, 'one request every 2 s — under the measured burst rule with room for the token page');
+  assert.equal(ps.window, null, 'the gap alone is the ceiling; a window would only add a queue wait');
+  console.log('ok  swap-api.pump.fun is paced at 2 s, under its measured Cloudflare burst rule');
+}
+
+// ── 12. Jupiter's host, gap and window follow the key ────────────────────
+{
+  setJupiterApiKey('');
+  assert.equal(jupiterKeyed(), false);
+  const keyless = providerLimits('jupiter');
+  assert.equal(keyless.host, 'lite-api.jup.ag', 'no key keeps the host the app uses today');
+  // 2026-09-20: lite-api 429'd at ~46 calls/min under 8/s bursts; probed
+  // fine at 2/s. The gap allows those bursts and the window holds the minute.
+  assert.equal(keyless.gapMs, 500, 'two a second, the burst the host tolerates');
+  assert.deepEqual(keyless.window, { n: 50, ms: 60_000 }, 'the minute ceiling, under the ~60 the host serves');
+
+  setJupiterApiKey('  jup_test_key  ');
+  assert.equal(jupiterKeyed(), true, 'the key is trimmed, not rejected for the spaces around it');
+  const keyed = providerLimits('jupiter');
+  assert.equal(keyed.host, 'api.jup.ag', 'a key moves off the retiring endpoint');
+  assert.equal(keyed.gapMs, 1_000, 'and onto its documented 1 request/second');
+  assert.deepEqual(keyed.window, { n: 55, ms: 60_000 }, 'the window followed the host — under its documented 60 a minute');
+
+  // No other provider moved.
+  assert.equal(providerLimits('geckoterminal').host, 'api.geckoterminal.com');
+  assert.deepEqual(providerLimits('geckoterminal').window, { n: 28, ms: 60_000 });
+  console.log('ok  the Jupiter gap and window follow the host');
+}
+
+// ── 13. the key rides in a header, on the keyed host ─────────────────────
+{
+  stubFetch(() => res(200, '[]'));
+  await getJson('jupiter', '/swap/v1/quote?x=1', { priority: true });
+  assert.equal(hits.length, 1);
+  assert.ok(hits[0].url.startsWith('https://api.jup.ag/'), `the request went to the keyed host: ${hits[0].url}`);
+  assert.ok(!hits[0].url.includes('jup_test_key'), 'the key is never in the URL — no URL crosses IPC, and URLs get logged');
+  assert.equal(lastInit.headers['x-api-key'], 'jup_test_key', 'it rides in the header instead');
+
+  setJupiterApiKey('');
+  stubFetch(() => res(200, '[]'));
+  await getJson('jupiter', '/tokens/v2/x', { priority: true });
+  assert.ok(hits[0].url.startsWith('https://lite-api.jup.ag/'), 'clearing the key returns to the keyless host');
+  assert.equal(lastInit.headers['x-api-key'], undefined, 'and sends no key header');
+  console.log('ok  the Jupiter key travels as a header, never in the URL');
+}
+
+
+// ── A spent ALLOWANCE is not a rate limit (2026-09-16) ──────────────────
+//
+// MEASURED on a user's session: Birdeye answered
+// `HTTP 400 — Compute units usage limit exceeded` and the app made 1,743
+// calls collecting 1,743 errors. Only a 429 parked, and this is a 400, so
+// every doomed call fired. A monthly allowance does not come back in twenty
+// seconds and must not be retried as though it might.
+{
+  stubFetch(() => res(400, JSON.stringify({ message: 'Compute units usage limit exceeded' })));
+  // `merkl` rather than `birdeye`: the tests above already parked birdeye,
+  // and a call that never leaves the queue would measure nothing here.
+  const r = await getJson('merkl', '/quota-one');
+  assert.equal(r.ok, false);
+  assert.match(r.message, /allowance spent/, r.message);
+  assert.match(r.message, /Compute units/, 'and it quotes the provider');
+  const cooling = cooldownRemainingMs('merkl');
+  assert.ok(cooling > 60 * 60_000, `parked for HOURS, not seconds — got ${Math.round(cooling / 1000)}s`);
+
+  // And the next call does not reach the host at all. That is the whole
+  // point: 1,743 became 1.
+  const before = hits.length;
+  const again = await getJson('merkl', '/quota-two');
+  assert.equal(hits.length, before, 'no second request was made');
+  assert.equal(again.ok, false);
+  console.log('ok  a spent allowance parks for hours and stops the retries');
+}
+
+// A plain 4xx that is NOT about allowance keeps its old behaviour — a park
+// of hours on an ordinary "not tradable" would silence a working provider.
+{
+  stubFetch(() => res(400, JSON.stringify({ message: 'Could not find any route' })));
+  const r = await getJson('lifi', '/ordinary-400');
+  assert.equal(r.ok, false);
+  assert.ok(!/allowance spent/.test(r.message), r.message);
+  assert.equal(cooldownRemainingMs('lifi'), 0, 'an ordinary refusal parks nothing, as before');
+  console.log('ok  an ordinary 4xx is not mistaken for a spent plan');
+}
+
+// ── The net under everything: a provider that just keeps failing ────────
+//
+// The classifier above has to RECOGNISE a phrase. This does not have to
+// understand anything — it counts. It is the general form of the Birdeye
+// case and would have stopped it at ten instead of seventeen hundred.
+{
+  stubFetch(() => {
+    throw new Error('fetch failed');
+  });
+  let made = 0;
+  for (let i = 0; i < 14; i += 1) {
+    const before = hits.length;
+    await getJson('lifi-status', `/dead-${i}`);
+    if (hits.length > before) made += 1;
+  }
+  assert.ok(made <= 10, `stopped calling after a streak — ${made} of 14 reached the host`);
+  assert.ok(cooldownRemainingMs('lifi-status') > 0, 'and the provider is parked');
+  console.log('ok  a provider failing in an unbroken streak is stood down, whatever the reason');
+}
+
+// One good answer ends it. The streak is about a provider that is not
+// working now, never about its lifetime record.
+{
+  let fail = true;
+  stubFetch(() => (fail ? res(500) : res(200, '{"a":1}')));
+  for (let i = 0; i < 9; i += 1) await getJson('rugcheck', `/flap-${i}`);
+  fail = false;
+  const good = await getJson('rugcheck', '/recovered');
+  assert.equal(good.ok, true, 'the ninth failure did not park it');
+  fail = true;
+  const before = hits.length;
+  await getJson('rugcheck', '/after');
+  assert.equal(hits.length, before + 1, 'and the counter restarted from the success');
+  console.log('ok  one success clears the streak');
+}
+
+
+// A 429 is a RATE limit and must never be read as a spent plan, however it
+// is worded. Free providers 429 constantly, and a six-hour park on one that
+// was merely throttled is far worse than a slow stand-down on one that is
+// genuinely spent — the failure-streak breaker covers that case anyway.
+{
+  stubFetch(() => res(429, JSON.stringify({ message: 'monthly limit exceeded' }), { 'retry-after': '5' }));
+  const r = await getJson('rugcheck', '/throttle-worded-like-quota');
+  assert.equal(r.ok, false);
+  assert.ok(!/allowance spent/.test(r.message), r.message);
+  const cooling = cooldownRemainingMs('rugcheck');
+  assert.ok(cooling > 0 && cooling <= 120_000, `a normal 429 park, not hours — got ${Math.round(cooling / 1000)}s`);
+  console.log('ok  a 429 is a rate limit whatever words it carries');
+}
+
+// Durations people can read. "retrying in 21596s" is what a six-hour park
+// looked like in a message written when every park was seconds.
+{
+  assert.equal(humanWait(4_000), '4s');
+  assert.equal(humanWait(89_000), '89s');
+  assert.equal(humanWait(90_000), '2 min');
+  assert.equal(humanWait(21_596_000), '6 h');
+  console.log('ok  a wait is rendered in units a person reads');
+}
+
+// The polling lanes on a host never promise more than the host allows.
+//
+// MEASURED 2026-09-19: every pump route advertises the same 60/60 s, and its
+// `remaining` counter does not move with our calls (twelve in three seconds
+// read 59 nine times), so the app has to plan against one host allowance it
+// cannot observe. A lane budget CARVES that allowance - it cannot create
+// more of it. 55 for the list lane plus 20 for callouts is two promises
+// adding to 75 against a ceiling of 60, and when the host refused, the
+// smallest lane was the one that lost: "pump.fun not answering" in the
+// callouts rail while Discover carried on working.
+//
+// The group is what holds them together. It covers POLLERS only - a lookup
+// the user's own click made is not background traffic and is bounded by the
+// gap, as it was, so a 60-token portfolio build is not throttled into a
+// minute of waiting.
+{
+  const HOST_CEILING = 60;
+  const lanes = ['pumpfun:list', 'pumpfun:callout'];
+  const group = windowBudget('pumpfun:poll');
+  assert.ok(group, 'the pump polling lanes share a group budget');
+  assert.ok(
+    group.n <= HOST_CEILING,
+    `the group budgets ${group.n} against a host that advertises ${HOST_CEILING}`,
+  );
+  for (const key of lanes) {
+    const w = windowBudget(key);
+    assert.ok(w, `${key} is budgeted`);
+    assert.ok(w.n <= group.n, `${key} budgets ${w.n}, more than the ${group.n} its group allows`);
+    assert.equal(w.ms, group.ms, `${key} and its group must measure the same window`);
+  }
+  // And the gate must actually count a laned call against the group, not
+  // just against its own lane. This is the line that was the bug.
+  assert.deepEqual(
+    windowKeysFor('pumpfun', 'callout'),
+    ['pumpfun', 'pumpfun:callout', 'pumpfun:poll'],
+    'a callout spends from its lane AND from the shared poll budget',
+  );
+  assert.deepEqual(windowKeysFor('pumpfun', undefined), ['pumpfun'], 'an un-laned call is the host only');
+  console.log('ok  pump polling lanes carve one host allowance instead of inventing more');
+}
+
+// ── Stale grace: a throttled provider must not blank the app ──────────
+//
+// A park used to empty every panel it fed. `cached` deletes at TTL, so the
+// reload had nothing to fall back on, and the token page, the holders list
+// and the intel fields all went to em dashes at once - which a user reads as
+// "the app is broken", not "pump.fun is throttling me".
+//
+// The grace tier keeps the last good value past its TTL, to be served ONLY
+// when the reload failed for a reason that is not an answer. The difference
+// is the whole point: "the network did not reach the provider" is a good
+// reason to show what we last knew; "the provider says this token has no
+// pair" is a fact, and resurrecting a four-minute-old value over it is the
+// polite-refusal bug wearing a different hat.
+{
+  const TTL = 60;
+  clearCache();
+  stubFetch(() => res(200, JSON.stringify({ v: 1 })));
+  const first = await memo('grace:key', TTL, async () => {
+    const r = await getJson('dexscreener', '/ok');
+    return r.ok ? r.data : null;
+  });
+  assert.deepEqual(first, { v: 1 }, 'the good value is cached');
+
+  await sleep(TTL + 20);
+  // Now the provider is unreachable. The loader returns null, but a
+  // transport failure was recorded on the way.
+  stubFetch(() => {
+    throw new Error('fetch failed');
+  });
+  const served = await memo('grace:key', TTL, async () => {
+    const r = await getJson('dexscreener', '/down');
+    return r.ok ? r.data : null;
+  });
+  assert.deepEqual(served, { v: 1 }, 'a failed reload serves the last good value, not a blank');
+  console.log('ok  an unreachable provider shows what we last knew, not an em dash');
+}
+
+{
+  const TTL = 60;
+  clearCache();
+  stubFetch(() => res(200, JSON.stringify({ v: 1 })));
+  await memo('grace:answered', TTL, async () => {
+    const r = await getJson('dexscreener', '/ok');
+    return r.ok ? r.data : null;
+  });
+  await sleep(TTL + 20);
+  // The provider ANSWERS, and the answer is "nothing". No transport failure.
+  stubFetch(() => res(200, JSON.stringify({ data: [] })));
+  const answered = await memo('grace:answered', TTL, async () => {
+    const r = await getJson('dexscreener', '/empty');
+    assert.ok(r.ok, 'the call itself succeeded');
+    return null; // the parser found nothing in a perfectly good answer
+  });
+  assert.equal(answered, null, 'a provider that answers "nothing" is believed');
+  console.log('ok  a real "there is nothing here" is never overruled by a stale value');
+}
+
+{
+  const TTL = 40;
+  clearCache();
+  stubFetch(() => res(200, JSON.stringify({ v: 1 })));
+  await memo('grace:expired', TTL, async () => {
+    const r = await getJson('dexscreener', '/ok');
+    return r.ok ? r.data : null;
+  });
+  // Ten TTLs is the grace; past it the value is gone for good. A price from
+  // that long ago is not worth showing at any age label.
+  await sleep(TTL * 11 + 40);
+  stubFetch(() => {
+    throw new Error('fetch failed');
+  });
+  const gone = await memo('grace:expired', TTL, async () => {
+    const r = await getJson('dexscreener', '/down');
+    return r.ok ? r.data : null;
+  });
+  assert.equal(gone, null, 'past grace there is nothing to serve');
+  console.log('ok  grace expires — a stale value is a bridge, not a memory');
+}
+
+// 2026-09-27: the park log names the route's SHAPE. pump.fun was parked 126
+// times in six hours on a user's machine and the log could not say whether
+// the creator list, the coin record or the Discover poll was doing it. A
+// shape — mints and addresses replaced, the query reduced to its keys — so
+// two parks on the same route still read as one repeated line in the
+// support bundle, whichever coin or creator each asked about.
+{
+  assert.equal(routeShape('/coins?offset=100&limit=100&creator=Cre111&sort=created_timestamp&order=DESC&includeNsfw=true'), '/coins?creator&includeNsfw&limit&offset&order&sort');
+  assert.equal(routeShape('/coins-v2/5vPUcAb7HVr7dKB5FXYuKYufgLL1DtzgAcdYzME3pump'), '/coins-v2/{mint}');
+  assert.equal(routeShape('/coins/5vPUcAb7HVr7dKB5FXYuKYufgLL1DtzgAcdYzME3pump?sync=true'), '/coins/{mint}?sync');
+  assert.equal(routeShape('/tokens/0x1234567890abcdef1234567890abcdef12345678'), '/tokens/{address}');
+  assert.equal(routeShape('/tx/4AqMzoBvFUHzGUExPWmZcEw3MvtCf32NPwA2zFYZdUT5Jt72DcePPFUBvVhqZCCirvTU6RAwSZyKb48okfJwHBKL'), '/tx/{sig}', 'a signature is masked too');
+  assert.equal(routeShape('/home-feed'), '/home-feed');
+  assert.equal(routeShape(''), '');
+  assert.equal(routeShape(undefined), '');
+  // Two creators' lists are one shape.
+  assert.equal(routeShape('/coins?creator=A111&limit=100'), routeShape('/coins?creator=B222&limit=100'));
+  console.log('ok  the park log names the route shape, never the coin or creator');
+}
+
+// 2026-10-01: pump.fun's `/coins` list has its OWN limiter. Measured: after
+// every 429 on `/coins?creator=`, `/coins-v3/{mint}` answered 200 (12 of 12).
+// Parking the host for it stopped coin records for two minutes at a time,
+// and with a park every three minutes pump.fun sat parked two thirds of the
+// day. A list 429 now parks the list route only.
+{
+  stubFetch((url) => (url.includes('/coins?') ? res(429, '', { 'retry-after': '1' }) : res(200, '{"mint":"M"}')));
+  const refused = await getJson('pumpfun', '/coins?offset=0&limit=100&creator=Cre111');
+  assert.equal(refused.ok, false, 'the creator list was refused');
+  assert.equal(cooldownRemainingMs('pumpfun'), 0, 'the HOST is not parked');
+  assert.ok(routeCooldownMs('pumpfun', '/coins?offset=0&limit=50') >= 19_000, 'the list route is, at the usual 20 s');
+  const record = await getJson('pumpfun', '/coins-v3/5vPUcAb7HVr7dKB5FXYuKYufgLL1DtzgAcdYzME3pump');
+  assert.equal(record.ok, true, 'coin records still load while the list waits');
+  const before = hits.length;
+  const list = await getJson('pumpfun', '/coins?offset=0&limit=50&sort=created_timestamp');
+  assert.equal(list.ok, false, 'another list call fails fast…');
+  assert.equal(hits.length, before, '…without a request');
+  assert.match(list.message, /rate limited, retrying in/, 'and says when');
+  assert.ok(routeCooldownMs('pumpfun', '/coins?creator=B222') > 0, "a coin record's success does not clear the list's park");
+  // Not every path under /coins is the list: only the measured route is scoped.
+  assert.equal(routeCooldownMs('pumpfun', '/coins/king-of-the-hill'), 0, 'a sibling route is not assumed to share it');
+  console.log("ok  a 429 on pump's /coins list parks that route, not the host");
+}
+
+// expireCache: out of date, not gone. The next memo reloads; a refused
+// reload still gets the old value back, inside its grace.
+{
+  clearCache();
+  putCache('ch:Cre111', { launches: 3 }, 60_000);
+  assert.deepEqual(cached('ch:Cre111'), { launches: 3 }, 'fresh before');
+  expireCache('ch:Cre111');
+  assert.equal(cached('ch:Cre111'), null, 'expired: not served as current');
+  stubFetch(() => {
+    throw new Error('fetch failed');
+  });
+  const served = await memo('ch:Cre111', 60_000, async () => {
+    const r = await getJson('dexscreener', '/creator-refused');
+    return r.ok ? r.data : null;
+  });
+  assert.deepEqual(served, { launches: 3 }, 'a refused reload falls back to the expired record');
+  console.log('ok  an expired creator record is a fallback, not a loss');
+}
+
+console.log('\nhttp layer: all rate-limit rules hold');

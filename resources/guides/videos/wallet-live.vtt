@@ -1,0 +1,41 @@
+WEBVTT
+
+1
+00:00:00.973 --> 00:00:09.677
+You only need a wallet to go live. Open Wallet and generate a dedicated hot wallet. Its key is encrypted by Windows and never leaves this computer.
+
+2
+00:00:13.068 --> 00:00:20.415
+Back up the key before you fund it. Nobody, including Krypt, can recover it for you. Fund it with lunch money, never your main wallet.
+
+3
+00:00:21.137 --> 00:00:27.095
+Send SOL to the deposit address. 0.1 to 0.5 SOL is plenty to test with.
+
+4
+00:00:28.709 --> 00:00:40.802
+Your balance on the bar opens the wallet switcher: every wallet, its balance and its pump.fun name. Follows set to Active wallet copy with the ticked one, and a switch waits until their live copies have closed.
+
+5
+00:00:45.541 --> 00:00:53.826
+Safety rails cap every live copy: a maximum per trade, a balance cap, a session loss cap, and a stop after losses in a row.
+
+6
+00:00:57.406 --> 00:01:02.486
+Going live is two switches. First the top bar, Paper to Live, which asks you to confirm.
+
+7
+00:01:07.377 --> 00:01:14.355
+Then the follow itself: on its card, switch it to Live and arm it. It asks first, and a size above your live cap is caught here.
+
+8
+00:01:21.219 --> 00:01:33.538
+If a safety rail trips, Live turns off, but open copies still sell on their exits, so nothing is stranded. If you switch to Paper yourself, exits stop too: the card says so, and you can sell from the Wallet page.
+
+9
+00:01:37.245 --> 00:01:45.051
+Live copies pay Krypt’s fee on every buy and every sell, on-chain in the same transaction. Start small; most memecoins go to zero.
+
+10
+00:01:46.191 --> 00:01:58.045
+pump.fun accounts are optional. New wallet plus account makes a fresh wallet with its own pump.fun account in one step. Live copies can call out what they buy, and pump pays callers USDC rewards.

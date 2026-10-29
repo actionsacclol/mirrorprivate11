@@ -1,0 +1,612 @@
+// Script sandboxes: one hidden, sandboxed renderer per running code script.
+//
+// Why a renderer and not `vm`: Node's vm module is not a security boundary,
+// and a utility process still has Node — `require('fs')` is one line away.
+// A sandboxed BrowserWindow is Chromium's own process sandbox: no Node, no
+// filesystem, and with the partition below, no network either. What a
+// script CAN do is send messages on one channel; `automation.ts` decides
+// what each one is allowed to mean.
+//
+// The window is tied to a script id at creation. A message is attributed
+// by the webContents it came from, never by anything the message says.
+
+import { app, BrowserWindow, ipcMain, session, type WebContents } from 'electron';
+import path from 'node:path';
+import { parseFromSandbox, probeResponsive, sandboxPageHtml, ALIVE_TIMEOUT_MS, EVENT_HARD_MS, EVENT_TIMEOUT_MS, READY_MAX_MS, READY_TIMEOUT_MS, type MainToSandbox, type SandboxToMain } from '@shared/scriptProtocol';
+
+const CHANNEL = 'script-sandbox';
+const PARTITION = 'script-sandbox';
+
+export interface SandboxHost {
+  /** A validated message from the sandbox of `scriptId`. */
+  onMessage(scriptId: string, msg: SandboxToMain): void;
+  /** The sandbox died (crash, kill, watchdog) — the script is no longer running. */
+  onGone(scriptId: string, reason: string): void;
+  log(level: 'info' | 'warn' | 'error', line: string): void;
+}
+
+interface Inflight {
+  /** Answers the dispatch caller; only the first call counts. */
+  settle: (r: { ok: boolean; error?: string }) => void;
+  /** The watchdog deadline. A `done` does NOT clear it — see dispatch(). */
+  timer: NodeJS.Timeout;
+  /** A well-formed `done` arrived for this id. */
+  onDone: (r: { ok: boolean; error?: string }) => void;
+}
+
+interface Box {
+  scriptId: string;
+  win: BrowserWindow;
+  /** Held directly: reading `win.webContents` throws once the window is gone. */
+  contents: WebContents;
+  contentsId: number;
+  /** Which start() made this box; a stale start must not touch a newer one. */
+  gen: number;
+  /**
+   * Set just before WE crash the renderer, and read by `gone` (2026-09-21).
+   *
+   * Electron reports our own watchdog kill as `render-process-gone` with
+   * reason `killed` — indistinguishable from a renderer someone else killed,
+   * and the script's card then said "sandbox gone (renderer killed)", which
+   * reads like a mystery crash. It is not a mystery: it is almost always a
+   * handler that ran past the deadline. A user reported exactly that line and
+   * asked what had happened. Say which it was.
+   */
+  killedBy: string | null;
+  /** The harness said `alive`: the preload installed the bridge. */
+  alive: boolean;
+  aliveWaiters: Array<() => void>;
+  ready: boolean;
+  readyWaiters: Array<(ok: boolean, why: string) => void>;
+  /** What Electron said when the preload failed to load, if it did. This is
+   *  the only place the real reason is knowable; without it every preload
+   *  failure looks like a plain timeout. */
+  preloadError: string | null;
+  /** Pending event dispatches, by id. */
+  inflight: Map<number, Inflight>;
+  nextEventId: number;
+}
+
+/** Message rate wall, per sandbox. A script that floods the channel makes
+ *  MAIN do the work — and main is where breakers, orders and sells are
+ *  evaluated, so a jam delays a stop-loss. Measured: 20,000 messages =
+ *  8.4 s of main-process time. */
+const MSG_BURST = 120;
+const MSG_PER_SEC = 60;
+
+interface Bucket {
+  tokens: number;
+  last: number;
+  dropped: number;
+  /** One error per flood, not one per dropped message. */
+  reported: boolean;
+}
+
+/**
+ * Two buckets per sandbox (2026-09-27). One shared bucket let a burst of log
+ * lines (a pass writing its SCORE rows) starve the script's own CALLS, and a
+ * starved call was never answered — see the refusal in `install`. Logs,
+ * stats and errors ("chatter") now spend their own budget; calls spend
+ * theirs. Each is the same size as the old single wall, so neither kind can
+ * cost main more than it could before.
+ */
+type BucketKind = 'chatter' | 'calls';
+const boxes = new Map<string, Box>();
+const byContents = new Map<number, string>();
+const buckets = new Map<string, Bucket>();
+const bucketKey = (contentsId: number, kind: BucketKind): string => `${contentsId}:${kind}`;
+let host: SandboxHost | null = null;
+let installed = false;
+let generation = 0;
+
+/** Where the bridge preload lives. Overridable ONLY so the live test can
+ *  point it at a file that does not exist and prove what a broken install
+ *  actually reports — that failure shipped once as a bare eight-second
+ *  timeout and nothing pinned it. */
+let preloadPath: string | null = null;
+export function _setPreloadPath(p: string | null): void {
+  preloadPath = p;
+}
+/** Test seam: the next start's page load fails as if Chromium refused it. */
+let failNextLoad = false;
+export function _failNextLoad(): void {
+  failNextLoad = true;
+}
+
+/** Once, before any sandbox: lock the partition down and route its messages. */
+export function install(h: SandboxHost): void {
+  host = h;
+  if (installed) return;
+  installed = true;
+  const ses = session.fromPartition(PARTITION);
+  // No network. The only request allowed is the sandbox page itself — a
+  // data: URL loading as the main frame (it DOES pass through here; the
+  // live test found the blanket cancel blocking it). Everything else —
+  // fetch, XHR, WebSocket, images, fonts, any navigation — is cancelled.
+  ses.webRequest.onBeforeRequest((details, callback) => {
+    const isOwnPage = details.resourceType === 'mainFrame' && details.url.startsWith('data:text/html');
+    callback({ cancel: !isOwnPage });
+  });
+  ses.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
+  ses.setPermissionCheckHandler(() => false);
+  // WebRTC's only way out is a proxy that carries UDP (see the window's
+  // `disable_non_proxied_udp` below); pin this partition to a direct
+  // connection so the user's system proxy can never be that carrier.
+  void ses.setProxy({ mode: 'direct' }).catch(() => undefined);
+  ipcMain.on(CHANNEL, (event, raw: unknown) => {
+    const scriptId = byContents.get(event.sender.id);
+    if (!scriptId) return; // not one of ours
+    const box = boxes.get(scriptId);
+    if (!box) return;
+    // The rate wall, before anything reads the message. `ready` and `done`
+    // are exempt: they are the control path (startup and the watchdog), they
+    // parse without touching the payload, and main's own state bounds what
+    // they can do — starving them would let a flood fake a hang or a
+    // failure to start. Everything else — log, call, error, and anything
+    // malformed — is bucketed, so a flood costs main a lookup and no more.
+    const kind = typeof raw === 'object' && raw !== null ? (raw as { t?: unknown }).t : undefined;
+    if (kind !== 'ready' && kind !== 'done' && !allow(box, kind === 'call' ? 'calls' : 'chatter')) {
+      // A dropped CALL must still be answered. Its promise in the page is
+      // what the handler awaits: left unanswered it hung the handler to the
+      // 30 s hard kill and the script lost its memory for OUR wall (09-26
+      // 22:15: a pass that priced ~120 coins at once, killed at 31 s). A
+      // refusal costs one post and the script sees an ordinary rejection.
+      const id = kind === 'call' ? (raw as { id?: unknown }).id : undefined;
+      if (typeof id === 'number' && Number.isInteger(id) && id >= 0 && id < 2 ** 31) {
+        post(box, { t: 'reply', id, ok: false, error: `dropped: over ${MSG_PER_SEC} calls a second from this script — slow down (price in batches)` });
+      }
+      return;
+    }
+    const msg = parseFromSandbox(raw);
+    if (!msg) {
+      host?.log('warn', `script ${scriptId}: dropped a malformed sandbox message`);
+      return;
+    }
+    if (msg.t === 'alive') {
+      box.alive = true;
+      for (const w of box.aliveWaiters.splice(0)) w();
+    } else if (msg.t === 'ready') {
+      box.ready = true;
+      for (const w of box.readyWaiters.splice(0)) w(true, '');
+    } else if (msg.t === 'error' && !box.ready) {
+      // The script threw while loading: say so now, not after the ready
+      // timeout has run out.
+      for (const w of box.readyWaiters.splice(0)) w(false, msg.line);
+    } else if (msg.t === 'done') {
+      // A `done` is the page's WORD that the handler finished — page code can
+      // forge one (the preload's `on` is additive and the id is in the body).
+      // It answers the caller; only a live renderer clears the watchdog.
+      box.inflight.get(msg.id)?.onDone({ ok: msg.ok, error: msg.error });
+    }
+    host?.onMessage(scriptId, msg);
+  });
+}
+
+/** Token bucket per sandbox. False ⇒ drop this message. */
+function allow(box: Box, kind: BucketKind): boolean {
+  const now = Date.now();
+  const key = bucketKey(box.contentsId, kind);
+  let b = buckets.get(key);
+  if (!b) {
+    b = { tokens: MSG_BURST, last: now, dropped: 0, reported: false };
+    buckets.set(key, b);
+  }
+  b.tokens = Math.min(MSG_BURST, b.tokens + ((now - b.last) / 1000) * MSG_PER_SEC);
+  b.last = now;
+  if (b.tokens >= 1) {
+    b.tokens -= 1;
+    // Recovered: a later flood is a new episode and reports again.
+    if (b.tokens >= MSG_BURST - 1 && b.reported) {
+      host?.log('info', `script ${box.scriptId}: message flood over — ${b.dropped} dropped`);
+      b.reported = false;
+      b.dropped = 0;
+    }
+    return true;
+  }
+  b.dropped += 1;
+  if (!b.reported) {
+    b.reported = true;
+    const what = kind === 'calls' ? 'calls' : 'log/stat messages';
+    host?.log('warn', `script ${box.scriptId}: over ${MSG_PER_SEC} sandbox ${what} a second — dropping the excess`);
+    host?.onMessage(box.scriptId, {
+      t: 'error',
+      line:
+        kind === 'calls'
+          ? `flooded the sandbox channel (over ${MSG_PER_SEC} calls a second) — the excess calls are refused ("dropped: …"); make fewer at once`
+          : `flooded the sandbox channel (over ${MSG_PER_SEC} log/stat messages a second) — the excess lines are dropped`,
+    });
+  }
+  return false;
+}
+
+export function isRunning(scriptId: string): boolean {
+  const b = boxes.get(scriptId);
+  return !!b && b.ready && !b.contents.isDestroyed();
+}
+
+/** What `start` says. `retryable` marks a failure that another attempt could
+ *  plausibly survive — a slow start, a stalled provider — as opposed to code
+ *  that will fail identically every time. The caller uses it to decide
+ *  between backing off and disarming the script. */
+export interface StartResult {
+  ok: boolean;
+  message: string;
+  retryable?: boolean;
+}
+
+/** The script's renderer working set in MB, or null (not running, or the
+ *  process metrics do not list it). For the hourly health line. */
+export function memoryMB(scriptId: string): number | null {
+  const b = boxes.get(scriptId);
+  if (!b || b.contents.isDestroyed()) return null;
+  try {
+    const pid = b.contents.getOSProcessId();
+    const kb = app.getAppMetrics().find((m) => m.pid === pid)?.memory?.workingSetSize;
+    return typeof kb === 'number' && Number.isFinite(kb) ? Math.round(kb / 1024) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Start (or restart) the sandbox for a script and load its code. */
+export async function start(scriptId: string, code: string, info?: { chain?: string; nativeSymbol?: string; inputs?: Record<string, unknown> }): Promise<StartResult> {
+  await stop(scriptId, 'restart');
+  let win: BrowserWindow;
+  try {
+    win = new BrowserWindow({
+      show: false,
+      width: 200,
+      height: 100,
+      webPreferences: {
+        preload: preloadPath ?? path.join(__dirname, 'scriptPreload.js'),
+        partition: PARTITION,
+        sandbox: true,
+        contextIsolation: true,
+        nodeIntegration: false,
+        webSecurity: true,
+        devTools: false,
+        backgroundThrottling: false,
+        images: false,
+        webgl: false,
+      },
+    });
+  } catch (err) {
+    return { ok: false, message: `sandbox window: ${(err as Error).message}`, retryable: true };
+  }
+  const contents = win.webContents;
+  const box: Box = {
+    scriptId,
+    win,
+    contents,
+    contentsId: contents.id,
+    gen: ++generation,
+    alive: false,
+    aliveWaiters: [],
+    ready: false,
+    readyWaiters: [],
+    preloadError: null,
+    killedBy: null,
+    inflight: new Map(),
+    nextEventId: 1,
+  };
+  boxes.set(scriptId, box);
+  byContents.set(box.contentsId, scriptId);
+  // The last hole in "no network": a data-channel-only RTCPeerConnection
+  // needs no permission, is not a request (so the webRequest cancel above
+  // never sees it) and no `*-src` directive covers it — `stun:<attacker>`
+  // was a DNS + UDP way out. The CSP3 `webrtc 'block'` directive is in the
+  // page for the day Chromium implements it; measured on Electron 43 it does
+  // nothing (meta AND header: 9 host candidates either way, and
+  // `default_public_interface_only` reached Google's STUN server and put this
+  // machine's public IP in the SDP). This DOES work: no candidate is
+  // gathered at all, in the page's realm and in any iframe realm it can
+  // make — measured 9 candidates → 0.
+  try {
+    contents.setWebRTCIPHandlingPolicy('disable_non_proxied_udp');
+  } catch {
+    /* older Electron — the CSP and the page comment stand */
+  }
+  contents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  contents.on('will-navigate', (e) => e.preventDefault());
+  // A preload that fails to load is SILENT: the page's harness finds no
+  // bridge and returns, so the only symptom was the ready timeout eight
+  // seconds later, with no way to tell a broken install from a slow script.
+  // Nothing subscribed to this until 2026-09-09.
+  contents.on('preload-error', (_e, preloadPath, err) => {
+    box.preloadError = `${path.basename(preloadPath)}: ${err?.message ?? String(err)}`;
+    host?.log('error', `script ${scriptId}: sandbox preload failed to load — ${box.preloadError}`);
+  });
+  const gone = (reason: string): void => {
+    // A closed window still owned by this script id must be reported even
+    // when a newer box has taken the id — but only ours is torn down.
+    const mine = boxes.get(scriptId) === box;
+    teardown(box);
+    if (mine) host?.onGone(scriptId, reason);
+  };
+  contents.on('render-process-gone', (_e, d) => gone(box.killedBy ? box.killedBy : `the renderer stopped (${d.reason})`));
+  win.on('closed', () => gone('closed'));
+
+  // Every failure below tears down THIS box, never `stop(scriptId)`: a second
+  // start may already own the id, and stopping "the script" would kill the
+  // healthy newer sandbox while this stale start reports the failure.
+  const superseded = (): boolean => boxes.get(scriptId) !== box;
+  // Our own constant page failing to load is never the script's fault, so it
+  // is RETRYABLE (2026-09-27). A soak crashed a sandbox renderer 36 minutes
+  // into a heavy run and the immediate restart's load came back ERR_FAILED
+  // (-2); reported as a plain failure, that DISABLED the script for good. A
+  // retry two seconds later is what it needed.
+  try {
+    if (failNextLoad) {
+      failNextLoad = false;
+      throw new Error('ERR_FAILED (-2) (test)');
+    }
+    await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(sandboxPageHtml())}`);
+  } catch (err) {
+    teardown(box);
+    return { ok: false, message: `sandbox load: ${(err as Error).message}`, retryable: true };
+  }
+  if (superseded()) {
+    teardown(box);
+    return { ok: false, message: `superseded by a newer start (#${box.gen} → #${generation})` };
+  }
+  if (contents.isDestroyed()) {
+    teardown(box);
+    return { ok: false, message: 'sandbox closed while loading', retryable: true };
+  }
+  // Phase 1: is the bridge there at all? `alive` is the harness's first
+  // statement, so this covers process start and nothing else. Missing it
+  // means the preload never ran — a broken build, not a slow script.
+  if (!box.alive) {
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, ALIVE_TIMEOUT_MS);
+      box.aliveWaiters.push(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+  }
+  if (superseded()) {
+    teardown(box);
+    return { ok: false, message: `superseded by a newer start (#${box.gen} → #${generation})` };
+  }
+  if (!box.alive) {
+    const why = box.preloadError
+      ? `the sandbox preload failed to load (${box.preloadError}) — this is a broken install, not a problem with your script`
+      : `the sandbox bridge never loaded (no signal in ${ALIVE_TIMEOUT_MS} ms) — this is a broken install, not a problem with your script`;
+    teardown(box);
+    host?.log('error', `script ${scriptId}: ${why}`);
+    return { ok: false, message: why, retryable: true };
+  }
+
+  // Phase 2: the script's own top-level code. It may use top-level `await`,
+  // so this budget is the USER's, and a renderer that keeps answering is
+  // given more of it rather than killed for being slow.
+  post(box, { t: 'init', scriptId, code, chain: info?.chain, nativeSymbol: info?.nativeSymbol, inputs: info?.inputs });
+  const startedAt = Date.now();
+  let ready: { ok: boolean; why: string } | null = null;
+  for (;;) {
+    ready = await new Promise<{ ok: boolean; why: string }>((resolve) => {
+      const timer = setTimeout(() => resolve({ ok: false, why: 'timeout' }), READY_TIMEOUT_MS);
+      box.readyWaiters.push((ok, why) => {
+        clearTimeout(timer);
+        resolve({ ok, why });
+      });
+    });
+    if (superseded()) {
+      teardown(box);
+      return { ok: false, message: `superseded by a newer start (#${box.gen} → #${generation})` };
+    }
+    // `why` is only 'timeout' for our own timer; a real load error arrives
+    // through the waiter and is reported as itself.
+    if (ready.ok || ready.why !== 'timeout') break;
+    if (contents.isDestroyed()) break;
+    const elapsed = Date.now() - startedAt;
+    // Still breathing? Then it is waiting on something (a `bot.market` behind
+    // a parked provider, say), not wedged. Wedged renderers never answer.
+    const breathing = await probeAlive(contents);
+    if (!breathing || elapsed >= READY_MAX_MS) {
+      const why = breathing
+        ? `the script's own top-level code did not finish within ${Math.round(READY_MAX_MS / 1000)} s`
+        : `the sandbox stopped responding while loading the script (${Math.round(elapsed / 1000)} s)`;
+      teardown(box);
+      host?.log('warn', `script ${scriptId}: ${why}`);
+      return { ok: false, message: why, retryable: breathing };
+    }
+    host?.log('info', `script ${scriptId}: still starting after ${Math.round(elapsed / 1000)} s — its top-level code is waiting on something, the sandbox is healthy`);
+  }
+  if (!ready.ok) {
+    teardown(box);
+    host?.log('info', `script ${scriptId}: sandbox failed to start (${ready.why})`);
+    return { ok: false, message: ready.why };
+  }
+  return { ok: true, message: 'running' };
+}
+
+/** True if the RENDERER itself answers. A wedged one never does; a page
+ *  merely waiting on main does. Same probe the event watchdog uses.
+ *
+ *  Tolerant since 2026-09-26 (see probeResponsive in shared/scriptProtocol):
+ *  it was one ask with a 1 s timeout, so a main process that was itself busy
+ *  for a second killed healthy scripts ("handler ran past 5 s — killed"). */
+async function probeAlive(contents: WebContents): Promise<boolean> {
+  return probeResponsive({
+    ask: () => contents.executeJavaScript('0'),
+    gone: () => contents.isDestroyed(),
+  });
+}
+
+/** Push an event and wait for the handlers.
+ *
+ *  WHAT THE DEADLINE IS ACTUALLY FOR (rewritten 2026-09-21). It exists to
+ *  catch a WEDGED renderer — a handler in an infinite loop, which nothing
+ *  else can stop. It was killing something else too: a handler legitimately
+ *  AWAITING one of our own calls. `bot.market()` is documented as "slow — a
+ *  second or more", so two of them inside one handler used up the three
+ *  seconds and the script was crashed for our latency, losing every byte of
+ *  its in-memory state. A user hit this for seven hours (see
+ *  docs/script-never-bought-2026-09-21.md).
+ *
+ *  The two cases are perfectly distinguishable and the code already knew how:
+ *  a renderer stuck in a loop cannot answer an injected expression, and one
+ *  merely awaiting can. So when the deadline fires we ASK. If it answers, the
+ *  script is not wedged — it is waiting on us — and the deadline is extended.
+ *  If it does not, it is crashed exactly as before.
+ *
+ *  Extensions are bounded by EVENT_HARD_MS: a handler still waiting after
+ *  that is a bug whichever side it is on, and an unbounded extension would be
+ *  a watchdog that never bites.
+ *
+ *  The page still cannot talk its way out of it. Its `done` answers the
+ *  caller, but the deadline is only lifted once the RENDERER answers the
+ *  probe (`executeJavaScript` sits pending for exactly as long as a wedged
+ *  renderer is wedged, where `win.on('unresponsive')` never fires at all for
+ *  a hidden window: Chromium's hang monitor is input-driven). A forged `done`
+ *  from a second, additive ipcRenderer listener buys nothing. */
+export function dispatch(scriptId: string, name: string, payload: unknown): Promise<{ ok: boolean; error?: string }> {
+  const box = boxes.get(scriptId);
+  if (!box || !box.ready || box.contents.isDestroyed()) return Promise.resolve({ ok: false, error: 'not running' });
+  const id = box.nextEventId++;
+  return new Promise((resolve) => {
+    let settled = false;
+    let probing = false;
+    const settle = (r: { ok: boolean; error?: string }): void => {
+      if (settled) return;
+      settled = true;
+      resolve(r);
+    };
+    const startedAt = Date.now();
+    let timer: NodeJS.Timeout;
+    let extended = false;
+    /**
+     * Only a PROVEN-ALIVE renderer lifts the deadline.
+     *
+     * Never `settled`: the page can settle the caller by forging a `done` for
+     * an event it never finished (the bridge's `on` is additive and the id
+     * rides in the message), so a deadline that stood down once the caller
+     * was answered could be talked out of existence by the very script it is
+     * there to stop. Caught by `forgedDoneStillKilled` in the live sandbox
+     * test the moment it was written that way (2026-09-21).
+     */
+    let cleared = false;
+    /** The deadline fired. Wedged, or just waiting on us? Ask before killing. */
+    const onDeadline = async (): Promise<void> => {
+      if (cleared || box.contents.isDestroyed()) return;
+      const waited = Date.now() - startedAt;
+      const alive = waited < EVENT_HARD_MS ? await probeAlive(box.contents) : false;
+      if (cleared || box.contents.isDestroyed()) return;
+      if (alive) {
+        // Not wedged — the handler is awaiting something, most often one of
+        // our own calls. Give it another slice rather than crashing it.
+        if (!extended) {
+          extended = true;
+          host?.log(
+            'info',
+            `script ${scriptId}: the "${name}" handler is still waiting after ${Math.round(waited / 1000)}s — it is responsive, so it is waiting on something rather than stuck. Letting it finish (up to ${EVENT_HARD_MS / 1000}s).`,
+          );
+        }
+        timer = setTimeout(() => void onDeadline(), EVENT_TIMEOUT_MS);
+        if (box.inflight.get(id) === entry) entry.timer = timer;
+        return;
+      }
+      box.inflight.delete(id);
+      // Measured at the kill, not before the probe: the probe itself can
+      // take several seconds, and "ran past 3 s" for a 9 s kill misleads.
+      const secs = Math.round((Date.now() - startedAt) / 1000);
+      settle({ ok: false, error: `handler for "${name}" ran past ${secs} s — killed` });
+      kill(
+        box,
+        scriptId,
+        waited >= EVENT_HARD_MS
+          ? `your "${name}" handler was still going after ${secs}s, so the script was restarted — anything it held in memory is gone (use bot.setState to keep it)`
+          : `your "${name}" handler stopped responding — it is most likely stuck in a loop. The script was restarted and anything it held in memory is gone (use bot.setState to keep it).`,
+      );
+    };
+    timer = setTimeout(() => void onDeadline(), EVENT_TIMEOUT_MS);
+    const clear = (): void => {
+      cleared = true;
+      clearTimeout(entry ? entry.timer : timer);
+      if (box.inflight.get(id) === entry) box.inflight.delete(id);
+    };
+    const onDone = (r: { ok: boolean; error?: string }): void => {
+      settle(r);
+      if (probing) return;
+      probing = true;
+      // Not a value we use — only the renderer's ability to answer at all.
+      // Either outcome ends the deadline; a rejection means the frame is
+      // gone, which the 'gone' handler reports on its own.
+      try {
+        void box.contents.executeJavaScript('0').then(clear, clear);
+      } catch {
+        clear();
+      }
+    };
+    const entry: Inflight = { settle, timer, onDone };
+    entry.timer = timer;
+    box.inflight.set(id, entry);
+    post(box, { t: 'event', id, name, payload });
+  });
+}
+
+function kill(box: Box, scriptId: string, why: string): void {
+  // Recorded BEFORE the crash, because `render-process-gone` fires from it
+  // and has no idea who pulled the trigger.
+  box.killedBy = why;
+  try {
+    if (!box.contents.isDestroyed()) box.contents.forcefullyCrashRenderer();
+    else void stop(scriptId, 'watchdog');
+  } catch {
+    void stop(scriptId, 'watchdog');
+  }
+}
+
+/** Answer a `call` the script made. */
+export function reply(scriptId: string, id: number, ok: boolean, value?: unknown, error?: string): void {
+  const box = boxes.get(scriptId);
+  if (!box || box.contents.isDestroyed()) return;
+  post(box, { t: 'reply', id, ok, value, error });
+}
+
+export async function stop(scriptId: string, reason = 'stopped'): Promise<void> {
+  const box = boxes.get(scriptId);
+  if (!box) return;
+  teardown(box);
+  host?.log('info', `script ${scriptId}: sandbox ${reason}`);
+}
+
+export async function stopAll(): Promise<void> {
+  for (const id of [...boxes.keys()]) await stop(id, 'shutdown');
+}
+
+// Nothing here may read a property OFF the window: a page that called
+// window.close() (or any stop after a crash) reaches teardown with the
+// BrowserWindow already destroyed, and `win.webContents` then THROWS
+// "Object has been destroyed" — out of the 'closed' listener, past
+// host.onGone (so automation never learns the script died) and into
+// crashGuard, which writes a crash file and shouts about a trade in flight.
+// The contents id and object are captured at creation for exactly this.
+function teardown(box: Box): void {
+  if (boxes.get(box.scriptId) === box) boxes.delete(box.scriptId);
+  byContents.delete(box.contentsId);
+  buckets.delete(bucketKey(box.contentsId, 'chatter'));
+  buckets.delete(bucketKey(box.contentsId, 'calls'));
+  for (const [, p] of box.inflight) {
+    clearTimeout(p.timer);
+    p.settle({ ok: false, error: 'sandbox stopped' });
+  }
+  box.inflight.clear();
+  for (const w of box.readyWaiters.splice(0)) w(false, 'sandbox stopped');
+  try {
+    if (!box.win.isDestroyed()) box.win.destroy();
+  } catch {
+    /* already gone */
+  }
+}
+
+function post(box: Box, msg: MainToSandbox): void {
+  try {
+    const wc: WebContents = box.contents;
+    if (!wc.isDestroyed()) wc.send(CHANNEL, msg);
+  } catch {
+    /* frame gone — the gone handler reports it */
+  }
+}

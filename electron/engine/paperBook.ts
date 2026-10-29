@@ -1,0 +1,175 @@
+// Paper-position book — persistence around shared/paper.ts.
+//
+// Stored in userData/paper-positions.json (tmp + rename, like the ledger).
+// Not per wallet: a paper position is a simulated fill, it belongs to the
+// install, and switching wallets should not hide it.
+//
+// This book is the ONLY place a Paper trade leaves a mark. The ledger, the
+// real portfolio, the live breakers and fee accounting never see it.
+
+import fs from 'node:fs';
+import path from 'node:path';
+import {
+  emptyPaperBook,
+  openPaper,
+  paperRealizedSol,
+  parsePaperBook,
+  samePaperKey,
+  sellPaper,
+  type PaperBook,
+  type PaperPosition,
+  type PaperSellResult,
+} from '@shared/paper';
+import type { ClosedTrade } from '@shared/portfolio';
+import type { ChainKind } from '@shared/evm';
+
+const FILE = 'paper-positions.json';
+let filePath: string | null = null;
+let book: PaperBook = emptyPaperBook();
+
+/**
+ * Set when the book on disk exists but could not be read or parsed.
+ *
+ * An unreadable book is NOT an empty book. Before this, any throw produced
+ * `emptyPaperBook()` and the very next paper fill called `save()` over the top
+ * — a real file (2 open, 9 closed, a realised total) became 0/0/0 and was then
+ * destroyed. That breaks two house rules at once: state fails CLOSED, and
+ * unknown is an em dash rather than a 0. This is the `ledger.ts` shape.
+ */
+let loadFailure: string | null = null;
+
+export function init(userDataDir: string): void {
+  filePath = path.join(userDataDir, FILE);
+  loadFailure = null;
+  let text: string;
+  try {
+    text = fs.readFileSync(filePath, 'utf8');
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
+      loadFailure = `${filePath} could not be read (${(e as Error).message})`;
+      console.warn(`[sniper] paper book: ${loadFailure} — paper trading is read-only this session`);
+    }
+    book = emptyPaperBook();
+    return;
+  }
+  try {
+    book = parsePaperBook(JSON.parse(text));
+  } catch (e) {
+    loadFailure = `${filePath} is corrupt (${(e as Error).message})`;
+    console.warn(`[sniper] paper book: ${loadFailure} — paper trading is read-only this session`);
+    book = emptyPaperBook();
+  }
+}
+
+/** Null when the book loaded. A string means the numbers are not the truth. */
+export function failure(): string | null {
+  return loadFailure;
+}
+
+function save(): void {
+  // Never write over a book we could not read — that is the data loss itself.
+  if (!filePath || loadFailure) return;
+  try {
+    const tmp = `${filePath}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(book, null, 2), 'utf8');
+    fs.renameSync(tmp, filePath);
+  } catch {
+    /* a failed save loses at most one paper fill; never blocks the trade path */
+  }
+}
+
+export function open(p: { mint: string; symbol: string; tokens: number; costSol: number; decimalsKnown: boolean; chain?: ChainKind }): { ok: boolean; message: string; position: PaperPosition | null } {
+  // A buy is refused while the book is unreadable, because it could not be
+  // recorded and the user would be told they hold something they do not. A
+  // SELL is deliberately NOT gated the same way (see below): a limit never
+  // blocks an exit, even a simulated one.
+  if (loadFailure) {
+    return { ok: false, message: `Paper trading is read-only — ${loadFailure}`, position: null };
+  }
+  const r = openPaper(book, p);
+  if (r.ok) {
+    book = r.book;
+    save();
+  }
+  return { ok: r.ok, message: r.message, position: r.position };
+}
+
+export function sell(mint: string, pct: number, priceSol: number | null, chain: ChainKind = 'solana', fixedFeeSol = 0): PaperSellResult {
+  const r = sellPaper(book, mint, pct, priceSol, Date.now(), chain, fixedFeeSol);
+  if (r.ok) {
+    book = r.book;
+    save();
+  }
+  return r;
+}
+
+export function list(): PaperPosition[] {
+  return book.open;
+}
+
+export function get(mint: string, chain: ChainKind = 'solana'): PaperPosition | undefined {
+  return book.open.find((p) => samePaperKey(p, { mint, chain }));
+}
+
+export function closed(): ClosedTrade[] {
+  return book.closed;
+}
+
+export function realized(): number {
+  return paperRealizedSol(book);
+}
+
+/**
+ * A position or round trip booked before its symbol was known (a pasted
+ * mint the feed never carried) learns it once the market layer names the
+ * token, so the replay and the card stop saying "$???". Only empty symbols
+ * are touched; the numbers are never.
+ */
+export function noteSymbol(mint: string, symbol: string): void {
+  const sym = (symbol ?? '').trim();
+  if (!sym) return;
+  let changed = false;
+  const open = book.open.map((p) => {
+    if (p.mint !== mint || p.symbol) return p;
+    changed = true;
+    return { ...p, symbol: sym };
+  });
+  const closed = book.closed.map((c) => {
+    if (c.mint !== mint || c.symbol) return c;
+    changed = true;
+    return { ...c, symbol: sym };
+  });
+  if (!changed) return;
+  book = { ...book, open, closed };
+  save();
+}
+
+/**
+ * Start the paper record over: every open paper position and every closed
+ * paper round trip, on every chain (user ask, 2026-09-24 — "it can get messy
+ * when testing scripts").
+ *
+ * The old book is copied to paper-positions.backup.json first, so one reset
+ * is recoverable by hand. Refused while the book is unreadable: that file is
+ * the thing the read-only rule protects, and a reset would write over it.
+ */
+export function reset(): { ok: boolean; message: string; open: number; closed: number } {
+  if (loadFailure) return { ok: false, message: `Paper trading is read-only — ${loadFailure}`, open: 0, closed: 0 };
+  const open = book.open.length;
+  const closed = book.closed.length;
+  if (filePath) {
+    try {
+      fs.writeFileSync(path.join(path.dirname(filePath), 'paper-positions.backup.json'), JSON.stringify(book, null, 2), 'utf8');
+    } catch {
+      return { ok: false, message: 'Could not back up the paper record first, so it was not reset.', open: 0, closed: 0 };
+    }
+  }
+  book = emptyPaperBook();
+  save();
+  return { ok: true, message: `Paper record reset — ${open} open and ${closed} closed paper trades cleared.`, open, closed };
+}
+
+/** Test hook. */
+export function _load(b: PaperBook): void {
+  book = b;
+}

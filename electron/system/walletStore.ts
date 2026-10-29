@@ -1,0 +1,228 @@
+// Multi-wallet state rules — pure, no key material, no `electron` import.
+//
+// Split from wallet.ts on the same principle as signPolicy.ts: that module
+// owns the secret, this one owns the bookkeeping, and bookkeeping is where
+// the quiet money bugs live. A dangling `activeId`, a promotion that picks
+// nothing, an import that silently duplicates a key you already hold — none
+// of those throw, they just leave you trading the wrong wallet. So every rule
+// here is a pure function over a plain object and is unit-tested directly.
+//
+// Nothing in this file ever sees a decrypted secret. `secretEnc` is carried
+// around as an opaque string.
+
+export interface StoredWallet {
+  /** Stable local id. Not derived from the key, so a relabel or a re-import
+   *  never changes how the rest of the app refers to this wallet. */
+  id: string;
+  label: string;
+  publicKey: string;
+  /** Opaque ciphertext, produced and consumed only by wallet.ts. */
+  secretEnc: string;
+  homeAddress: string | null;
+  maxBalanceSol: number;
+  createdAt: number;
+}
+
+/**
+ * GROUPS ARE GONE (2026-09-22, the owner's call: "grouping feels like
+ * bundling"), and so is the Copier that followed them. A file written before
+ * then may still carry `groups`; it is ignored and never written again.
+ */
+
+export interface WalletsFile {
+  version: 2;
+  /** The wallet that signs single trades. Null only when there are none. */
+  activeId: string | null;
+  wallets: StoredWallet[];
+}
+
+/** The single-wallet file this replaced. Still read once, to migrate. */
+export interface LegacyWalletFile {
+  version: 1;
+  publicKey: string;
+  secretEnc: string;
+  homeAddress: string | null;
+  maxBalanceSol: number;
+  createdAt: number;
+}
+
+export const DEFAULT_MAX_BALANCE_SOL = 2;
+const MAX_LABEL = 32;
+/**
+ * At most ten Solana wallets, the main one included (2026-09-22, the owner's
+ * call). It also caps pump.fun accounts at ten — one per wallet — which is the
+ * difference between someone's own handful and an account farm.
+ *
+ * Enforced where a wallet is ADDED, never on read: a file that already holds
+ * more (made before the cap) keeps every key; it just cannot grow until it is
+ * back under ten. A cap that deleted keys would be data loss.
+ */
+export const MAX_WALLETS = 15;
+
+export function emptyFile(): WalletsFile {
+  return { version: 2, activeId: null, wallets: [] };
+}
+
+export function cleanLabel(raw: string, fallbackIndex: number): string {
+  const trimmed = (raw ?? '').replace(/\s+/g, ' ').trim().slice(0, MAX_LABEL);
+  return trimmed.length ? trimmed : `Wallet ${fallbackIndex}`;
+}
+
+/**
+ * Read whatever is on disk into the current shape.
+ *
+ * Accepts the v1 single-wallet file and migrates it, because the alternative
+ * — treating an unrecognised file as "no wallet" — would look exactly like a
+ * wallet that vanished, on a file holding the only copy of a key.
+ */
+export function parseFile(raw: unknown, now: number, mintId: () => string): WalletsFile | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const obj = raw as Record<string, unknown>;
+
+  if (obj.version === 1 && typeof obj.publicKey === 'string' && typeof obj.secretEnc === 'string') {
+    return migrateLegacy(obj as unknown as LegacyWalletFile, now, mintId());
+  }
+
+  if (obj.version !== 2 || !Array.isArray(obj.wallets)) return null;
+  const wallets: StoredWallet[] = [];
+  for (const w of obj.wallets as unknown[]) {
+    const parsed = parseWallet(w);
+    // Skip a malformed entry rather than discarding the whole file: one bad
+    // record must not take the other wallets down with it.
+    if (parsed && !wallets.some((x) => x.publicKey === parsed.publicKey)) wallets.push(parsed);
+  }
+  // Skipping one bad record is right; skipping EVERY record is not. A file
+  // that listed wallets and yielded none is a file we failed to understand —
+  // returning a valid empty file here leaves the store writable, and the next
+  // `generate()` writes over the only copy of the ciphertext. Fail closed and
+  // let the caller keep the file untouched.
+  if (wallets.length === 0 && (obj.wallets as unknown[]).length > 0) return null;
+
+  const activeId = typeof obj.activeId === 'string' ? obj.activeId : null;
+  return healActive({ version: 2, activeId, wallets });
+}
+
+function parseWallet(w: unknown): StoredWallet | null {
+  if (!w || typeof w !== 'object') return null;
+  const o = w as Record<string, unknown>;
+  if (typeof o.id !== 'string' || !o.id) return null;
+  if (typeof o.publicKey !== 'string' || !o.publicKey) return null;
+  if (typeof o.secretEnc !== 'string' || !o.secretEnc) return null;
+  const max = typeof o.maxBalanceSol === 'number' && o.maxBalanceSol > 0 ? o.maxBalanceSol : DEFAULT_MAX_BALANCE_SOL;
+  return {
+    id: o.id,
+    label: typeof o.label === 'string' && o.label.trim() ? o.label.slice(0, MAX_LABEL) : 'Wallet',
+    publicKey: o.publicKey,
+    secretEnc: o.secretEnc,
+    homeAddress: typeof o.homeAddress === 'string' ? o.homeAddress : null,
+    maxBalanceSol: max,
+    createdAt: typeof o.createdAt === 'number' ? o.createdAt : 0,
+  };
+}
+
+export function migrateLegacy(legacy: LegacyWalletFile, now: number, id: string): WalletsFile {
+  const w: StoredWallet = {
+    id,
+    label: 'Wallet 1',
+    publicKey: legacy.publicKey,
+    secretEnc: legacy.secretEnc,
+    homeAddress: legacy.homeAddress ?? null,
+    maxBalanceSol: legacy.maxBalanceSol > 0 ? legacy.maxBalanceSol : DEFAULT_MAX_BALANCE_SOL,
+    createdAt: legacy.createdAt || now,
+  };
+  return { version: 2, activeId: w.id, wallets: [w] };
+}
+
+/**
+ * Guarantee the invariant every caller depends on: `activeId` names a wallet
+ * that exists, and is null only when none do.
+ *
+ * Without this a file whose active wallet was removed by hand reads back with
+ * no signer while wallets are plainly listed — which presents as "no wallet"
+ * on a machine that has several.
+ */
+export function healActive(file: WalletsFile): WalletsFile {
+  if (!file.wallets.length) return { ...file, activeId: null };
+  if (file.activeId && file.wallets.some((w) => w.id === file.activeId)) return file;
+  const oldest = [...file.wallets].sort((a, b) => a.createdAt - b.createdAt)[0];
+  return { ...file, activeId: oldest.id };
+}
+
+export function activeWallet(file: WalletsFile): StoredWallet | null {
+  if (!file.activeId) return null;
+  return file.wallets.find((w) => w.id === file.activeId) ?? null;
+}
+
+export interface StoreResult {
+  file: WalletsFile;
+  ok: boolean;
+  message: string;
+}
+
+/** Add a wallet. The first one added becomes active; later ones do not, so
+ *  importing a key never silently changes which wallet is signing. */
+export function addWallet(file: WalletsFile, w: StoredWallet): StoreResult {
+  if (file.wallets.length >= MAX_WALLETS) {
+    return { file, ok: false, message: `At most ${MAX_WALLETS} wallets.` };
+  }
+  if (file.wallets.some((x) => x.publicKey === w.publicKey)) {
+    return { file, ok: false, message: 'That key is already in this wallet list.' };
+  }
+  if (file.wallets.some((x) => x.id === w.id)) {
+    return { file, ok: false, message: 'Duplicate wallet id.' };
+  }
+  const wallets = [...file.wallets, w];
+  const activeId = file.activeId ?? w.id;
+  return { file: healActive({ ...file, wallets, activeId }), ok: true, message: `Added ${w.label}` };
+}
+
+export function selectWallet(file: WalletsFile, id: string): StoreResult {
+  const target = file.wallets.find((w) => w.id === id);
+  if (!target) return { file, ok: false, message: 'No such wallet.' };
+  if (file.activeId === id) return { file, ok: true, message: `${target.label} is already active` };
+  return { file: { ...file, activeId: id }, ok: true, message: `Switched to ${target.label}` };
+}
+
+export function renameWallet(file: WalletsFile, id: string, label: string): StoreResult {
+  const idx = file.wallets.findIndex((w) => w.id === id);
+  if (idx < 0) return { file, ok: false, message: 'No such wallet.' };
+  const wallets = [...file.wallets];
+  wallets[idx] = { ...wallets[idx], label: cleanLabel(label, idx + 1) };
+  return { file: { ...file, wallets }, ok: true, message: 'Renamed' };
+}
+
+/**
+ * Remove a wallet, promoting another when the active one goes.
+ *
+ * Deliberately does NOT refuse to remove the last wallet — the user is
+ * entitled to delete their key. What it refuses to do is leave the file in a
+ * state where something still points at a wallet that is gone.
+ */
+export function removeWallet(file: WalletsFile, id: string): StoreResult {
+  const target = file.wallets.find((w) => w.id === id);
+  if (!target) return { file, ok: false, message: 'No such wallet.' };
+  const wallets = file.wallets.filter((w) => w.id !== id);
+  const activeId = file.activeId === id ? null : file.activeId;
+  return {
+    file: healActive({ ...file, wallets, activeId }),
+    ok: true,
+    message: `Removed ${target.label}`,
+  };
+}
+
+/** Patch the ACTIVE wallet's settings (withdrawal address, balance cap). */
+export function patchActive(file: WalletsFile, patch: Partial<Pick<StoredWallet, 'homeAddress' | 'maxBalanceSol'>>): StoreResult {
+  const active = activeWallet(file);
+  if (!active) return { file, ok: false, message: 'No wallet' };
+  const wallets = file.wallets.map((w) => (w.id === active.id ? { ...w, ...patch } : w));
+  return { file: { ...file, wallets }, ok: true, message: 'Updated' };
+}
+
+/** The next default label, given what is already there. */
+export function nextLabel(file: WalletsFile): string {
+  for (let n = 1; n <= MAX_WALLETS + 1; n++) {
+    const candidate = `Wallet ${n}`;
+    if (!file.wallets.some((w) => w.label === candidate)) return candidate;
+  }
+  return 'Wallet';
+}

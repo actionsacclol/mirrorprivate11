@@ -1,0 +1,49 @@
+WEBVTT
+
+1
+00:00:00.960 --> 00:00:11.892
+The AI page connects an AI app you already use, such as Claude Code, Codex or Cursor, over MCP. It sees what your follows see, and on the follows you choose, it has the final say.
+
+2
+00:00:13.794 --> 00:00:18.594
+Switch the connection on. It opens a port on this computer only, and starts read only.
+
+3
+00:00:22.832 --> 00:00:32.888
+Choose how far it reaches: read only, paper trading, or live trading. Deciding a follow’s trades needs paper trading for paper follows, and live trading for live ones.
+
+4
+00:00:34.345 --> 00:00:43.137
+Pick your AI app, then copy the command or the config into it. It carries a token, a password for this app, so the screen masks it. Never paste it into a chat.
+
+5
+00:00:51.200 --> 00:01:01.479
+Then paste this prompt into the AI app. It starts the loop that hears your follows and answers their questions. The AI app has to keep running, and each event it reads costs its own tokens.
+
+6
+00:01:02.195 --> 00:01:11.189
+Limits cap what the AI may spend on its own buys. A follow’s copies keep the follow’s own size: the AI can only shrink or skip them, and sells are never capped.
+
+7
+00:01:11.914 --> 00:01:19.550
+Whatever you allow, the AI can never withdraw, change a setting, arm a follow, or see your key. It asks; the app checks and builds every trade.
+
+8
+00:01:23.838 --> 00:01:30.193
+Choose which follows it decides on the Follow page, under Advanced: Your AI decides each buy, each sell, or both.
+
+9
+00:01:36.063 --> 00:01:43.108
+Set how long it has to answer. Past that, the follow’s own rule decides, and for a buy you choose: skip it, or copy anyway.
+
+10
+00:01:48.604 --> 00:01:55.630
+Stop-losses do not wait for the AI unless you say so. An AI that is thinking, or offline, never holds you in a falling coin.
+
+11
+00:02:00.183 --> 00:02:07.712
+Back on the AI page: the follows it decides, the questions waiting on it, and every decision, with the answer and how long it took.
+
+12
+00:02:17.701 --> 00:02:23.270
+Start it on paper trading, and read its decisions for a week before an AI ever touches a live follow.

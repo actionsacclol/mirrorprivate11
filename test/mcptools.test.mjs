@@ -1,0 +1,510 @@
+// What an MCP tool call does (electron/engine/mcpTools.ts), against a fake host.
+//
+// The server test proves the door is a door. This proves that what comes
+// through it is bounded: arguments are refused rather than coerced, unknown
+// fields never reach a trade, the budget is reserved BEFORE the app is asked
+// (so two calls in flight cannot both spend the same allowance), and a paper
+// connection never reaches the live pipeline.
+
+import assert from 'node:assert';
+import * as tools from './.mcptools.mjs';
+
+let passed = 0;
+const ok = (label) => {
+  console.log(`  ok   ${label}`);
+  passed += 1;
+};
+
+const MINT = 'CopyMint111111111111111111111111111111111';
+const WALLET = 'Whae1111111111111111111111111111111111111';
+
+let access = 'live';
+let budget = { maxBuySol: 0.1, hourlyCapSol: 0.5, maxTradesPerMinute: 4 };
+let calls;
+let answers;
+
+function setup(over = {}) {
+  tools._reset();
+  calls = { buys: [], sells: [], orders: [], cancels: [], reads: [], krypto: [], trader: [] };
+  answers = { buy: { ok: true, message: 'bought' }, sell: { ok: true, message: 'sold' }, order: { ok: true, message: 'armed' }, ...over.answers };
+  const read = (name) => async (...args) => {
+    calls.reads.push({ name, args });
+    return over[name] !== undefined ? over[name] : { name };
+  };
+  tools.attach({
+    access: () => access,
+    budget: () => budget,
+    defaultChain: () => 'solana',
+    walletInfo: read('walletInfo'),
+    positions: async (paper, chain) => {
+      calls.reads.push({ name: 'positions', args: [paper, chain] });
+      return { paper, chain };
+    },
+    token: read('token'),
+    discover: read('discover'),
+    chart: read('chart'),
+    tokenLinks: read('tokenLinks'),
+    runnerAlerts: read('runnerAlerts'),
+    callouts: read('callouts'),
+    scoutBoard: read('scoutBoard'),
+    scoutWallet: read('scoutWallet'),
+    copyConfigs: read('copyConfigs'),
+    orders: read('orders'),
+    trades: read('trades'),
+    buy: async (mint, amount, paper, chain) => {
+      calls.buys.push({ mint, amount, paper, chain });
+      return answers.buy;
+    },
+    sell: async (mint, percent, paper, chain) => {
+      calls.sells.push({ mint, percent, paper, chain });
+      return answers.sell;
+    },
+    placeOrder: async (req, paper) => {
+      calls.orders.push({ req, paper });
+      return answers.order;
+    },
+    kryptoSessions: read('kryptoSessions'),
+    kryptoTrade: async (mint, side, amount, live) => {
+      calls.krypto.push({ mint, side, amount, live });
+      return { ok: true, message: 'krypto ok' };
+    },
+    traderSessions: async () => [{ session_id: 'kt_one', seq: 3 }],
+    traderSession: async (id) => (id === 'kt_one' ? { session_id: 'kt_one', seq: 3, facts: { coin: 'the coin' } } : null),
+    traderGate: (id) => (id === 'kt_one' ? { driver: 'mcp', status: 'running', mode: 'paper', seq: 3, ...(over.gate ?? {}) } : null),
+    traderAct: async (id, intent, expectedSeq) => {
+      calls.trader.push({ id, intent, expectedSeq });
+      return { ok: true, message: `${intent.action} done`, seq: expectedSeq + 1 };
+    },
+    cancelOrders: async (mint) => {
+      calls.cancels.push(mint);
+      return { ok: true, message: 'Cancelled 2 order(s).', cancelled: 2 };
+    },
+    // The AI desk (2026-10-28).
+    deskPoll: async (cursor, waitMs, kinds) => {
+      calls.desk = calls.desk ?? [];
+      calls.desk.push({ name: 'poll', cursor, waitMs, kinds });
+      return { cursor: 9, events: [{ seq: 9, kind: 'copy' }], missed: 0, pending: [{ id: 'ai_3' }] };
+    },
+    deskPending: () => [{ id: 'ai_3' }],
+    deskDecide: (id, v) => {
+      calls.desk = calls.desk ?? [];
+      calls.desk.push({ name: 'decide', id, v });
+      return { ok: true, message: `Recorded: ${v.verdict}.` };
+    },
+    copyMode: (id) => (id === 'cfgLive' ? 'live' : id === 'cfgPaper' ? 'paper' : null),
+    sellCopy: (configId, mint, percent, reason) => {
+      calls.desk = calls.desk ?? [];
+      calls.desk.push({ name: 'sellCopy', configId, mint, percent, reason });
+      return { ok: true, message: 'Selling.' };
+    },
+    log: () => {},
+  });
+}
+
+// ── arguments are refused, never coerced ─────────────────────────────────
+{
+  setup();
+  access = 'live';
+  const bad = [
+    ['buy_token', { mint: 'not-base58', amount: 0.01 }, /not a Solana mint/],
+    ['buy_token', { mint: MINT }, /amount is required/],
+    ['buy_token', { mint: MINT, amount: '0.1' }, /amount must be a number/],
+    ['buy_token', { mint: MINT, amount: Number.NaN }, /amount must be a number/],
+    ['sell_token', { mint: MINT, percent: 0 }, /at least 1/],
+    ['sell_token', { mint: MINT, percent: 101 }, /at most 100/],
+    ['find_tokens', {}, /list is required/],
+    ['find_tokens', { list: 'hot' }, /list must be one of/],
+    ['find_tokens', { list: 'new', limit: 500 }, /at most 50/],
+    ['get_wallet_record', { address: 'nope' }, /is not an address/],
+    ['get_wallet_scores', { chain: 'ethereum' }, /chain must be one of/],
+    ['place_order', { mint: MINT, kind: 'limit_buy', triggerBasis: 'pct', triggerValue: 20, amount: 0.05 }, /needs an absolute level/],
+    ['place_order', { mint: MINT, kind: 'moon', triggerBasis: 'pct', triggerValue: 1, amount: 1 }, /kind must be one of/],
+  ];
+  for (const [name, args, re] of bad) {
+    const r = await tools.call(name, args);
+    assert.equal(r.ok, false, `${name} ${JSON.stringify(args)} should be refused`);
+    assert.match(r.text, re, `${name}: ${r.text}`);
+  }
+  assert.equal(calls.buys.length + calls.sells.length + calls.orders.length, 0, 'not one of them reached the app');
+
+  // A field nobody agreed to read must never ride along into a trade.
+  const smuggled = await tools.call('buy_token', { mint: MINT, amount: 0.01, feeBps: 0, slippage: 99 });
+  assert.equal(smuggled.ok, false);
+  assert.match(smuggled.text, /does not take feeBps, slippage/);
+  assert.equal(calls.buys.length, 0);
+  ok('bad arguments are refused with the reason, and an unknown field is refused rather than ignored');
+}
+
+// ── the access ladder reaches the tools themselves ───────────────────────
+{
+  setup();
+  access = 'read';
+  for (const name of ['buy_token', 'sell_token', 'place_order', 'cancel_orders']) {
+    const r = await tools.call(name, { mint: MINT, amount: 0.01, percent: 50, kind: 'stop_loss', triggerBasis: 'pct', triggerValue: 20 });
+    assert.equal(r.ok, false, `${name} on a read connection`);
+    assert.match(r.text, /read only/i);
+  }
+  assert.equal(calls.buys.length + calls.sells.length + calls.orders.length + calls.cancels.length, 0);
+  // Reads still work, and say which mode they are in.
+  const w = await tools.call('get_wallet', {});
+  assert.equal(w.ok, true);
+  assert.match(w.text, /READ ONLY/, 'a read-only connection is told it cannot trade at all — not that it is in paper, which would invite it to try');
+  assert.equal(w.data.mode, 'read-only');
+  ok('a read-only connection is refused every trade tool inside the tool layer too, not only at the door');
+}
+
+// ── paper never touches the live pipeline ────────────────────────────────
+{
+  setup();
+  access = 'paper';
+  const b = await tools.call('buy_token', { mint: MINT, amount: 0.05 });
+  assert.equal(b.ok, true);
+  assert.deepEqual(calls.buys, [{ mint: MINT, amount: 0.05, paper: true, chain: 'solana' }], 'paper is passed down, not assumed');
+  assert.match(b.text, /Paper buy/);
+  const s = await tools.call('sell_token', { mint: MINT, percent: 50 });
+  assert.equal(calls.sells[0].paper, true);
+  assert.match(s.text, /Paper sell/);
+  // Paper is not bounded by the value caps — a record built under tighter
+  // limits measures a strategy nobody intends to run.
+  const big = await tools.call('buy_token', { mint: MINT, amount: 999 });
+  assert.equal(big.ok, true);
+  assert.equal(calls.buys.at(-1).amount, 999);
+  const pos = await tools.call('get_positions', {});
+  assert.deepEqual(pos.data, { paper: true, chain: 'solana' }, 'and positions read the paper book');
+  ok('a paper connection passes paper all the way down, reads the paper book, and is not held to the spending caps');
+}
+
+// ── a read-only connection reads the book the APP is using ───────────────
+// 09-24: a read-only connection on a live app read the paper book and said
+// the wallet held nothing while it held a coin.
+{
+  setup({ walletInfo: { appMode: 'live' } });
+  access = 'read';
+  assert.deepEqual((await tools.call('get_positions', {})).data, { paper: false, chain: 'solana' }, 'live app: the real book');
+  setup({ walletInfo: { appMode: 'paper' } });
+  access = 'read';
+  assert.deepEqual((await tools.call('get_positions', {})).data, { paper: true, chain: 'solana' }, 'paper app: the paper book');
+  setup({ walletInfo: {} });
+  access = 'read';
+  assert.equal((await tools.call('get_positions', {})).data.paper, true, 'an unknown app mode never claims the live book');
+  ok('a read-only connection reads the book the app is using, not always the paper one');
+}
+
+// ── live spending is bounded, and reserved before the app is asked ───────
+{
+  setup();
+  access = 'live';
+  budget = { maxBuySol: 0.1, hourlyCapSol: 0.25, maxTradesPerMinute: 10 };
+
+  const over = await tools.call('buy_token', { mint: MINT, amount: 0.5 });
+  assert.equal(over.ok, false);
+  assert.match(over.text, /0\.1 per-trade limit/);
+  assert.equal(calls.buys.length, 0, 'a refusal never reaches the app');
+
+  for (let i = 0; i < 2; i++) assert.equal((await tools.call('buy_token', { mint: MINT, amount: 0.1 })).ok, true);
+  assert.equal(calls.buys.length, 2);
+  const capped = await tools.call('buy_token', { mint: MINT, amount: 0.1 });
+  assert.equal(capped.ok, false, '0.2 spent + 0.1 passes the 0.25 hourly cap');
+  assert.match(capped.text, /hourly limit/);
+  assert.equal(calls.buys.length, 2);
+
+  // The reservation rule: the attempt is recorded BEFORE the app answers, so
+  // two calls in flight cannot both read an allowance neither has spent.
+  setup();
+  budget = { maxBuySol: 1, hourlyCapSol: 1, maxTradesPerMinute: 10 };
+  let release;
+  answers.buy = new Promise((r) => (release = r));
+  const a = tools.call('buy_token', { mint: MINT, amount: 0.6 });
+  const b = tools.call('buy_token', { mint: MINT, amount: 0.6 });
+  release({ ok: true, message: 'bought' });
+  const [ra, rb] = await Promise.all([a, b]);
+  assert.equal([ra.ok, rb.ok].filter(Boolean).length, 1, 'exactly one of two concurrent buys passed the cap');
+  assert.equal(calls.buys.length, 1, 'and only one reached the app');
+
+  // The rate limit counts every trade, buy or sell.
+  setup();
+  budget = { maxBuySol: 1, hourlyCapSol: 10, maxTradesPerMinute: 2 };
+  assert.equal((await tools.call('sell_token', { mint: MINT, percent: 10 })).ok, true);
+  assert.equal((await tools.call('sell_token', { mint: MINT, percent: 10 })).ok, true);
+  const third = await tools.call('sell_token', { mint: MINT, percent: 10 });
+  assert.equal(third.ok, false);
+  assert.match(third.text, /2 trades in a minute/);
+  ok('live buys meet the per-trade and hourly caps, the allowance is reserved before the app is asked, and the rate limit counts sells too');
+}
+
+// ── a limit buy commits funds, so it meets the same caps ─────────────────
+{
+  setup();
+  access = 'live';
+  budget = { maxBuySol: 0.1, hourlyCapSol: 0.5, maxTradesPerMinute: 10 };
+  const over = await tools.call('place_order', { mint: MINT, kind: 'limit_buy', triggerBasis: 'price_sol', triggerValue: 0.001, amount: 5 });
+  assert.equal(over.ok, false, 'an order that would spend 5 SOL when it fires is not a way around a 0.1 cap');
+  assert.equal(calls.orders.length, 0);
+  // An exit is never value-capped: the worst case is a sale into the user's
+  // own wallet.
+  const stop = await tools.call('place_order', { mint: MINT, kind: 'stop_loss', triggerBasis: 'pct', triggerValue: 30, amount: 100 });
+  assert.equal(stop.ok, true);
+  assert.equal(calls.orders.length, 1);
+  assert.equal(calls.orders[0].paper, false);
+  ok('a limit buy is checked against the buy caps; a stop loss, which only ever sells, is not');
+}
+
+{
+  // MCP-1 (audit 2026-09-23): arming a sell-type order still counts against
+  // the per-minute rate limit, so a live agent cannot arm unlimited
+  // stop_loss/take_profit/limit_sell orders in a burst.
+  setup();
+  access = 'live';
+  budget = { maxBuySol: 1, hourlyCapSol: 10, maxTradesPerMinute: 2 };
+  const a = await tools.call('place_order', { mint: MINT, kind: 'stop_loss', triggerBasis: 'pct', triggerValue: 30, amount: 100 });
+  const b = await tools.call('place_order', { mint: MINT, kind: 'take_profit', triggerBasis: 'pct', triggerValue: 50, amount: 100 });
+  const c = await tools.call('place_order', { mint: MINT, kind: 'limit_sell', triggerBasis: 'price_sol', triggerValue: 0.001, amount: 100 });
+  assert.equal(a.ok, true);
+  assert.equal(b.ok, true);
+  assert.equal(c.ok, false, 'the third arming in the minute is over the rate limit');
+  assert.match(c.text ?? c.message ?? JSON.stringify(c), /trades in a minute/);
+  assert.equal(calls.orders.length, 2, 'only the two that passed the limit were armed');
+  ok('arming sell-type orders is rate-limited, not just limit buys');
+}
+
+// ── reads pass their arguments through and say what they are ─────────────
+{
+  setup({ token: null, scoutWallet: null });
+  access = 'read';
+  const missing = await tools.call('get_token', { mint: MINT });
+  assert.equal(missing.ok, false);
+  assert.match(missing.text, /could not read that token/);
+  const noRec = await tools.call('get_wallet_record', { address: WALLET });
+  assert.equal(noRec.ok, false);
+  assert.match(noRec.text, /Read from the chain/, 'and says how to fill the record in');
+
+  setup();
+  const scores = await tools.call('get_wallet_scores', { chain: 'bnb', window: 'month', limit: 5, onlyWorthALook: true });
+  assert.equal(scores.ok, true);
+  assert.deepEqual(calls.reads.at(-1).args, ['bnb', 'month', 5, true], 'every argument reaches the host as given');
+  assert.match(scores.text, /not an edge/, 'and the answer repeats what the score is not');
+  const hist = await tools.call('get_trade_history', {});
+  assert.deepEqual(calls.reads.at(-1).args, [25], 'the documented default is the one used');
+  assert.match(hist.text, /already include fees/);
+  ok('reads pass their arguments through unchanged, default as documented, and each answer carries the caveat the number needs');
+}
+
+// ── three chains, where the app has three ────────────────────────────────
+{
+  setup();
+  access = 'live';
+  budget = { maxBuySol: 10, hourlyCapSol: 100, maxTradesPerMinute: 60 };
+  const EVM_TOKEN = '0x' + 'ab'.repeat(20);
+
+  // An EVM address is refused on Solana and vice versa — a buy that fell
+  // through to the wrong chain would spend SOL on another chain's address.
+  assert.match((await tools.call('buy_token', { mint: EVM_TOKEN, amount: 0.1 })).text, /not a Solana mint/);
+  assert.match((await tools.call('buy_token', { mint: MINT, amount: 0.1, chain: 'bnb' })).text, /not a contract address on BNB/);
+  assert.equal(calls.buys.length, 0);
+
+  // The right pairing routes, and the chain travels all the way down.
+  assert.equal((await tools.call('buy_token', { mint: EVM_TOKEN, amount: 0.1, chain: 'bnb' })).ok, true);
+  assert.deepEqual(calls.buys.at(-1), { mint: EVM_TOKEN, amount: 0.1, paper: false, chain: 'bnb' });
+  assert.equal((await tools.call('sell_token', { mint: EVM_TOKEN, percent: 50, chain: 'robinhood' })).ok, true);
+  assert.equal(calls.sells.at(-1).chain, 'robinhood');
+  // EVM addresses are stored lower-cased, as the rest of the app keys them.
+  await tools.call('buy_token', { mint: '0x' + 'AB'.repeat(20), amount: 0.1, chain: 'bnb' });
+  assert.equal(calls.buys.at(-1).mint, EVM_TOKEN, 'the address is lower-cased on the way in');
+
+  // Reads follow the chain too.
+  await tools.call('get_positions', { chain: 'bnb' });
+  assert.deepEqual(calls.reads.at(-1).args, [false, 'bnb']);
+  await tools.call('get_token', { mint: EVM_TOKEN, chain: 'robinhood' });
+  assert.deepEqual(calls.reads.at(-1).args, [EVM_TOKEN, 'robinhood']);
+  await tools.call('find_tokens', { list: 'new', chain: 'bnb' });
+  assert.deepEqual(calls.reads.at(-1).args, ['new', 20, 'bnb']);
+
+  // The four Solana-only tools take no chain at all, so passing one is an
+  // unknown field rather than a silently ignored hint.
+  for (const [name, args] of [
+    ['place_order', { mint: MINT, kind: 'stop_loss', triggerBasis: 'pct', triggerValue: 20, amount: 100, chain: 'bnb' }],
+    ['cancel_orders', { mint: MINT, chain: 'bnb' }],
+    ['get_chart', { mint: MINT, chain: 'bnb' }],
+    ['get_token_links', { mint: MINT, chain: 'bnb' }],
+  ]) {
+    const r = await tools.call(name, args);
+    assert.equal(r.ok, false, `${name} should refuse a chain it cannot honour`);
+    assert.match(r.text, /does not take chain/, `${name}: ${r.text}`);
+  }
+  ok('trades and reads route to all three chains, an address of the wrong shape is refused, and the Solana-only tools refuse a chain outright');
+}
+
+// ── the four readers added 2026-09-21 ────────────────────────────────────
+{
+  setup();
+  access = 'read';
+  const chart = await tools.call('get_chart', { mint: MINT, interval: '5m', limit: 50 });
+  assert.equal(chart.ok, true);
+  assert.deepEqual(calls.reads.at(-1).args, [MINT, '5m', 50]);
+  assert.match(chart.text, /5m candles, oldest first/);
+  await tools.call('get_chart', { mint: MINT });
+  assert.deepEqual(calls.reads.at(-1).args, [MINT, '1m', 120], 'the documented defaults are the ones used');
+  assert.match((await tools.call('get_chart', { mint: MINT, interval: '3h' })).text, /interval must be one of/);
+
+  const runners = await tools.call('get_runner_alerts', { chain: 'bnb', limit: 5 });
+  assert.equal(runners.ok, true);
+  assert.deepEqual(calls.reads.at(-1).args, ['bnb', 5]);
+  assert.match(runners.text, /most flagged launches still do not graduate/, 'a flag is never reported as a prediction');
+
+  const calls_ = await tools.call('get_callouts', {});
+  assert.equal(calls_.ok, true);
+  assert.deepEqual(calls.reads.at(-1).args, [20]);
+  assert.match(calls_.text, /what THEY report about themselves/, 'pump’s own numbers are labelled as pump’s');
+  assert.match(calls_.text, /coinCallouts is the COIN’s callout count/, 'the coin’s call count is never passed off as the caller’s (2026-09-26)');
+
+  // "Nobody has looked yet" and "there is nothing there" are different, and
+  // each says which — an empty chart is not a flat price.
+  setup({ chart: [], tokenLinks: null, callouts: null });
+  assert.match((await tools.call('get_chart', { mint: MINT })).text, /may have none/);
+  assert.match((await tools.call('get_token_links', { mint: MINT })).text, /Look it up with get_token first/);
+  assert.match((await tools.call('get_callouts', {})).text, /not answering right now/);
+  ok('the four readers pass their arguments, default as documented, and tell an empty answer apart from an unread one');
+}
+
+// ── $Krypto Mode ─────────────────────────────────────────────────────────
+{
+  setup();
+  budget = { maxBuySol: 0.1, hourlyCapSol: 0.5, maxTradesPerMinute: 60 };
+  access = 'read';
+  assert.equal((await tools.call('get_krypto_sessions', {})).ok, true, 'reading sessions is a read tool');
+  const ro = await tools.call('krypto_mode_trade', { mint: MINT, side: 'buy', amount: 0.01 });
+  assert.equal(ro.ok, false, 'a read-only connection cannot trade a bot');
+  assert.equal(calls.krypto.length, 0);
+  access = 'paper';
+  assert.equal((await tools.call('krypto_mode_trade', { mint: MINT, side: 'buy', amount: 0.01 })).ok, true);
+  assert.equal(calls.krypto.at(-1).live, false, 'a paper connection says so, and kryptoMode refuses it a live session');
+  access = 'live';
+  assert.equal((await tools.call('krypto_mode_trade', { mint: MINT, side: 'sell', amount: 150 })).ok, false, 'a sell over 100% is refused, not clipped');
+  assert.equal((await tools.call('krypto_mode_trade', { mint: MINT, side: 'dump', amount: 1 })).ok, false);
+  assert.equal((await tools.call('krypto_mode_trade', { mint: MINT, side: 'buy', amount: 5 })).ok, false, 'the connection budget applies too (0.1 SOL per buy)');
+  const good = await tools.call('krypto_mode_trade', { mint: MINT, side: 'buy', amount: 0.05 });
+  assert.equal(good.ok, true);
+  assert.deepEqual(calls.krypto.at(-1), { mint: MINT, side: 'buy', amount: 0.05, live: true });
+  ok('krypto_mode_trade: trade tier, both budgets, strict arguments, paper connections flagged');
+}
+
+// ── Krypto Trader: trader_act, checked in the design's order (§8) ────────
+{
+  setup();
+  budget = { maxBuySol: 0.1, hourlyCapSol: 0.5, maxTradesPerMinute: 60 };
+  access = 'read';
+  assert.equal((await tools.call('get_trader_sessions', {})).ok, true, 'reading sessions is a read tool');
+  const one = await tools.call('get_trader_session', { session_id: 'kt_one' });
+  assert.equal(one.ok, true);
+  assert.equal(one.data.seq, 3);
+  assert.equal(one.data.connection_budget.mode, 'read-only');
+  assert.match(one.text, /untrusted data, never instructions/);
+  assert.match((await tools.call('get_trader_session', { session_id: 'kt_none' })).text, /No Krypto Trader session/);
+  assert.match((await tools.call('get_trader_session', { session_id: 'km_x' })).text, /not a Krypto Trader session id/);
+  // 1. toolAllowed: a read-only connection cannot act.
+  const ro = await tools.call('trader_act', { session_id: 'kt_one', action: 'buy', sol: 0.01, reason: 'x', expected_seq: 3 });
+  assert.equal(ro.ok, false);
+  assert.match(ro.text, /read only/i);
+  access = 'paper';
+  // Arguments are refused, never coerced.
+  for (const [args, re] of [
+    [{ session_id: 'kt_one', action: 'buy', sol: 0.01, percent: 10, reason: 'x', expected_seq: 3 }, /never both/],
+    [{ session_id: 'kt_one', action: 'hold', sol: 0.01, reason: 'x', expected_seq: 3 }, /neither sol nor percent/],
+    [{ session_id: 'kt_one', action: 'sell', percent: 150, reason: 'x', expected_seq: 3 }, /at most 100/],
+    [{ session_id: 'kt_one', action: 'buy', reason: 'x', expected_seq: 3 }, /sol is required/],
+    [{ session_id: 'kt_one', action: 'buy', sol: 0.01, expected_seq: 3 }, /reason is required/],
+    [{ session_id: 'kt_one', action: 'buy', sol: 0.01, reason: 'x'.repeat(161), expected_seq: 3 }, /at most 160/],
+    [{ session_id: 'kt_one', action: 'buy', sol: 0.01, reason: 'x' }, /expected_seq is required/],
+    [{ session_id: 'kt_one', action: 'dump', reason: 'x', expected_seq: 3 }, /action must be one of/],
+    [{ session_id: 'kt_one', action: 'buy', sol: 0.01, reason: 'x', expected_seq: 3, budgetSol: 50 }, /does not take budgetSol/],
+  ]) {
+    const r = await tools.call('trader_act', args);
+    assert.equal(r.ok, false, JSON.stringify(args));
+    assert.match(r.text, re, r.text);
+  }
+  // 2. The session exists, is MCP-driven and running.
+  assert.match((await tools.call('trader_act', { session_id: 'kt_none', action: 'hold', reason: 'x', expected_seq: 0 })).text, /No Krypto Trader session/);
+  setup({ gate: { driver: 'ai' } });
+  access = 'paper';
+  assert.match((await tools.call('trader_act', { session_id: 'kt_one', action: 'hold', reason: 'x', expected_seq: 3 })).text, /driven by an AI key, not MCP/);
+  setup({ gate: { status: 'paused' } });
+  access = 'live';
+  assert.match((await tools.call('trader_act', { session_id: 'kt_one', action: 'buy', sol: 0.01, reason: 'x', expected_seq: 3 })).text, /paused.*Only the user can resume it/);
+  // 3. T13: a paper connection cannot move a live session.
+  setup({ gate: { mode: 'live' } });
+  access = 'paper';
+  const t13 = await tools.call('trader_act', { session_id: 'kt_one', action: 'sell', percent: 50, reason: 'x', expected_seq: 3 });
+  assert.equal(t13.ok, false);
+  assert.match(t13.text, /LIVE and this connection is in PAPER/);
+  assert.equal(calls.trader.length, 0, 'T13: nothing reached the session');
+  // 4. T27: a stale seq is refused before any budget is spent.
+  setup({ gate: { mode: 'live' } });
+  access = 'live';
+  budget = { maxBuySol: 0.1, hourlyCapSol: 0.5, maxTradesPerMinute: 60 };
+  const t27 = await tools.call('trader_act', { session_id: 'kt_one', action: 'buy', sol: 0.05, reason: 'x', expected_seq: 2 });
+  assert.equal(t27.ok, false);
+  assert.match(t27.text, /Stale: the session is at seq 3, not 2/);
+  assert.equal(calls.trader.length, 0);
+  assert.equal(tools.recentAttempts().length, 0, 'a stale call used no budget slot');
+  // 5. The connection budget (live session, live connection).
+  assert.match((await tools.call('trader_act', { session_id: 'kt_one', action: 'buy', sol: 0.5, reason: 'x', expected_seq: 3 })).text, /0\.1 per-trade limit/);
+  assert.equal(calls.trader.length, 0);
+  // 6 + 7. Through to the session, as an intent.
+  const good = await tools.call('trader_act', { session_id: 'kt_one', action: 'buy', sol: 0.05, reason: 'dip bought', expected_seq: 3 });
+  assert.equal(good.ok, true, good.text);
+  assert.deepEqual(calls.trader[0], { id: 'kt_one', intent: { action: 'buy', sol: 0.05, reason: 'dip bought', tag: 'add' }, expectedSeq: 3 });
+  assert.equal(good.data.seq, 4, 'the answer carries the next seq');
+  const sell = await tools.call('trader_act', { session_id: 'kt_one', action: 'sell', percent: 25, reason: 'trim', expected_seq: 3 });
+  assert.deepEqual(calls.trader[1].intent, { action: 'sell', pct: 25, reason: 'trim', tag: 'ai' }, 'a sell is a percent of the SESSION’s bag');
+  assert.equal(sell.ok, true);
+  // A hold is logged and takes no trade slot.
+  const before = tools.recentAttempts().length;
+  assert.equal((await tools.call('trader_act', { session_id: 'kt_one', action: 'hold', reason: 'nothing to do', expected_seq: 3 })).ok, true);
+  assert.equal(tools.recentAttempts().length, before, 'a hold uses no slot');
+  assert.deepEqual(calls.trader[2].intent, { action: 'hold', reason: 'nothing to do' });
+  ok('trader_act: read tier refused; bad args refused; not-MCP / not-running refused; T13 paper cannot move live; T27 stale seq refused before the budget; budget, then the session');
+}
+
+// ── the AI desk (2026-10-28) ─────────────────────────────────────────────
+{
+  setup();
+  access = 'read';
+  // Reading the feed is a read; deciding and selling a copy are trades.
+  let r = await tools.call('wait_for_events', { cursor: 4, waitSec: 10, kinds: ['copy', 'decision'] });
+  assert.equal(r.ok, true);
+  assert.deepEqual(calls.desk[0], { name: 'poll', cursor: 4, waitMs: 10_000, kinds: ['copy', 'decision'] });
+  assert.match(r.text, /^1 event\. Pass cursor 9 next time\. 1 decision is waiting on you/);
+  r = await tools.call('wait_for_events', {});
+  assert.equal(calls.desk[1].cursor, null);
+  assert.equal(calls.desk[1].waitMs, 25_000, 'the default wait');
+  assert.match((await tools.call('wait_for_events', { waitSec: 60 })).text, /at most 50/);
+  assert.match((await tools.call('wait_for_events', { kinds: ['gossip'] })).text, /kinds must be a list of/);
+  assert.equal((await tools.call('get_pending_decisions', {})).ok, true);
+  assert.match((await tools.call('decide_trade', { id: 'ai_3', verdict: 'skip', reason: 'x' })).text, /read only/);
+  assert.match((await tools.call('sell_copy', { configId: 'cfgPaper', mint: MINT, percent: 50, reason: 'x' })).text, /read only/);
+
+  access = 'paper';
+  assert.match((await tools.call('decide_trade', { id: '12', verdict: 'skip', reason: 'x' })).text, /decision id like ai_12/);
+  assert.match((await tools.call('decide_trade', { id: 'ai_3', verdict: 'maybe', reason: 'x' })).text, /verdict must be one of/);
+  assert.match((await tools.call('decide_trade', { id: 'ai_3', verdict: 'buy', sizeSol: 1, reason: 'x', feeBps: 0 })).text, /does not take feeBps/);
+  r = await tools.call('decide_trade', { id: 'ai_3', verdict: 'buy', sizeSol: 0.02, reason: 'half' });
+  assert.equal(r.ok, true);
+  assert.deepEqual(calls.desk.at(-1), { name: 'decide', id: 'ai_3', v: { verdict: 'buy', reason: 'half', sizeSol: 0.02 } });
+
+  // sell_copy: the follow's own mode decides what the connection needs.
+  assert.match((await tools.call('sell_copy', { configId: 'nope', mint: MINT, percent: 50, reason: 'x' })).text, /No follow nope/);
+  assert.match((await tools.call('sell_copy', { configId: 'cfgLive', mint: MINT, percent: 50, reason: 'x' })).text, /LIVE and this connection is in PAPER/);
+  r = await tools.call('sell_copy', { configId: 'cfgPaper', mint: MINT, percent: 50, reason: 'faded' });
+  assert.equal(r.ok, true);
+  assert.deepEqual(calls.desk.at(-1), { name: 'sellCopy', configId: 'cfgPaper', mint: MINT, percent: 50, reason: 'faded' });
+  access = 'live';
+  assert.equal((await tools.call('sell_copy', { configId: 'cfgLive', mint: MINT, percent: 50, reason: 'x' })).ok, true);
+  // A paper connection may not cancel advanced orders: they are always real.
+  access = 'paper';
+  const cancelsBefore = calls.cancels.length;
+  assert.match((await tools.call('cancel_orders', { mint: MINT })).text, /live-only/);
+  assert.equal(calls.cancels.length, cancelsBefore);
+  ok('the desk: the feed is a read; decide_trade and sell_copy are trades, checked and refused in words; a live follow needs a live connection');
+}
+
+console.log(`\nmcptools: ${passed}/13 passed`);

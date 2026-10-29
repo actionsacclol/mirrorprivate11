@@ -1,0 +1,846 @@
+/* ── Themes ───────────────────────────────────────────────────────────
+ *
+ * A theme moves the ACCENT and nothing else.
+ *
+ * What it deliberately does NOT move: emerald (up, filled, holding), rose
+ * and arc-crimson (down, refused, danger), and arc-gold (your money, pay
+ * attention). In a trading terminal those are DATA, not decoration - a
+ * green that means "profit" has to keep meaning profit when the chrome is
+ * also green, or the app starts lying in the one place it must not.
+ *
+ * That constraint is why the red and green accents below are not the
+ * obvious ones: the red leans warm/orange so it never reads as a loss
+ * badge, and the green leans teal so it never reads as a fill. Blue and
+ * grey have no such collision and are straight.
+ *
+ * Channels, not hex, so Tailwind's <alpha-value> keeps working:
+ * `bg-krypt-purple/20` is still a 20% wash of whatever the theme is.
+ */
+/* Krypto Mirror's accent (2026-10-22): one calm blue, flat — the "gradient"
+   is the same colour at both ends, so every inherited primary button is a
+   solid fill. Blue cannot be mistaken for profit or loss. */
+:root,
+html[data-theme='purple'] {
+  --krypt-accent: 59 115 247;       /* #3B73F7 */
+  --krypt-accent-soft: 118 160 255;
+  --krypt-indigo: 37 60 120;
+  --krypt-grad-from: 59 115 247;
+  --krypt-grad-to: 59 115 247;
+}
+
+html[data-theme='blue'] {
+  --krypt-accent: 56 148 235;
+  --krypt-accent-soft: 137 195 255;
+  --krypt-indigo: 38 78 128;
+  --krypt-grad-from: 25 66 122;
+  --krypt-grad-to: 52 140 224;
+}
+
+/* Warm, orange-leaning. A rose-red accent beside rose loss badges would
+   make the chrome and the bad news the same colour. */
+html[data-theme='red'] {
+  --krypt-accent: 232 106 76;
+  --krypt-accent-soft: 255 160 134;
+  --krypt-indigo: 122 60 48;
+  --krypt-grad-from: 128 52 38;
+  --krypt-grad-to: 224 100 70;
+}
+
+/* Teal-leaning, for the same reason in the other direction: emerald means
+   a fill landed, and the chrome must not be able to be mistaken for one. */
+html[data-theme='green'] {
+  --krypt-accent: 45 178 160;
+  --krypt-accent-soft: 120 226 210;
+  --krypt-indigo: 30 96 90;
+  --krypt-grad-from: 22 88 82;
+  --krypt-grad-to: 42 170 152;
+}
+
+/* No hue at all - for anyone who wants the data to be the only colour on
+   the screen. */
+html[data-theme='grey'] {
+  --krypt-accent: 150 156 174;
+  --krypt-accent-soft: 196 201 214;
+  --krypt-indigo: 74 80 96;
+  --krypt-grad-from: 62 67 80;
+  --krypt-grad-to: 140 147 165;
+}
+/* ── Looks ────────────────────────────────────────────────────────────
+ *
+ * The second axis (2026-09-20). Where an accent moves one colour, a look
+ * moves the fonts, the surfaces, the corner radius and the effects: the
+ * character of the screen. `data-skin` is set by src/state/skin.ts from
+ * Settings › Theme › Look. Classic is what the app always looked like, so
+ * `:root` carries its values and a build with no attribute renders it.
+ *
+ * Surfaces are channels for the same reason the accent is: bg-white/5,
+ * bg-krypt-panel/80 and a thousand other alpha uses keep working. `white`
+ * in Tailwind is the TEXT colour (parchment on Classic), not #fff.
+ *
+ * What a look never moves: emerald, rose, crimson, gold. Data, not decoration.
+ */
+/* Krypto Mirror's base look, DARK (2026-10-22). Neutral graphite surfaces
+   with a hint of blue, Inter everywhere (headings included), and softer
+   corners. Light mode is `html.light`, at the end of this file. */
+:root,
+html[data-skin='classic'] {
+  --krypt-text: 232 235 241;
+  --krypt-ink: 0 0 0;           /* what bg-black/N washes with */
+  --krypt-black: 8 9 12;
+  --krypt-void: 12 14 18;       /* the page */
+  --krypt-surface: 26 30 38;    /* raised: hover, inputs, chips */
+  --krypt-panel: 19 22 28;      /* cards */
+  --krypt-muted: 139 146 161;
+  --up: 34 197 130;
+  --down: 240 82 92;
+  --warn: 232 170 60;
+  --shadow-card: 0 1px 2px rgb(0 0 0 / 0.35);
+  --shadow-pop: 0 16px 40px rgb(0 0 0 / 0.45), 0 2px 6px rgb(0 0 0 / 0.3);
+  --font-sans: Inter, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-display: Inter, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  --radius-sm: 0.25rem;
+  --radius: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.625rem;
+  --radius-xl: 0.875rem;
+  --radius-2xl: 1.125rem;
+}
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body, #root {
+    height: 100%;
+    background-color: rgb(var(--krypt-void));
+    color: rgb(var(--krypt-text));
+    font-family: var(--font-sans);
+    font-feature-settings: 'tnum' 0;
+  }
+  ::selection { background-color: rgb(var(--krypt-accent) / 0.35); color: rgb(var(--krypt-text)); }
+  * { box-sizing: border-box; }
+  /* Observatory scrollbar — thin, dark, violet when handled. */
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: rgb(var(--krypt-text) / 0.08); border-radius: 8px; }
+  ::-webkit-scrollbar-thumb:hover { background: rgb(var(--krypt-accent) / 0.55); }
+}
+
+@layer utilities {
+  /* Wordmark sheen — engraved silver catching violet light. */
+  .text-krypt-gradient {
+    background-image: linear-gradient(105deg, rgb(var(--krypt-text)) 0%, rgb(var(--krypt-accent-soft)) 60%, rgb(var(--krypt-accent)) 100%);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .text-krypt-shimmer {
+    background-image: linear-gradient(90deg, rgb(var(--krypt-text)) 0%, rgb(var(--krypt-accent-soft)) 50%, rgb(var(--krypt-text)) 100%);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .glow-purple    { box-shadow: 0 0 22px rgb(var(--krypt-accent) / 0.28); }
+  .glow-recording { box-shadow: 0 0 16px rgba(229, 72, 77, 0.5); }
+  .glow-playing   { box-shadow: 0 0 16px rgba(52, 211, 153, 0.45); }
+  .glow-text {
+    text-shadow: 0 0 18px rgb(var(--krypt-accent) / 0.5), 0 0 44px rgb(var(--krypt-accent) / 0.18);
+  }
+  .glow-text-gold {
+    text-shadow: 0 0 16px rgba(217, 180, 91, 0.45), 0 0 40px rgba(217, 180, 91, 0.15);
+  }
+
+  /* Engraved instrument plate — the standard card surface. Hairline border,
+     inner top highlight, and etched corner ticks (the "corner runes"). */
+  /*
+   * NOTE ON BLUR. `backdrop-filter` makes the compositor re-run the filter
+   * over whatever sits behind an element every frame that anything beneath
+   * it changes. The rule since 2026-09-28: a filtered surface may sit over
+   * the BACKDROP LAYER (the liquid-metal sheet, which repaints at 15–30 fps
+   * and is the thing worth seeing through) or over the page for as long as
+   * an overlay is open — never over a scrolling list for the life of the
+   * app. The displacement pass of the liquid-glass LENS costs ~5 ms per
+   * surface per frame (measured, src/state/glass.ts), so it is reserved for
+   * overlays; surfaces that stay on screen over the backdrop get FROST
+   * (blur + saturate, measured free), and the top bar and sidebar — on
+   * screen for the life of the app — carry no filter at all. Lite mode
+   * removes every filter at once.
+   */
+  .plate {
+    position: relative;
+    border: 1px solid rgb(var(--krypt-text) / 0.09);
+    background-color: rgb(var(--krypt-panel) / 0.82);
+    /* The wash is what the glass surfaces do with light; the plate gets a
+       faint version so a page of cards and a glass drawer read as one
+       material family. 4 % of the text colour, gone by 40 % down. */
+    background-image: linear-gradient(180deg, rgb(var(--krypt-text) / 0.04), transparent 40%);
+    box-shadow: 0 10px 34px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgb(var(--krypt-text) / 0.08), inset 0 0 0 1px rgb(var(--krypt-text) / 0.02);
+  }
+  .plate::after {
+    content: '';
+    position: absolute;
+    inset: 5px;
+    pointer-events: none;
+    --tick: rgb(var(--krypt-text) / 0.18);
+    background-image:
+      linear-gradient(var(--tick), var(--tick)), linear-gradient(var(--tick), var(--tick)),
+      linear-gradient(var(--tick), var(--tick)), linear-gradient(var(--tick), var(--tick)),
+      linear-gradient(var(--tick), var(--tick)), linear-gradient(var(--tick), var(--tick)),
+      linear-gradient(var(--tick), var(--tick)), linear-gradient(var(--tick), var(--tick));
+    background-repeat: no-repeat;
+    background-size: 9px 1px, 1px 9px, 9px 1px, 1px 9px, 9px 1px, 1px 9px, 9px 1px, 1px 9px;
+    background-position:
+      left top, left top, right top, right top,
+      left bottom, left bottom, right bottom, right bottom;
+  }
+  /*
+   * A cheap surface for LIST ITEMS.
+   *
+   * `.plate` costs a 34px-blur box-shadow plus a pseudo-element carrying eight
+   * gradient layers for its corner ticks. That is fine for the handful of big
+   * panels on a page — it is not fine 160 times over, which is what Discover
+   * asks for with four columns of forty cards. Large blur radii and stacked
+   * gradients are among the most expensive things Chromium paints, and they
+   * are repainted on hover, scroll and every re-render.
+   *
+   * This keeps the same border and background so the look holds, drops the
+   * blur to a tight 1px-ish edge, and has no pseudo-element at all.
+   */
+  .card {
+    position: relative;
+    border: 1px solid rgb(var(--krypt-text) / 0.09);
+    background-color: rgb(var(--krypt-panel) / 0.82);
+    box-shadow: inset 0 1px 0 rgb(var(--krypt-text) / 0.045);
+  }
+  .card:hover {
+    border-color: rgba(157, 106, 255, 0.35);
+  }
+  /*
+   * Skip layout and paint for cards scrolled out of view.
+   *
+   * Discover keeps four scrolling columns of forty cards alive at once — about
+   * 10,000 DOM elements, of which maybe a fifth are actually visible. This is
+   * the browser's own answer to that: off-screen subtrees are not styled,
+   * laid out or painted until they approach the viewport. `contain-intrinsic-size`
+   * supplies a placeholder height so the scrollbar does not jump around while
+   * they are skipped.
+   *
+   * It is a one-line alternative to virtualising the list, with no scroll
+   * maths of our own to get wrong.
+   */
+  .card-list > .card {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 132px;
+  }
+
+  /* ── Liquid glass (2026-09-28) ─────────────────────────────────────
+   *
+   * Four classes and a pseudo-element, one material each (the table that
+   * picks between them is src/state/glass.ts):
+   *   .glass-lens   the LENS — frost + SVG displacement over the page behind,
+   *                 applied inline by @samasante/liquid-glass; this sheet
+   *                 only gives it a drop. Overlays only: it costs frames.
+   *   .glass-frost  blur + saturate + a lit rim, no displacement. Free.
+   *   .glass-chrome the frame: a dark fill and a lit edge, no filter.
+   *   .glass        the same box with no filter at all — Lite mode, and the
+   *                 Hacker and Retro looks.
+   * The hairline border is always the call site's own Tailwind class, so a
+   * bar can keep a bottom edge only.
+   *
+   * Neither carries the accent. The tint is the look's panel colour, the
+   * rim is white light; emerald, rose and gold stay data. */
+  .glass-lens {
+    box-shadow: 0 18px 50px rgb(var(--krypt-ink) / 0.45), 0 2px 8px rgb(var(--krypt-ink) / 0.25);
+  }
+  /* FROST: blur + saturate and the same lit rim the lens draws, with no
+     displacement pass. Measured free over the animating backdrop where the
+     lens cost ~5 ms per surface per frame, so this is what a surface that
+     stays on screen gets (the Hub's tiles, the Widgets panels). The rim is
+     white light, like the library's, so a frosted tile and a lensed sheet
+     read as the same material. */
+  .glass-frost {
+    backdrop-filter: blur(10px) saturate(1.2);
+    -webkit-backdrop-filter: blur(10px) saturate(1.2);
+    background-image: linear-gradient(180deg, rgb(255 255 255 / 0.07), transparent 42%);
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.34),
+      inset 0 0 0 1px rgb(255 255 255 / 0.07),
+      inset 0 12px 28px -18px rgb(255 255 255 / 0.22),
+      0 18px 50px rgb(var(--krypt-ink) / 0.45);
+    isolation: isolate;
+  }
+  /* The specular band needs a positioned box; a call site that already
+     positions the surface (a fixed pill) keeps its own. */
+  .glass-frost:not([class~='fixed']):not([class~='absolute']) {
+    position: relative;
+  }
+  /* The specular band: a soft diagonal streak across the top-left corner,
+     the one cue that says 'polished surface' rather than 'tinted panel'.
+     Under the children (z-index -1 inside the isolated box) so text never
+     sits behind a highlight. */
+  .glass-frost::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    border-radius: inherit;
+    background: linear-gradient(118deg, rgb(255 255 255 / 0.10) 0%, rgb(255 255 255 / 0.03) 22%, transparent 42%);
+  }
+  /* CHROME: the frame. A dark fill the call site chooses, a lit top edge and
+     a faint top-down wash, and NO filter — the frame is on screen for the
+     life of the app, and a frosted bar over the backdrop read worse than
+     the old near-black one anyway (user, 2026-09-28). */
+  .glass-chrome {
+    background-image: linear-gradient(180deg, rgb(var(--krypt-text) / 0.035), transparent 60%);
+    box-shadow: inset 0 1px 0 rgb(var(--krypt-text) / 0.07);
+  }
+  .glass {
+    background-color: rgb(var(--krypt-panel) / 0.94);
+    background-image: linear-gradient(180deg, rgb(var(--krypt-text) / 0.05), transparent 45%);
+    box-shadow: 0 18px 50px rgb(var(--krypt-ink) / 0.45), inset 0 1px 0 rgb(var(--krypt-text) / 0.10);
+  }
+  /* A control lit from above: a highlight over the top half, a shade under
+     the bottom. Drawn on a pseudo-element so it composes with whatever
+     background the button already has (the accent gradient, a rose wash)
+     instead of replacing it. `overflow: hidden` keeps it inside the corners. */
+  .glass-btn {
+    position: relative;
+    overflow: hidden;
+    isolation: isolate;
+  }
+  .glass-btn::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: -1;
+    border-radius: inherit;
+    background: linear-gradient(180deg, rgb(var(--krypt-text) / 0.16), rgb(var(--krypt-text) / 0.03) 48%, transparent 52%, rgb(var(--krypt-ink) / 0.14));
+  }
+
+  .plate-gold::after { --tick: rgba(217, 180, 91, 0.4); }
+  .plate-crimson::after { --tick: rgba(229, 72, 77, 0.45); }
+
+  /* Faint celestial dust behind hero panels. */
+  .grid-backdrop {
+    background-image:
+      radial-gradient(rgb(var(--krypt-text) / 0.07) 1px, transparent 1px),
+      radial-gradient(rgb(var(--krypt-accent) / 0.06) 1px, transparent 1px);
+    background-size: 34px 34px, 56px 56px;
+    background-position: 0 0, 17px 23px;
+    mask-image: radial-gradient(ellipse 90% 85% at 50% 40%, black 30%, transparent 78%);
+    -webkit-mask-image: radial-gradient(ellipse 90% 85% at 50% 40%, black 30%, transparent 78%);
+  }
+
+  /* Fixed ambient star layer over the whole shell. */
+  .stars-backdrop {
+    background-image:
+      radial-gradient(rgb(var(--krypt-text) / 0.05) 1px, transparent 1px),
+      radial-gradient(rgb(var(--krypt-text) / 0.032) 1px, transparent 1px);
+    background-size: 190px 190px, 310px 310px;
+    background-position: 40px 60px, 130px 220px;
+  }
+
+  .scanlines {
+    background-image: repeating-linear-gradient(to bottom,
+      rgb(var(--krypt-text) / 0.02) 0, rgb(var(--krypt-text) / 0.02) 1px, transparent 1px, transparent 3px);
+  }
+
+  /* Celestial dust slowly drifting across a grid-backdrop surface. */
+  @keyframes dust-drift {
+    from { background-position: 0 0, 17px 23px; }
+    to   { background-position: -340px 190px, -560px 330px; }
+  }
+  .animate-dust { animation: dust-drift 90s linear infinite; }
+
+
+  /* Spark travelling along a pipeline connector. */
+  @keyframes spark-run {
+    0%   { left: -6px; opacity: 0; }
+    12%  { opacity: 1; }
+    88%  { opacity: 1; }
+    100% { left: calc(100% + 2px); opacity: 0; }
+  }
+  .animate-spark { animation: spark-run 1.8s linear infinite; }
+}
+
+/* The route fade is decorative: a viewer who asked for less motion gets the
+   page at once. */
+@media (prefers-reduced-motion: reduce) {
+  .animate-ink { animation: none; }
+}
+
+/* ── Lite mode ──────────────────────────────────────────────────────────
+   `html.lite` is set by src/state/liteMode.ts from Settings › Display
+   "Reduce effects" — also the Hub's "Laggy?" button. Everything decorative
+   goes: transitions, the drifting/scrolling/pulsing animations, blur, glows,
+   the big soft shadows, the star and dust backdrops and the corner runes.
+   The spinner and the thin "pending" bar stay — a frozen spinner reads as a
+   hang, and both are a few pixels of compositor work.
+
+   Why a class and not JS per element: Chromium's cost here is paint and
+   composite, and a stylesheet rule reaches every element at once, including
+   Discover's ~10,000, with no React work at all. */
+html.lite *,
+html.lite *::before,
+html.lite *::after {
+  transition: none !important;
+}
+html.lite .animate-dust,
+html.lite .animate-spark,
+html.lite .animate-ink,
+html.lite .animate-fade-in,
+html.lite .animate-pop-in,
+html.lite .animate-rune-pulse,
+html.lite .animate-gradient-x,
+html.lite .animate-pulse-slow {
+  animation: none !important;
+}
+html.lite .stars-backdrop,
+html.lite .grid-backdrop,
+html.lite .scanlines,
+html.lite .bg-krypt-radial {
+  background-image: none !important;
+  mask-image: none !important;
+  -webkit-mask-image: none !important;
+}
+html.lite [class*='backdrop-blur'],
+html.lite [data-liquid-glass],
+html.lite .glass-frost {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+/* A lens with its filter stripped is a translucent wash over an unblurred
+   page — worse than flat. Give it the flat surface's fill instead. */
+html.lite .glass-lens,
+html.lite .glass-frost {
+  background-color: rgb(var(--krypt-panel) / 0.94) !important;
+  background-image: none !important;
+}
+html.lite .glass-btn::before {
+  display: none;
+}
+html.lite [class*='shadow-'],
+html.lite .plate,
+html.lite .card,
+html.lite .glass,
+html.lite .glass-lens,
+html.lite .glass-frost,
+html.lite .glass-chrome {
+  box-shadow: none !important;
+}
+html.lite .glass-chrome {
+  background-image: none !important;
+}
+html.lite .plate,
+html.lite .glass {
+  background-image: none !important;
+}
+/* The corner runes: eight gradient layers per plate. */
+html.lite .plate::after {
+  display: none;
+}
+html.lite [class^='blur-'],
+html.lite [class*=' blur-'] {
+  filter: none !important;
+}
+
+/* ── Panel grid (My Layout) ──────────────────────────────────────────────
+   react-grid-layout ships light-theme chrome: the resize grip is a dark SVG
+   on a transparent background (invisible here) in a 20px corner, and the drop
+   placeholder is bright red. Both are restyled rather than overridden inline
+   so the grid component stays free of styling for a library it only hosts. */
+
+/* The grab area. Bigger than the default 20px — a 20px corner on a dense dark
+   UI is findable only if you already know it is there. */
+.react-grid-item > .react-resizable-handle {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  background: none;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.react-grid-item:hover > .react-resizable-handle,
+.react-grid-item.resizing > .react-resizable-handle {
+  opacity: 1;
+}
+/* Two short strokes in the corner: legible on the panel background without
+   drawing the eye when you are reading the panel rather than moving it. */
+.react-grid-item > .react-resizable-handle::after {
+  content: '';
+  position: absolute;
+  right: 5px;
+  bottom: 5px;
+  width: 9px;
+  height: 9px;
+  border-right: 2px solid rgba(255, 255, 255, 0.45);
+  border-bottom: 2px solid rgba(255, 255, 255, 0.45);
+  border-bottom-right-radius: 2px;
+}
+.react-grid-item > .react-resizable-handle:hover::after {
+  border-color: rgb(var(--krypt-accent));
+}
+
+/* Where the panel will land. Default is red. */
+.react-grid-item.react-grid-placeholder {
+  background: rgb(var(--krypt-accent) / 0.18);
+  border: 1px dashed rgb(var(--krypt-accent) / 0.55);
+  border-radius: 0.75rem;
+  opacity: 1;
+}
+
+/* The panel being dragged sits above its neighbours. */
+.react-grid-item.react-draggable-dragging {
+  z-index: 20;
+  cursor: grabbing;
+}
+
+/* Frameless pop-out panels (src/panels/PanelWindow.tsx).
+   With no title bar the window has nothing to grab, so the shell is the drag
+   handle and everything usable inside it opts back out. Without the `no-drag`
+   half, a click on a row would move the window instead of activating the row —
+   Chromium gives the drag region the event first. */
+.app-drag {
+  -webkit-app-region: drag;
+}
+.no-drag,
+.no-drag button,
+.no-drag a,
+.no-drag input,
+.no-drag select,
+.no-drag textarea {
+  -webkit-app-region: no-drag;
+}
+
+/* ── The other looks ──────────────────────────────────────────────────
+   Each block sets the variables from the Looks section and restyles the
+   handful of classes that carry Classic's character — the plate, the card,
+   the backdrops, the glows. Everything else follows the variables. Lite
+   mode's rules carry !important and still win over all of this. */
+
+/* Futuristic: sharp corners, a faint grid instead of stars, headings wide
+   and uppercase, panels edged in the accent. A little denser. */
+html[data-skin='futuristic'] {
+  --krypt-text: 226 238 247;
+  --krypt-ink: 0 0 0;
+  --krypt-black: 2 4 8;
+  --krypt-void: 4 8 14;
+  --krypt-surface: 12 22 36;
+  --krypt-panel: 7 13 22;
+  --krypt-muted: 122 146 168;
+  --font-sans: Rajdhani, 'Spline Sans', system-ui, sans-serif;
+  --font-display: Orbitron, Rajdhani, sans-serif;
+  --font-mono: 'Share Tech Mono', 'JetBrains Mono', monospace;
+  --radius-sm: 0;
+  --radius: 1px;
+  --radius-md: 2px;
+  --radius-lg: 3px;
+  --radius-xl: 4px;
+  --radius-2xl: 6px;
+  font-size: 15px;
+}
+html[data-skin='futuristic'] .font-display { text-transform: uppercase; letter-spacing: 0.12em; }
+html[data-skin='futuristic'] .plate,
+html[data-skin='futuristic'] .card,
+html[data-skin='futuristic'] .glass,
+html[data-skin='futuristic'] .glass-lens,
+html[data-skin='futuristic'] .glass-frost {
+  border-color: rgb(var(--krypt-accent) / 0.25);
+  box-shadow: inset 0 0 0 1px rgb(var(--krypt-accent) / 0.05), 0 0 24px rgb(var(--krypt-accent) / 0.07);
+}
+html[data-skin='futuristic'] .plate::after { --tick: rgb(var(--krypt-accent) / 0.6); }
+html[data-skin='futuristic'] .stars-backdrop {
+  background-image:
+    linear-gradient(rgb(var(--krypt-accent) / 0.07) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(var(--krypt-accent) / 0.07) 1px, transparent 1px);
+  background-size: 44px 44px, 44px 44px;
+  background-position: 0 0, 0 0;
+}
+
+/* Minimal: flat and quiet. Nothing glows, no runes, no backdrops, softer
+   corners and a little more room around everything. */
+html[data-skin='minimal'] {
+  --krypt-text: 236 236 236;
+  --krypt-ink: 0 0 0;
+  --krypt-black: 6 6 8;
+  --krypt-void: 10 10 12;
+  --krypt-surface: 24 24 28;
+  --krypt-panel: 16 16 19;
+  --krypt-muted: 140 140 148;
+  --font-sans: Inter, system-ui, -apple-system, sans-serif;
+  --font-display: Inter, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  --radius-sm: 4px;
+  --radius: 6px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-xl: 14px;
+  --radius-2xl: 18px;
+  font-size: 16.5px;
+}
+html[data-skin='minimal'] .font-display { letter-spacing: -0.01em; font-weight: 600; }
+html[data-skin='minimal'] .glass-lens { box-shadow: 0 12px 40px rgb(var(--krypt-ink) / 0.35); }
+html[data-skin='minimal'] .glass-frost { box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.18), 0 12px 40px rgb(var(--krypt-ink) / 0.35); }
+html[data-skin='minimal'] .plate,
+html[data-skin='minimal'] .card,
+html[data-skin='minimal'] .glass {
+  background-color: rgb(var(--krypt-panel));
+  border-color: rgb(var(--krypt-text) / 0.08);
+  box-shadow: none;
+}
+html[data-skin='minimal'] .plate::after { display: none; }
+html[data-skin='minimal'] .stars-backdrop,
+html[data-skin='minimal'] .grid-backdrop,
+html[data-skin='minimal'] .scanlines,
+html[data-skin='minimal'] .bg-krypt-radial { background-image: none; mask-image: none; -webkit-mask-image: none; }
+html[data-skin='minimal'] .glow-purple,
+html[data-skin='minimal'] .shadow-krypt-glow,
+html[data-skin='minimal'] [class*='shadow-krypt'] { box-shadow: none; }
+html[data-skin='minimal'] .glow-text,
+html[data-skin='minimal'] .glow-text-gold { text-shadow: none; }
+html[data-skin='minimal'] .text-krypt-gradient,
+html[data-skin='minimal'] .text-krypt-shimmer { background-image: none; color: rgb(var(--krypt-text)); }
+
+/* Hacker: a black screen, monospace everywhere, scanlines over the whole
+   shell, a blinking cursor after the page title. The picker pairs it with
+   the green accent the first time. */
+html[data-skin='hacker'] {
+  --krypt-text: 214 236 214;
+  --krypt-ink: 0 0 0;
+  --krypt-black: 0 0 0;
+  --krypt-void: 0 0 0;
+  --krypt-surface: 8 14 8;
+  --krypt-panel: 3 6 3;
+  --krypt-muted: 110 150 110;
+  --font-sans: 'Share Tech Mono', 'JetBrains Mono', ui-monospace, monospace;
+  --font-display: VT323, 'Share Tech Mono', monospace;
+  --font-mono: 'Share Tech Mono', 'JetBrains Mono', ui-monospace, monospace;
+  --radius-sm: 0;
+  --radius: 0;
+  --radius-md: 0;
+  --radius-lg: 0;
+  --radius-xl: 0;
+  --radius-2xl: 0;
+  font-size: 15px;
+}
+html[data-skin='hacker'] .font-display { font-size: 1.2em; letter-spacing: 0.04em; text-shadow: 0 0 8px rgb(var(--krypt-accent) / 0.45); }
+html[data-skin='hacker'] main h1::after { content: '_'; margin-left: 0.15em; animation: caret-blink 1s steps(1) infinite; }
+@keyframes caret-blink { 50% { opacity: 0; } }
+html[data-skin='hacker'] .plate,
+html[data-skin='hacker'] .card,
+html[data-skin='hacker'] .glass {
+  background-color: rgb(var(--krypt-panel) / 0.92);
+  border-color: rgb(var(--krypt-accent) / 0.35);
+  box-shadow: none;
+}
+html[data-skin='hacker'] .plate::after { display: none; }
+html[data-skin='hacker'] .plate,
+html[data-skin='hacker'] .glass { background-image: none; }
+html[data-skin='hacker'] .glass-btn::before { display: none; }
+html[data-skin='hacker'] .bg-krypt-radial { background-image: none; }
+html[data-skin='hacker'] .stars-backdrop {
+  background-image: repeating-linear-gradient(to bottom, rgb(var(--krypt-text) / 0.04) 0, rgb(var(--krypt-text) / 0.04) 1px, transparent 1px, transparent 3px);
+  background-size: auto;
+  background-position: 0 0;
+  opacity: 1 !important;
+}
+html[data-skin='hacker'] ::-webkit-scrollbar-thumb { border-radius: 0; }
+html.lite[data-skin='hacker'] main h1::after { animation: none; }
+
+/* Retro: an arcade cabinet. A pixel page title with a hard accent shadow,
+   pixel text, chunky panels with an offset drop, faint CRT lines and a
+   vignette closing in from the edges. */
+html[data-skin='retro'] {
+  --krypt-text: 240 236 255;
+  --krypt-ink: 0 0 0;
+  --krypt-black: 6 4 16;
+  --krypt-void: 12 8 28;
+  --krypt-surface: 30 22 60;
+  --krypt-panel: 20 14 44;
+  --krypt-muted: 156 148 190;
+  /* Pixel faces for the title and the headings only: at table size a
+     pixel B reads as an 8, and "BNB" cannot become "8N8" on a trading
+     screen. Text stays on the terminal face the numbers use. */
+  --font-sans: 'Share Tech Mono', 'JetBrains Mono', ui-monospace, monospace;
+  --font-display: 'Press Start 2P', 'Share Tech Mono', monospace;
+  --font-mono: 'Share Tech Mono', 'JetBrains Mono', monospace;
+  --radius-sm: 0;
+  --radius: 0;
+  --radius-md: 0;
+  --radius-lg: 0;
+  --radius-xl: 0;
+  --radius-2xl: 0;
+  font-size: 15px;
+}
+/* Press Start 2P is drawn on an 8px grid and reads only at title size, so
+   the page title gets it and every smaller heading and label takes the
+   terminal face, uppercase and tracked, where a C is never an O. */
+html[data-skin='retro'] .font-display { font-family: 'Share Tech Mono', 'JetBrains Mono', monospace; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; }
+html[data-skin='retro'] main h1.font-display { font-family: 'Press Start 2P', 'Share Tech Mono', monospace; font-size: 0.8em; line-height: 1.5; letter-spacing: 0.02em; text-shadow: 3px 3px 0 rgb(var(--krypt-accent) / 0.6); }
+html[data-skin='retro'] .plate,
+html[data-skin='retro'] .card,
+html[data-skin='retro'] .glass {
+  border: 2px solid rgb(var(--krypt-text) / 0.28);
+  background-color: rgb(var(--krypt-panel) / 0.94);
+  box-shadow: 5px 5px 0 rgb(var(--krypt-ink) / 0.55);
+}
+html[data-skin='retro'] .plate::after { display: none; }
+html[data-skin='retro'] .plate,
+html[data-skin='retro'] .glass { background-image: none; }
+html[data-skin='retro'] .glass-btn::before { display: none; }
+html[data-skin='retro'] .stars-backdrop {
+  background-image: repeating-linear-gradient(to bottom, rgb(var(--krypt-ink) / 0.16) 0, rgb(var(--krypt-ink) / 0.16) 1px, transparent 1px, transparent 4px);
+  background-size: auto;
+  background-position: 0 0;
+  opacity: 1 !important;
+}
+html[data-skin='retro'] .bg-krypt-radial {
+  background-image: radial-gradient(ellipse at center, transparent 58%, rgb(var(--krypt-ink) / 0.55) 100%);
+}
+html[data-skin='retro'] ::-webkit-scrollbar-thumb { border-radius: 0; }
+
+/* XP / Y2K: the first LIGHT look. Luna blue on white, a Bliss sky behind
+   the shell, the system's Tahoma. Every dark wash (bg-black/N) becomes a
+   blue-grey wash through --krypt-ink, and the colours that carry meaning
+   are DARKENED for contrast on white — still green for up, red for down,
+   gold for money; only their shade moves, never what they mean. */
+html[data-skin='xp'] {
+  --krypt-text: 20 28 46;
+  --krypt-ink: 150 176 214;   /* Luna: bg-black/40 becomes a pale blue wash */
+  --krypt-black: 214 224 240;
+  --krypt-void: 232 238 248;
+  --krypt-surface: 244 247 252;
+  --krypt-panel: 255 255 255;
+  --krypt-muted: 92 104 128;
+  --font-sans: Tahoma, Verdana, 'Segoe UI', system-ui, sans-serif;
+  --font-display: 'Trebuchet MS', Tahoma, Verdana, sans-serif;
+  --font-mono: 'Lucida Console', 'Courier New', ui-monospace, monospace;
+  --radius-sm: 3px;
+  --radius: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 10px;
+  --radius-2xl: 12px;
+  font-size: 15px;
+  color-scheme: light;
+}
+html[data-skin='xp'] .font-display { font-weight: 700; letter-spacing: 0; text-transform: none; }
+html[data-skin='xp'] .glass-lens {
+  box-shadow: 0 10px 30px rgb(0 0 0 / 0.16), 0 1px 3px rgb(0 0 0 / 0.12);
+}
+html[data-skin='xp'] .glass-frost {
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.9), inset 0 0 0 1px rgb(255 255 255 / 0.5), 0 10px 30px rgb(0 0 0 / 0.16);
+}
+html[data-skin='xp'] .glass-chrome {
+  background-image: linear-gradient(180deg, rgb(255 255 255 / 0.5), transparent 60%);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.9);
+}
+html[data-skin='xp'] .plate,
+html[data-skin='xp'] .card,
+html[data-skin='xp'] .glass {
+  background-color: rgb(var(--krypt-panel));
+  border: 1px solid rgb(0 84 227 / 0.35);
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.12), inset 0 3px 0 rgb(0 84 227 / 0.85);
+}
+html[data-skin='xp'] .plate::after { display: none; }
+html[data-skin='xp'] .stars-backdrop {
+  background-image: linear-gradient(180deg, rgb(90 168 240) 0%, rgb(160 208 255) 42%, rgb(124 196 106) 66%, rgb(63 143 58) 100%);
+  background-size: auto;
+  background-position: 0 0;
+  opacity: 0.35 !important;
+}
+html[data-skin='xp'] .bg-krypt-radial,
+html[data-skin='xp'] .grid-backdrop,
+html[data-skin='xp'] .scanlines { background-image: none; mask-image: none; -webkit-mask-image: none; }
+html[data-skin='xp'] .glow-purple,
+html[data-skin='xp'] [class*='shadow-krypt'] { box-shadow: 0 1px 3px rgb(0 0 0 / 0.12); }
+html[data-skin='xp'] .glow-text,
+html[data-skin='xp'] .glow-text-gold { text-shadow: none; }
+html[data-skin='xp'] .text-krypt-gradient,
+html[data-skin='xp'] .text-krypt-shimmer { background-image: none; color: rgb(0 84 227); }
+html[data-skin='xp'] [class*='text-emerald-'] { color: rgb(4 120 87) !important; }
+html[data-skin='xp'] [class*='text-rose-'] { color: rgb(190 18 60) !important; }
+html[data-skin='xp'] [class*='text-amber-'] { color: rgb(146 64 14) !important; }
+html[data-skin='xp'] [class*='text-arc-gold'] { color: rgb(138 109 31) !important; }
+html[data-skin='xp'] [class*='text-arc-crimson'] { color: rgb(185 28 28) !important; }
+html[data-skin='xp'] ::-webkit-scrollbar-thumb { background: rgb(0 84 227 / 0.35); }
+
+/* ══ Krypto Mirror (2026-10-22) ═════════════════════════════════════════
+ *
+ * The app's own look: calm, flat, legible. Everything inherited from Krypto
+ * Bot keeps its class names and is restyled here — the engraved plate, the
+ * glass, the glows and the star field go; a card is a surface with a
+ * hairline and a soft shadow. Last in the file so it wins.
+ */
+html { font-feature-settings: 'cv11', 'ss01'; }
+body { -webkit-font-smoothing: antialiased; }
+.tabular-nums, .font-mono { font-variant-numeric: tabular-nums; }
+
+.plate,
+.card,
+.glass {
+  border: 1px solid rgb(var(--krypt-text) / 0.08);
+  background-color: rgb(var(--krypt-panel));
+  background-image: none;
+  box-shadow: var(--shadow-card);
+}
+.plate::after { display: none; }
+.card:hover { border-color: rgb(var(--krypt-text) / 0.16); }
+.glass-frost { backdrop-filter: none; -webkit-backdrop-filter: none; background-image: none; box-shadow: var(--shadow-pop); }
+.glass-frost::before,
+.glass-btn::before { display: none; }
+.glass-chrome { background-image: none; box-shadow: none; }
+.glass-lens { box-shadow: var(--shadow-pop); }
+.bg-krypt-radial,
+.stars-backdrop,
+.grid-backdrop,
+.scanlines { background-image: none !important; }
+.glow-text,
+.glow-text-gold { text-shadow: none; }
+.text-krypt-gradient,
+.text-krypt-shimmer { background-image: none; color: rgb(var(--krypt-text)); }
+.animate-rune-pulse { animation: none; }
+::-webkit-scrollbar-thumb { background: rgb(var(--krypt-text) / 0.12); }
+::-webkit-scrollbar-thumb:hover { background: rgb(var(--krypt-text) / 0.24); }
+::selection { background-color: rgb(var(--krypt-accent) / 0.3); }
+
+/* Focus is a ring, never a glow. */
+:focus-visible { outline: 2px solid rgb(var(--krypt-accent) / 0.7); outline-offset: 2px; }
+input:focus-visible, textarea:focus-visible, select:focus-visible { outline: none; }
+
+/* ── Light mode ───────────────────────────────────────────────────────
+ * `html.light`, set by src/state/appearance.ts. The inherited pages write
+ * literal Tailwind greens and reds tuned for a dark page (emerald-300 is
+ * nearly invisible on white), so those are pulled to their deep shades
+ * here — the same move Krypto Bot's XP look made. */
+html.light {
+  --krypt-text: 17 20 28;
+  --krypt-ink: 100 110 130;       /* bg-black/40 inputs become a soft grey wash */
+  --krypt-black: 236 238 242;
+  --krypt-void: 245 246 248;
+  --krypt-surface: 238 240 244;
+  --krypt-panel: 255 255 255;
+  --krypt-muted: 98 106 122;
+  --krypt-accent: 37 99 235;
+  --krypt-accent-soft: 59 115 247;
+  --krypt-grad-from: 37 99 235;
+  --krypt-grad-to: 37 99 235;
+  --up: 4 150 95;
+  --down: 214 40 57;
+  --warn: 180 110 10;
+  --shadow-card: 0 1px 2px rgb(16 24 40 / 0.06), 0 1px 3px rgb(16 24 40 / 0.04);
+  --shadow-pop: 0 16px 40px rgb(16 24 40 / 0.14), 0 2px 6px rgb(16 24 40 / 0.06);
+  color-scheme: light;
+}
+html:not(.light) { color-scheme: dark; }
+html.light [class*='text-emerald-'] { color: rgb(var(--up)) !important; }
+html.light [class*='text-rose-'],
+html.light [class*='text-red-'] { color: rgb(var(--down)) !important; }
+html.light [class*='text-amber-'],
+html.light [class*='text-yellow-'] { color: rgb(var(--warn)) !important; }
+html.light [class*='text-sky-'],
+html.light [class*='text-violet-'],
+html.light [class*='text-indigo-'],
+html.light .text-krypt-pink { color: rgb(var(--krypt-accent)) !important; }
+html.light .bg-black\/40,
+html.light .bg-black\/30 { background-color: rgb(var(--krypt-surface)); }

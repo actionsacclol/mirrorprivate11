@@ -1,0 +1,38 @@
+node_modules/
+dist/
+dist-electron/
+release/
+test/.*.mjs
+*.log
+dist-electron-dev/
+
+# Build spill: the bytecode step leaves a copy of a compiled chunk in the
+# repo root. It is byte-identical to the one in dist-electron and is only a
+# hazard because `git add -A` would happily commit 7 MB of it.
+/*.jsc
+
+# Scratch artefacts from probes and recovery — never shipped, never committed.
+mints.json
+v4mod.json
+recover.tmp.json
+test/.sandbox/
+test/.copy-candidates/
+test/.walletdata/
+contracts/build/
+
+# Python bytecode from the analysis scripts
+__pycache__/
+*.pyc
+
+# Local environment files — keys never belong in the repo
+.env
+.env.*
+
+# Research tape — collected market data, never committed
+tape/
+tape-ofi.out
+
+# Our own scripts. Not shipped with the app and not pushed: these are run by
+# pasting them into Automation -> Scripts, which stores them in the app's
+# user-data folder, never in the repo.
+private/

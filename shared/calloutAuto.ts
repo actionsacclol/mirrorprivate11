@@ -1,0 +1,705 @@
+// Auto-callout — post a pump.fun callout on the coins you buy.
+//
+// A callout is a public statement, under your name, that other people trade
+// against. pump ranks callers and pays them out of the volume a call brings
+// in, so this is a promotion tool as much as a record: what goes out matters.
+//
+// ─── What pump itself allows (measured 2026-09-22) ───────────────────────
+//
+// The preflight at `/callout/eligibility/{mint}` is the gate, and it is worth
+// reading before assuming anything:
+//
+//   • You must HOLD the coin, worth at least ONE DOLLAR. A wallet with no
+//     position is refused with `INSUFFICIENT_BALANCE` and `position: null`
+//     beside it. That floor is low enough that an ordinary buy clears it,
+//     which is why this works on buy at all.
+//   • ONE CALLOUT per coin, per account. `postableAccounts[0].existingCalloutId`
+//     comes back with the uuid of the one that already exists — the same id a
+//     pump.fun link carries as `highlight_callout=`. A second call is not a
+//     thing; a REPLY is (see below). No edit route is known.
+//   • `attemptsRemaining` is 3, under `preflight.create`. What it counts is
+//     NOT known — it was read as "three callouts per coin" until the one-per-
+//     coin rule turned up, and a number whose meaning is a guess is not a
+//     number to build on. It is still obeyed at zero, which costs nothing.
+//   • `cooldownRemainingSeconds` sits under `preflight.reply`, and it means
+//     what it says: the gap between REPLIES. It refused first-ever callouts
+//     until 2026-09-22.
+//   • Lifetime counts among live callers run to 203 with a median of 64, so
+//     there is no global cap.
+//
+// So the preflight is asked every time and its answer is obeyed. Nothing here
+// invents a limit pump does not have, and nothing here works around one it
+// does.
+//
+// ─── Why the text is a list ──────────────────────────────────────────────
+//
+// The same sentence on every coin is a signature, and a caller whose every
+// call reads identically is one people mute. A list of lines, one picked at
+// random, is what the user asked for and is also the version that stays
+// readable. It is NOT a way to look like several different people — the calls
+// all carry the same wallet and pump shows the caller's position on each.
+
+import { webhookUrlProblem } from './webhook';
+
+/** Longest a single thesis may be. The real ones are short — "Runner" and a
+ *  dozen words are typical in the live feed. */
+export const MAX_THESIS = 200;
+
+// ── The watermark ─────────────────────────────────────────────────────
+//
+// Every auto-posted callout ends with a mark saying it came from here.
+//
+// It is DISCLOSURE before it is promotion. A callout posted by a machine the
+// instant a buy confirms is not the same thing as one someone sat down and
+// wrote, and a reader deciding whether to trade on it deserves to know which
+// they are looking at. That it also says where it came from is a side effect
+// rather than the point.
+//
+// It is shown in the form, and the character budget below is what is left for
+// the user's own words — the same rule the launch description follows.
+
+// The mark ROTATES (2026-09-24). Every auto-post used to end with the exact
+// same "Called with krypt.cc/bot" line; across many posts that identical
+// trailer reads as templated and pump temporarily restricted an account for
+// spam. So a short mark is picked at random per post. EVERY variation still
+// names Krypto Bot (or its URL), so each one is a real disclosure that a tool
+// posted the call — the rotation changes the wording, never whether it
+// discloses.
+// Krypto Mirror (2026-10-22; named 2026-10-25): the marks plug this app by its
+// name and its page, krypt.cc/mirror. Most of its calls are made by a COPY of
+// someone else's buy, posted with no one at the keys, so 'copied'/'auto-called'
+// wording is the honest kind. Every variation names Krypto Mirror or its URL.
+export const CALLOUT_WATERMARKS = [
+  'Called with Krypto Mirror',
+  'via Krypto Mirror',
+  'copied with Krypto Mirror',
+  'auto-called · Krypto Mirror',
+  'posted by Krypto Mirror',
+  'Krypto Mirror · krypt.cc/mirror',
+  'copy trading · krypt.cc/mirror',
+  'copy-called via krypt.cc/mirror',
+  'sent with Krypto Mirror',
+  '🤖 Krypto Mirror',
+  'Krypto Mirror',
+];
+
+/** Marks this app and Krypto Bot used before. Text already carrying one is re-stamped, never doubled. */
+const LEGACY_CALLOUT_MARKS = [
+  // The 'Krypt Mirror' spelling and the old page, until the name settled (2026-10-25)
+  'Called with Krypt Mirror',
+  'via Krypt Mirror',
+  'copied with Krypt Mirror',
+  'auto-called · Krypt Mirror',
+  'posted by Krypt Mirror',
+  'Krypt Mirror · krypt.cc/tools/mirror',
+  'copy trading · krypt.cc/tools/mirror',
+  'copy-called via krypt.cc/tools/mirror',
+  'sent with Krypt Mirror',
+  '🤖 Krypt Mirror',
+  'Krypt Mirror',
+  // Krypto Copy's own, before the Mirror name
+  'Called with Krypto Copy',
+  'via Krypto Copy',
+  'copied with Krypto Copy',
+  'auto-called · Krypto Copy',
+  'posted by Krypto Copy',
+  'Krypto Copy · krypt.cc',
+  'sent with Krypto Copy',
+  'copy-called · krypt.cc',
+  '🤖 Krypto Copy',
+  'Krypto Copy',
+  // Krypto Bot's
+  'Called with krypt.cc/bot',
+  'via krypt.cc/bot',
+  'via Krypto Bot',
+  'posted with Krypto Bot',
+  'called on Krypto Bot',
+  'Krypto Bot · krypt.cc/bot',
+  'sent with Krypto Bot',
+  'auto-called · Krypto Bot',
+  '🤖 Krypto Bot',
+  'Krypto Bot',
+  'via krypt.cc/tools/krypto',
+];
+
+/** The canonical mark — used where ONE fixed string is needed (the Auto-callout
+ *  page's "every call ends with…" label). Live posts rotate, see below. */
+export const CALLOUT_WATERMARK = CALLOUT_WATERMARKS[0];
+
+/** A random mark for this post. Every entry discloses Krypto Mirror, so the pick
+ *  never affects whether the post is disclosed — only its wording. */
+export function pickCalloutWatermark(): string {
+  return CALLOUT_WATERMARKS[Math.floor(Math.random() * CALLOUT_WATERMARKS.length)];
+}
+
+/** Between the user's words and the mark: a new line, so the mark stands on
+ *  its own under the call instead of running on from it (asked 09-22). */
+const WATERMARK_SEP = '\n';
+
+/** Every mark this app has ever used — current variations and the legacy one —
+ *  so text already stamped with ANY of them is stripped and re-stamped with a
+ *  fresh pick, never left carrying two. */
+// Longest first, so 'via Krypto Mirror' is stripped whole rather than as its
+// tail 'Krypto Mirror' (and 'Krypto Mirror' before the legacy 'Krypt Mirror').
+const ALL_CALLOUT_MARKS = [...CALLOUT_WATERMARKS, ...LEGACY_CALLOUT_MARKS].sort((a, b) => b.length - a.length);
+
+/** The longest mark, so the budget below reserves room for whichever one is
+ *  picked; a shorter pick simply leaves the post under the limit. */
+const WATERMARK_MAX = Math.max(...CALLOUT_WATERMARKS.map((m) => m.length));
+
+/**
+ * A thesis as it will actually be posted.
+ *
+ * Structurally idempotent: any existing mark (this post's, a legacy one, or a
+ * different rotation pick from a re-mark) is stripped before a fresh one is
+ * appended, so the text always carries EXACTLY ONE mark — never two, never
+ * none. The exact wording changes per call by design.
+ */
+export function withCalloutWatermark(thesis: string): string {
+  const body = stripCalloutMarks(thesis);
+  const mark = pickCalloutWatermark();
+  if (!body) return mark;
+  return `${body}${WATERMARK_SEP}${mark}`;
+}
+
+/**
+ * The words without any mark. Two kinds go: a mark glued to the end of the
+ * text, and any line that is nothing but a mark — someone who pasted "via
+ * Krypto Mirror" into their own lines (2026-10-25). The mark is the app's to
+ * add, on the way out, so the lines never need to carry it and a post never
+ * carries it twice. A product name INSIDE a sentence stays: those are the
+ * user's words, not a mark.
+ */
+export function stripCalloutMarks(thesis: string): string {
+  const isMarkLine = (line: string): boolean => {
+    const l = line
+      .trim()
+      .replace(/^[·\-–—\s]+/, '')
+      .replace(/[\s·.!]+$/, '');
+    return l.length > 0 && ALL_CALLOUT_MARKS.includes(l);
+  };
+  let body = (thesis ?? '')
+    .split('\n')
+    .filter((line) => !isMarkLine(line))
+    .join('\n')
+    .trim();
+  for (const old of ALL_CALLOUT_MARKS) {
+    if (body.endsWith(old)) {
+      body = body.slice(0, -old.length).replace(/[\s·]+$/, '');
+      break;
+    }
+  }
+  return body;
+}
+
+/**
+ * Which lines of a text carry a mark (1-based), for the form to point at:
+ * the app adds its own closing line to every post, so a line that ends with
+ * one is doing the app's job twice over.
+ */
+export function linesCarryingMark(text: string): number[] {
+  const out: number[] = [];
+  (text ?? '').split('\n').forEach((line, i) => {
+    const t = line.trim();
+    if (t && stripCalloutMarks(t) !== t) out.push(i + 1);
+  });
+  return out;
+}
+
+/** What is left for the user's own words once the LONGEST mark is accounted
+ *  for, so whichever mark is picked still fits under MAX_THESIS. */
+export const THESIS_BUDGET = MAX_THESIS - (WATERMARK_MAX + WATERMARK_SEP.length);
+
+// ─── Variables in a line ─────────────────────────────────────────────────
+//
+// `{ticker}` and friends, so one list of lines works across coins instead of
+// being written per coin. The braces match the app's own rule variables
+// (`fill` in electron/engine/automation.ts), which is what the Scripts page
+// already documents; `<ticker>` is accepted too, because that is what someone
+// types first and a public post reading "<ticker> looks good" is a worse
+// outcome than supporting one extra spelling.
+//
+// A value nobody knows renders as an em dash, never as 0 or a blank — the
+// house rule, and here it also keeps the sentence honest: "— market cap" is
+// visibly missing information, where "$0" is a claim.
+
+/** What a line may name, and what each one means. Shown in the UI. */
+export const CALLOUT_VARS: Array<{ name: string; means: string }> = [
+  { name: 'ticker', means: 'the coin’s symbol' },
+  { name: 'name', means: 'its full name' },
+  { name: 'mc', means: 'market cap, short ($1.2M)' },
+  { name: 'price', means: 'price in USD' },
+  { name: 'holders', means: 'holder count' },
+  { name: 'buyers', means: 'unique buyers so far' },
+  { name: 'liq', means: 'liquidity, short' },
+  { name: 'mint', means: 'the first 8 characters of the address' },
+];
+
+export interface CalloutFacts {
+  ticker?: string | null;
+  name?: string | null;
+  mc?: number | null;
+  price?: number | null;
+  holders?: number | null;
+  buyers?: number | null;
+  liq?: number | null;
+  mint?: string | null;
+}
+
+/** $1.2M / $12.3K / $940 — short enough to sit in a sentence. */
+export function shortUsd(v: number | null | undefined): string {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return '—';
+  const a = Math.abs(v);
+  if (a >= 1_000_000_000) return `$${(v / 1_000_000_000).toFixed(1)}B`;
+  if (a >= 1_000_000) return `$${(v / 1_000_000).toFixed(1)}M`;
+  if (a >= 1_000) return `$${(v / 1_000).toFixed(1)}K`;
+  if (a >= 1) return `$${v.toFixed(0)}`;
+  return `$${v.toPrecision(2)}`;
+}
+
+/**
+ * Put the coin's facts into a line.
+ *
+ * Both `{ticker}` and `<ticker>` are read. An unknown name is left exactly as
+ * written — a typo should look like a typo, not vanish from a public post.
+ */
+export function fillCallout(text: string, facts: CalloutFacts): string {
+  const known = new Set(CALLOUT_VARS.map((v) => v.name));
+  return (text ?? '').replace(/[{<](\w+)[}>]/g, (whole, key: string) => {
+    if (!known.has(key)) return whole;
+    switch (key) {
+      case 'ticker':
+        return facts.ticker || '—';
+      case 'name':
+        return facts.name || '—';
+      case 'mc':
+        return shortUsd(facts.mc);
+      case 'liq':
+        return shortUsd(facts.liq);
+      case 'price':
+        return typeof facts.price === 'number' && Number.isFinite(facts.price)
+          ? `$${facts.price < 0.01 ? facts.price.toPrecision(2) : facts.price.toFixed(facts.price < 1 ? 4 : 2)}`
+          : '—';
+      case 'holders':
+        return typeof facts.holders === 'number' ? String(facts.holders) : '—';
+      case 'buyers':
+        return typeof facts.buyers === 'number' ? String(facts.buyers) : '—';
+      case 'mint':
+        return facts.mint ? facts.mint.slice(0, 8) : '—';
+      default:
+        return whole;
+    }
+  });
+}
+
+/** More than this many variants is a list nobody is curating. */
+export const MAX_THESES = 30;
+
+export interface AutoCalloutSettings {
+  /** On by default in Krypto Mirror (DEFAULT_AUTO_CALLOUT), but nothing is
+   *  posted from a wallet with no pump.fun account. */
+  enabled: boolean;
+  /**
+   * One line per variant; a random one is used per callout.
+   *
+   * Stored as typed, blank lines and all, so the textarea round-trips exactly
+   * what the user wrote. `thesesOf` is what reads it.
+   */
+  text: string;
+  /**
+   * Buys smaller than this are not called out. 0 = every buy.
+   *
+   * Not a limit pump imposes — it is here because calling every scratch trade
+   * spends the standing that the payout actually tracks, and the volume a
+   * call brings is what earns.
+   */
+  minBuySol: number;
+  /**
+   * The account that posted a callout likes it straight after (asked 09-22).
+   * The like is the author's own, shown under their name, so it claims
+   * nothing about anybody else. On by default; applies to every callout the
+   * app posts — on a buy, from a script, or the test button.
+   */
+  likeOwn: boolean;
+  /**
+   * Post each auto-callout to this Discord webhook too (asked 09-23), in the
+   * same embed as the scorenow script's calls. Empty = off. Discord's hosts
+   * only — checked here, at the IPC boundary, and again before the POST.
+   * A credential: never logged or rendered in full.
+   */
+  discordWebhookUrl: string;
+  /**
+   * Also call out a coin you LAUNCH (asked 2026-09-23), once your dev buy is
+   * worth more than `launchMinUsd`, posted after a short delay so the coin
+   * has a moment of life and pump does not drop a call made the same second
+   * as the create. Uses the same text/likeOwn/webhook as any auto-callout.
+   * On by default, but nothing posts until callout text is written.
+   */
+  onLaunch: boolean;
+  /** A launch is only called out when its dev buy is worth more than this in
+   *  USD (pump's own floor is $1; the default here is stricter). 0 = any. */
+  launchMinUsd: number;
+}
+
+/** How long after a launch's dev buy the callout waits. Fixed: a brand-new
+ *  coin needs a moment, and a call made the instant of the create is the kind
+ *  pump was seen to drop (see the callout-latency notes). */
+export const LAUNCH_CALLOUT_DELAY_MS = 30_000;
+
+// ── Calling out live COPIES (Krypto Mirror, 2026-10-22) ─────────────────
+//
+// Krypto Mirror's buys are copies, so "call out what I buy" means calling out
+// what the copies buy (the owner's ask: "do auto callouts where applicable,
+// free extra profit"). pump pays callers from the volume their calls bring.
+// Only a LIVE copy that confirmed, only from the account of the wallet that
+// bought, and never more often than COPY_CALLOUT_GAP_MS per account: copy
+// trading can buy many coins an hour, pump restricted an account for
+// templated spam on 2026-09-24, and frequency is the lever left.
+
+/** The least time between two copy callouts from one account. */
+export const COPY_CALLOUT_GAP_MS = 15 * 60_000;
+/** How long after the copy's buy the call goes out: pump has to see the
+ *  position (a $1 holding is its gate), and a leader who is out within
+ *  seconds takes the copy out too — pump shows only callers who still hold,
+ *  so that call would be invisible. */
+export const COPY_CALLOUT_DELAY_MS = 20_000;
+
+/**
+ * The lines Krypto Mirror ships with. Each names the coin and a number in its
+ * own words: pump's spam filter was measured (2026-09-25) removing generic
+ * lines within ~30 s while lines naming a number or the ticker survived. All
+ * say what the call is — a copy of a wallet being followed — because that is
+ * what it is.
+ *
+ * Eighteen of them, in different shapes (2026-10-25): a run of posts from one
+ * account that all open the same way, or all end on "{mc} mc", reads as a
+ * template whatever the mark says. They lean on different facts too —
+ * holders, buyers, price, liquidity as well as market cap — so the pool a
+ * coin can fill differs from coin to coin. None carries the closing line: the
+ * app adds its own (CALLOUT_WATERMARKS), a different wording each time, after
+ * whichever line it posts.
+ */
+export const DEFAULT_COPY_CALLOUT_LINES = [
+  '{ticker} at {mc} — copying a wallet I track into this one',
+  'in {ticker} at {mc} mc, following a tracked wallet',
+  'tracked wallet bought {ticker} at {mc}, I am in with them',
+  '{ticker} · {mc} mc · copied a wallet with a decent record',
+  'followed a wallet into {ticker} around {mc}',
+  'copy-in on {ticker}, {mc} mc when I got in',
+  'one of the wallets I track just took {ticker}, copied it at {mc}',
+  '{ticker} — {holders} holders, {mc} mc. following a wallet in here',
+  'copied a wallet into {ticker}, {buyers} buyers so far',
+  '{ticker}: a wallet I follow bought, so did I. {mc} mc',
+  'mirror buy on {ticker} at {price}, tracking the wallet that led',
+  '{ticker} at {mc} mc — this is a copy of a wallet I follow, not a call of my own',
+  'a wallet on my list went into {ticker} at {mc}. copied, watching',
+  '{ticker} picked up at {mc}, following a wallet with a record this week',
+  'copying a tracked wallet into {ticker} — {liq} liq, {mc} mc',
+  'in {ticker} because a wallet I track is. {holders} holders when I copied',
+  '{ticker} {mc} mc · followed in behind a tracked wallet',
+  'copied into {ticker} at {mc}, same wallet I have been tracking all week',
+].join('\n');
+
+export const DEFAULT_AUTO_CALLOUT: AutoCalloutSettings = {
+  // On in Krypto Mirror: it does nothing until a wallet has a pump.fun account,
+  // which is made deliberately, and the Wallet › pump.fun page that makes one
+  // says so beside the switch.
+  enabled: true,
+  text: DEFAULT_COPY_CALLOUT_LINES,
+  minBuySol: 0,
+  likeOwn: true,
+  discordWebhookUrl: '',
+  onLaunch: true,
+  launchMinUsd: 2,
+};
+
+/**
+ * One line whose every variable is KNOWN for this coin, chosen at random —
+ * or null when no line can be filled completely.
+ *
+ * A line posted with an em dash where the market cap should be ("at —") was
+ * among the ones pump's filter removed, and it says nothing to a reader
+ * either. A line with no variables always qualifies.
+ *
+ * `avoid` is the line this account posted last (2026-10-25): two posts in a
+ * row that read alike are what a template looks like, so it is left out of
+ * the draw whenever another line can be filled.
+ */
+export function pickFillableThesis(text: string, facts: CalloutFacts, rand: () => number = Math.random, avoid: string | null = null): string | null {
+  const dashes = (s: string): number => (s.match(/—/g) ?? []).length;
+  let ok = thesesOf(text).filter((line) => dashes(fillCallout(line, facts)) === dashes(line));
+  if (avoid !== null && ok.length > 1) ok = ok.filter((line) => line !== avoid);
+  if (!ok.length) return null;
+  return ok[Math.min(ok.length - 1, Math.floor(rand() * ok.length))];
+}
+
+/** The usable variants: non-empty lines, trimmed, capped in length and count. */
+export function thesesOf(text: string): string[] {
+  return (text ?? '')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0)
+    .slice(0, MAX_THESES)
+    // Cut to the BUDGET, not the raw cap: the mark is appended afterwards and
+    // a line filling the whole cap would lose its tail to the slice.
+    .map((l) => l.slice(0, THESIS_BUDGET));
+}
+
+/**
+ * One variant, chosen at random. Null when there are none to choose from.
+ *
+ * `rand` is injected so a test can assert the choice rather than sampling it.
+ */
+export function pickThesis(text: string, rand: () => number = Math.random): string | null {
+  const list = thesesOf(text);
+  if (!list.length) return null;
+  return list[Math.min(list.length - 1, Math.floor(rand() * list.length))];
+}
+
+/**
+ * Why auto-callout cannot run as configured, or null when it can.
+ *
+ * Checked in the form so the switch can explain itself, and again in main
+ * before anything is posted.
+ */
+export function autoCalloutProblem(s: AutoCalloutSettings): string | null {
+  // First, and whether or not calling is on: a webhook is saved on its own,
+  // and a bad one must be refused when it is typed, not when it is switched on.
+  const hook = webhookUrlProblem(s.discordWebhookUrl ?? '');
+  if (hook) return `Discord webhook: ${hook}.`;
+  // The launch floor is checked whether or not on-buy calling is enabled:
+  // "call out coins I launch" is its own switch. Guarded on presence — a
+  // partial or pre-field object is not malformed (the store fills the default).
+  if (typeof s.launchMinUsd === 'number' && (s.launchMinUsd < 0 || s.launchMinUsd > 100_000)) {
+    return 'The launch call minimum must be between 0 and 100,000 USD.';
+  }
+  if (!s.enabled) return null; // off is not a problem, it is the default
+  if (thesesOf(s.text).length === 0) {
+    return 'Add at least one line of text to post. A callout with nothing written on it is not worth making.';
+  }
+  if (!Number.isFinite(s.minBuySol) || s.minBuySol < 0 || s.minBuySol > 100) {
+    return 'The minimum buy must be between 0 and 100 SOL.';
+  }
+  return null;
+}
+
+// ─── The create call ─────────────────────────────────────────────────────
+//
+// OBSERVED on 2026-09-22 by watching a real callout being posted, because it
+// is not discoverable by probing: `/callout/eligibility/{mint}`,
+// `/callout/top/{mint}` and `/callout/{uuid}` answer, but `POST /callout`,
+// `/callouts`, `/callout/{mint}` and `/coins/{mint}/callout` are all 404.
+//
+//   POST https://frontend-api-v3.pump.fun/callout/create  →  201 Created
+//
+// AUTH IS A COOKIE, not a bearer token. The preflight answers
+// `access-control-allow-headers: content-type`, so a browser cannot send an
+// Authorization header at all, and `access-control-allow-credentials: true`
+// is how the session rides along. This app is not a browser and can send
+// both — see electron/engine/autoCallout.ts, which sets the `auth_token`
+// cookie (the name their own login sets) and an Authorization header beside
+// it, so whichever the guard reads is there.
+
+/** The path a callout is created at. */
+export const CALLOUT_CREATE_PATH: string | null = '/callout/create';
+
+/**
+ * The minimum position pump requires, in USD.
+ *
+ * Their preflight refuses with `INSUFFICIENT_BALANCE` below it. Confirmed at
+ * one dollar (2026-09-22); the smallest real call seen in the live feed held
+ * $2.13 of cost basis, which is consistent. Recorded so the UI can say the
+ * number rather than leaving someone to discover it as a refusal.
+ */
+export const MIN_CALLOUT_POSITION_USD = 1;
+
+/**
+ * Solana mainnet, as pump identifies a chain in a callout.
+ *
+ * Their callouts are multi-chain — the live feed carries hyperevm and arc
+ * rows this app has no rail for — so the chain is named in the body rather
+ * than implied. This app only calls out Solana buys, because that is the only
+ * side `postCallout` is wired to; an EVM buy would need this to be that
+ * chain's id, not this one.
+ */
+export const SOLANA_CHAIN_ID = 1_399_811_149;
+
+/**
+ * The payload version pump's own client sends.
+ *
+ * If they bump it, posts made with the old number are likely to be refused —
+ * so it is a named constant rather than an inline 2, and a 400 mentioning a
+ * version is the first thing to check here.
+ */
+export const CALLOUT_BODY_VERSION = 2;
+
+/**
+ * The request body, exactly as pump's own client sends it.
+ *
+ * OBSERVED 2026-09-22 from a real callout:
+ *
+ *   { coinMint, thesis, chainId: 1399811149, version: 2 }
+ *
+ * `coinMint` rather than `mint`, which is why this was not guessed: the wrong
+ * field name is a 400 on every buy that reads as a bug in our posting.
+ *
+ * Null when either half is missing — an empty thesis is not a callout, and a
+ * request without a mint is not one either.
+ */
+export function calloutBody(mint: string, thesis: string): Record<string, unknown> | null {
+  const m = (mint ?? '').trim();
+  const t = (thesis ?? '').trim();
+  if (!m || !t) return null;
+  // Marked HERE, on the way out, so a caller cannot post an unmarked one.
+  // Idempotent, so the form showing it and this applying it never double it.
+  return {
+    coinMint: m,
+    // Clamp the caller's text to THESIS_BUDGET FIRST, so the watermark is
+    // always what remains — never the part sliced off. fillCallout expands a
+    // template ({price} etc.) AFTER the per-line clamp, so a variable-stuffed
+    // line could otherwise push the "Called with krypt.cc/bot" disclosure off
+    // the end of a public post (audit 2026-09-23). The outer slice is then a
+    // no-op guard.
+    thesis: withCalloutWatermark(t.slice(0, THESIS_BUDGET)).slice(0, MAX_THESIS),
+    chainId: SOLANA_CHAIN_ID,
+    version: CALLOUT_BODY_VERSION,
+  };
+}
+
+// ─── Replying to a callout ───────────────────────────────────────────────
+//
+// OBSERVED 2026-09-22, from a real reply:
+//
+//   POST frontend-api-v3.pump.fun/callout/<uuid>/replies  →  201 Created
+//   { "content": "…" }                                        69 bytes
+//
+// A callout is ONE per coin per account, so a reply is how you UPDATE one —
+// that is what this is for, and it is what pump's own client sends when you
+// add to a call. It does not rewrite the original; it appends, and it
+// RE-BUMPS the callout, which is the actual reason to send one.
+//
+// That bump is worth stating plainly, because it is what makes an automated
+// reply loop tempting: the only things pacing it are pump's reply cooldown
+// (`preflight.reply.cooldownRemainingSeconds`), their 10-per-60s limit, and
+// the calling script's own action budget. Nothing here adds a bump of its own
+// accord — a reply is sent when something asks for one.
+//
+// This is what `preflight.reply.cooldownRemainingSeconds` was always talking
+// about. That field was being used to refuse a CREATE, which it never
+// described — see `refusal` in electron/engine/autoCallout.ts.
+//
+// Rate limit, from the response headers: `x-ratelimit-limit: 10` with
+// `x-ratelimit-reset: 60`. Tighter than the profile's 30/120, and the reason
+// replies are one-at-a-time rather than a loop.
+
+/** The path a reply is posted at, built from the callout's own id. */
+export function calloutReplyPath(calloutId: string): string | null {
+  return looksLikeCalloutId(calloutId) ? `/callout/${calloutId}/replies` : null;
+}
+
+/**
+ * A callout id, as `highlight_callout=` carries it and as the eligibility
+ * preflight returns it: a plain UUID.
+ *
+ * Checked because the id is the only caller-supplied part of the path. A
+ * value that is not a UUID cannot become a path segment.
+ */
+export function looksLikeCalloutId(id: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test((id ?? '').trim());
+}
+
+/**
+ * Longest a reply may be.
+ *
+ * pump's own limit is NOT known — the observed reply was 55 characters, which
+ * says nothing about the ceiling. This is "nothing absurd gets sent"; their
+ * refusal is the authority.
+ */
+export const MAX_REPLY = 500;
+
+/** What is left for the user's own words once the mark is accounted for. */
+export const REPLY_BUDGET = MAX_REPLY - (WATERMARK_MAX + WATERMARK_SEP.length);
+
+/**
+ * The reply body, in the shape observed.
+ *
+ * Marked like a callout, and for the same reason: a reply posted by a machine
+ * is not a reply somebody sat down and wrote, and it can be read on its own
+ * away from the call it hangs under. Null when there is nothing to say.
+ */
+export function replyBody(content: string): Record<string, unknown> | null {
+  const c = (content ?? '').trim();
+  if (!c) return null;
+  // Same as calloutBody: clamp first so the watermark is never truncated.
+  return { content: withCalloutWatermark(c.slice(0, REPLY_BUDGET)).slice(0, MAX_REPLY) };
+}
+
+/** Whether posting is possible in this build at all. Needs the route AND the
+ *  body shape — having one without the other posts nothing. */
+export function canPostCallouts(): boolean {
+  return CALLOUT_CREATE_PATH !== null && calloutBody('x', 'y') !== null;
+}
+
+/** What a callout attempt did, for the record and the log. */
+export interface CalloutOutcome {
+  ok: boolean;
+  /** Our words or pump's, whichever explains it. */
+  message: string;
+  /** The verdict the preflight gave, when it was asked. */
+  verdict?: string;
+  /** The text that went out, when one did. */
+  thesis?: string;
+  /** pump's id for the callout that went out, when it could be learned —
+   *  what a like or a reply names. Null when neither the create answer nor a
+   *  second preflight gave it. */
+  calloutId?: string | null;
+  /** pump's id for a REPLY that went out, when its answer carried one — the
+   *  last segment of the reply's public link. */
+  replyId?: string | null;
+}
+
+/** A reply's own id out of pump's reply answer. Not `calloutIdFrom`: that
+ *  reads `calloutId` first, which on a reply is the PARENT. */
+export function replyIdFrom(raw: string): string | null {
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  try {
+    const j = JSON.parse(raw) as Record<string, unknown>;
+    const inner = j && typeof j.reply === 'object' && j.reply ? (j.reply as Record<string, unknown>) : {};
+    for (const v of [j?.replyId, j?.id, inner.replyId, inner.id]) {
+      if (typeof v === 'string' && UUID.test(v)) return v.toLowerCase();
+    }
+  } catch {
+    /* not JSON */
+  }
+  return null;
+}
+
+/**
+ * The public page for a callout, or for one reply in its thread — the same
+ * paths pump.fun's own share button builds (read out of its web bundle,
+ * 2026-09-23). Null unless every part is the shape pump uses, so a link is
+ * never built from something a caller made up.
+ */
+export function calloutPageUrl(mint: string, calloutId: string, replyId?: string | null): string | null {
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint ?? '') || !UUID.test(calloutId ?? '')) return null;
+  const base = `https://pump.fun/callouts/${mint}/${calloutId.toLowerCase()}`;
+  return replyId && UUID.test(replyId) ? `${base}/${replyId.toLowerCase()}` : base;
+}
+
+/** The new callout's id out of pump's create answer, whatever its shape. The
+ *  answer's schema was never observed, so this reads defensively: `id`,
+ *  `calloutId`, or either inside `callout`, and only a UUID counts. */
+export function calloutIdFrom(raw: string): string | null {
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  try {
+    const j = JSON.parse(raw) as Record<string, unknown>;
+    const inner = j && typeof j.callout === 'object' && j.callout ? (j.callout as Record<string, unknown>) : {};
+    for (const v of [j?.calloutId, j?.id, inner.calloutId, inner.id]) {
+      if (typeof v === 'string' && UUID.test(v)) return v.toLowerCase();
+    }
+  } catch {
+    /* not JSON */
+  }
+  return null;
+}

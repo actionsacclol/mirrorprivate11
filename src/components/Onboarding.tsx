@@ -1,0 +1,659 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  AlertTriangle,
+  ArrowLeft,
+  ArrowRight,
+  Check,
+  Compass,
+  ExternalLink,
+  FileText,
+  Gift,
+  Info,
+  KeyRound,
+  Loader2,
+  Rocket,
+  ShieldAlert,
+  Wallet as WalletIcon,
+  Zap,
+} from 'lucide-react';
+import { LiquidGlass } from './LiquidGlass';
+import { feePctLabel, referralProblem, TREASURY_ADDRESS } from '@shared/fees';
+import { CLICKWRAP_SUMMARY, ALL_DOCUMENTS, type LegalDocument } from '@shared/legal/documents';
+import { entityInfo } from '@shared/legal/entity';
+import type { RouteId } from '../state/nav';
+import { useAppState } from '../state/AppStateProvider';
+import { GhostButton, PrimaryButton } from './common';
+import { LanguagePicker } from './LanguagePicker';
+import { useLocale } from '../state/useLocale';
+import { cls } from '../utils/format';
+import { InlineGuide } from './GuideVideoPlayer';
+
+// First run.
+//
+// ─── Order matters ────────────────────────────────────────────────────
+//
+//  1. LEGAL — a hard gate. Nothing happens until the user affirmatively
+//     agrees. legalcheck.md: a link in a footer is not acceptance, and the
+//     plain-language summary is what makes it enforceable when someone later
+//     says "I never read it". Full text is one click away and works offline.
+//     The platform fee is disclosed HERE, in the accept summary — not in a
+//     later step — so it sits with the terms the user actually agrees to.
+//  2. REFERRAL — optional; just "a friend referred you? paste their address".
+//  3. KEYS — the app works with no keys at all, so this is opt-in help, not a
+//     wall. The fields are HERE rather than a pointer to Settings: "where do I
+//     put my API key" is best answered by letting them put it in.
+//  4. WALLET, then 5. READY.
+//
+// Only step 1 blocks. Everything after it can be skipped, because an
+// onboarding that traps someone who just wants to look around is a worse
+// product than one they can escape.
+
+type Step = 'loading' | 'language' | 'legal' | 'referral' | 'keys' | 'wallet' | 'ready' | 'done';
+
+const FLOW: Step[] = ['referral', 'keys', 'wallet', 'ready'];
+
+/** Accept a bare key or a whole pasted Helius URL — people paste both. */
+function extractHeliusKey(raw: string): string {
+  const t = raw.trim();
+  const fromUrl = t.match(/api-key=([A-Za-z0-9-]+)/);
+  return fromUrl ? fromUrl[1] : t;
+}
+
+function Reader({ onBack }: { onBack: () => void }) {
+  const [open, setOpen] = useState<LegalDocument['id']>('terms');
+  const doc = ALL_DOCUMENTS.find((d) => d.id === open) ?? ALL_DOCUMENTS[0];
+  return (
+    <>
+      <div className="px-6 py-3 border-b border-white/10 flex items-center gap-2 flex-wrap">
+        <GhostButton onClick={onBack}>
+          <ArrowLeft className="h-3.5 w-3.5" /> Back
+        </GhostButton>
+        {ALL_DOCUMENTS.map((d) => (
+          <button
+            key={d.id}
+            onClick={() => setOpen(d.id)}
+            className={cls(
+              'rounded-md border px-2.5 py-1 text-label font-semibold transition',
+              d.id === open
+                ? 'border-krypt-purple/40 bg-krypt-purple/15 text-white'
+                : 'border-white/10 bg-black/25 text-krypt-muted hover:text-white',
+            )}
+          >
+            {d.title}
+          </button>
+        ))}
+      </div>
+      <div className="px-6 py-4 max-h-[52vh] overflow-y-auto">
+        <div className="font-display text-value font-semibold text-white">{doc.title}</div>
+        <div className="text-label text-krypt-muted/70 mb-3">{doc.subtitle}</div>
+        {doc.sections.map((sec) => (
+          <div key={sec.heading} className="mb-3">
+            <h3 className={cls('text-body font-semibold mb-1', sec.emphasis ? 'text-arc-gold' : 'text-white')}>
+              {sec.heading}
+            </h3>
+            {sec.body.map((para, i) => (
+              <p
+                key={i}
+                className={cls(
+                  'text-body leading-relaxed mb-1.5',
+                  sec.emphasis ? 'text-white/90 font-medium' : 'text-krypt-muted',
+                )}
+              >
+                {para}
+              </p>
+            ))}
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
+function StepDots({ current }: { current: Step }) {
+  const idx = FLOW.indexOf(current);
+  if (idx < 0) return null;
+  return (
+    <div className="flex items-center gap-1.5">
+      {FLOW.map((s, i) => (
+        <span
+          key={s}
+          className={cls(
+            'h-1.5 rounded-full transition-all',
+            i === idx ? 'w-5 bg-krypt-purple' : i < idx ? 'w-1.5 bg-krypt-purple/50' : 'w-1.5 bg-white/15',
+          )}
+        />
+      ))}
+    </div>
+  );
+}
+
+function Field({
+  label,
+  hint,
+  value,
+  onChange,
+  placeholder,
+  saved,
+  link,
+  onLink,
+}: {
+  label: string;
+  hint: string;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder: string;
+  saved: boolean;
+  link: string;
+  onLink: () => void;
+}) {
+  return (
+    <div className="rounded-md border border-white/10 bg-black/25 px-3 py-2.5">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-body font-semibold text-white">{label}</span>
+        {saved && (
+          <span className="inline-flex items-center gap-1 rounded-full border border-emerald-400/30 bg-emerald-400/10 px-1.5 py-0.5 text-micro font-bold uppercase tracking-wider text-emerald-300">
+            <Check className="h-2.5 w-2.5" /> saved
+          </span>
+        )}
+        <div className="flex-1" />
+        <button
+          onClick={onLink}
+          className="inline-flex items-center gap-1 text-label font-semibold text-krypt-purple hover:text-white transition-colors"
+        >
+          {link} <ExternalLink className="h-3 w-3" />
+        </button>
+      </div>
+      <p className="mt-1 text-body leading-relaxed text-krypt-muted">{hint}</p>
+      <input
+        type="password"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        spellCheck={false}
+        placeholder={placeholder}
+        className="mt-2 w-full rounded bg-black/40 border border-white/15 px-3 py-2 font-mono text-body text-white outline-none focus:border-krypt-purple/60"
+      />
+    </div>
+  );
+}
+
+export function Onboarding({
+  onNavigate,
+  onGateChange,
+}: {
+  onNavigate?: (route: RouteId) => void;
+  /** Reports whether the gate is currently up. App marks the shell behind
+   *  it `inert` while true, so Tab/Enter cannot reach the Paper/Live toggle
+   *  or a quick-buy before the terms are accepted. */
+  onGateChange?: (gated: boolean) => void;
+}) {
+  const { settings, updateSettings } = useAppState();
+  const info = entityInfo();
+
+  const [step, setStep] = useState<Step>('loading');
+  // Onboarding is the one screen that must speak the user language before
+  // they have had a chance to set it, so it reads the resolved locale itself.
+  const lang = useLocale();
+  const [legalDone, setLegalDone] = useState(false);
+  const gated = step !== 'done';
+  useEffect(() => {
+    onGateChange?.(gated);
+  }, [gated, onGateChange]);
+  const boxRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (step !== 'loading' && step !== 'done') boxRef.current?.focus();
+  }, [step]);
+  const [reading, setReading] = useState(false);
+  const [agreed, setAgreed] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const [addr, setAddr] = useState('');
+  const [touched, setTouched] = useState(false);
+  const [helius, setHelius] = useState('');
+  const [birdeye, setBirdeye] = useState('');
+  const [jupiter, setJupiter] = useState('');
+  const [savedHelius, setSavedHelius] = useState(false);
+  const [savedBirdeye, setSavedBirdeye] = useState(false);
+  const [savedJupiter, setSavedJupiter] = useState(false);
+
+  const refresh = useCallback(async () => {
+    const r = await window.krypt.legal.status();
+    const accepted = r.ok && r.data ? r.data.accepted : false;
+    setLegalDone(accepted);
+    // Replaying from Settings: the documents are already accepted, so start
+    // at the language/colour screen and let Continue skip the legal gate
+    // rather than asking someone to re-accept what they accepted once.
+    if (accepted && !settings.onboarded) {
+      setStep('language');
+      return;
+    }
+    if (!accepted) {
+      // Language first. The next screen is a page of English legal text, and
+      // asking someone to read that before offering to change the language
+      // is asking the people who most need this feature to find it last.
+      setStep('language');
+      return;
+    }
+    setStep(settings.onboarded ? 'done' : 'referral');
+  }, [settings.onboarded]);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  // A returning install (the 5.4.0 replay) sees the referrer it already gave,
+  // not an empty box that reads as "none".
+  useEffect(() => {
+    if (!touched && settings.referrer && !addr) setAddr(settings.referrer);
+  }, [settings.referrer, touched, addr]);
+
+  const problem = touched ? referralProblem(addr, { ownAddresses: [], treasury: TREASURY_ADDRESS }) : null;
+
+  if (step === 'loading' || step === 'done') return null;
+
+  const acceptLegal = async (): Promise<void> => {
+    setBusy(true);
+    await window.krypt.legal.accept();
+    setBusy(false);
+    setStep(settings.onboarded ? 'done' : 'referral');
+  };
+
+  /** Persist the referral choice as soon as it is made, so closing the app
+   *  mid-setup does not lose the one answer we cannot ask for again.
+   *
+   *  Only a field the user TOUCHED is saved. Onboarding replays on 5.4.0
+   *  (settings revision 7) for every existing install, and an untouched
+   *  Continue used to write the empty field over a referrer saved months
+   *  ago — the one answer this screen exists to keep. */
+  const goFromFee = async (): Promise<void> => {
+    setBusy(true);
+    if (touched) await updateSettings({ referrer: addr.trim() });
+    setBusy(false);
+    setStep('keys');
+  };
+
+  const saveHelius = async (): Promise<void> => {
+    const key = extractHeliusKey(helius);
+    if (!/^[A-Za-z0-9-]{8,}$/.test(key)) return;
+    await updateSettings({ rpc: { ...settings.rpc, heliusApiKey: key } });
+    setSavedHelius(true);
+  };
+
+  const saveBirdeye = async (): Promise<void> => {
+    const key = birdeye.trim();
+    if (key.length < 8) return;
+    await updateSettings({ data: { ...settings.data, birdeyeApiKey: key } });
+    setSavedBirdeye(true);
+  };
+
+  // The same field the Market data settings save (data.jupiterApiKey): a host
+  // switch, not a feature unlock — see MarketDataSettings for the long form.
+  const saveJupiter = async (): Promise<void> => {
+    const key = jupiter.trim();
+    if (key.length < 8) return;
+    await updateSettings({ data: { ...settings.data, jupiterApiKey: key } });
+    setSavedJupiter(true);
+  };
+
+  const finish = async (): Promise<void> => {
+    setBusy(true);
+    await updateSettings({ onboarded: true });
+    setBusy(false);
+    setStep('done');
+  };
+
+  const jump = (route: RouteId): void => {
+    void finish().then(() => onNavigate?.(route));
+  };
+
+  return (
+    // The scrim dims and nothing more: a scrim that blurs is a backdrop root,
+    // and the glass card above it would then frost the scrim instead of the
+    // page. The card does its own frosting.
+    <div data-testid="onboarding" className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 p-6">
+      <LiquidGlass surface="sheet" className="w-full max-w-xl rounded-2xl border border-white/10 bg-card">
+      <div ref={boxRef} tabIndex={-1} className="outline-none">
+        <div className="px-6 pt-6 pb-4 border-b border-white/10 flex items-end gap-3">
+          <div className="flex-1">
+            <div className="text-note text-krypt-muted">Welcome to</div>
+            <div className="mt-0.5 flex items-center gap-2.5 text-[22px] font-semibold text-white">
+              <img src="./krypt.png" alt="" className="h-7 w-7 rounded-lg" />
+              Krypto Mirror
+            </div>
+            {step === 'legal' && (
+              <div className="text-label text-krypt-muted/70 mt-1.5">
+                Published by {info.entity} · terms version {info.termsVersion}
+              </div>
+            )}
+          </div>
+          <StepDots current={step} />
+        </div>
+
+        {/* ── 0. Language ─────────────────────── */}
+        {step === 'language' && (
+          <>
+            {/* Language only. The theme picker sat here too until 2026-09-27
+                and made the first screen a wall of swatches; it lives on the
+                Settings page, where a look is chosen once the app is seen. */}
+            <div className="px-6 py-4 max-h-[54vh] overflow-y-auto space-y-5">
+              <LanguagePicker />
+            </div>
+            <div className="px-6 py-4 border-t border-white/10 flex justify-end">
+              <PrimaryButton onClick={() => setStep(legalDone ? 'referral' : 'legal')}>{lang.t('action.continue')}</PrimaryButton>
+            </div>
+          </>
+        )}
+
+        {/* ── 1. Legal gate ─────────────────────────────────────────── */}
+        {step === 'legal' && reading && <Reader onBack={() => setReading(false)} />}
+
+        {step === 'legal' && !reading && (
+          <>
+            <div className="px-6 py-4 max-h-[54vh] overflow-y-auto">
+              <p className="text-body leading-relaxed text-krypt-muted mb-3">
+                Before you use {info.product}, please read this summary. It is short on purpose, and the full documents
+                are one click away.
+              </p>
+              <div className="space-y-2.5">
+                {CLICKWRAP_SUMMARY.map((pt) => (
+                  <div
+                    key={pt.title}
+                    className={cls(
+                      'rounded-md border px-3 py-2',
+                      pt.flagged ? 'border-arc-gold/25 bg-arc-gold/[0.06]' : 'border-white/10 bg-black/25',
+                    )}
+                  >
+                    <div className="flex items-center gap-1.5 text-body font-semibold text-white">
+                      {pt.flagged ? (
+                        <AlertTriangle className="h-3.5 w-3.5 text-arc-gold flex-shrink-0" />
+                      ) : (
+                        <Info className="h-3.5 w-3.5 text-krypt-purple flex-shrink-0" />
+                      )}
+                      {pt.title}
+                    </div>
+                    <p className="mt-1 text-body leading-relaxed text-krypt-muted">{pt.detail}</p>
+                  </div>
+                ))}
+              </div>
+              <button
+                onClick={() => setReading(true)}
+                className="mt-3 inline-flex items-center gap-1.5 text-body font-semibold text-krypt-purple hover:text-white transition-colors"
+              >
+                <FileText className="h-3.5 w-3.5" />
+                Read the full Terms of Service, Privacy Policy and Software Terms
+              </button>
+            </div>
+
+            <div className="px-6 py-4 border-t border-white/10">
+              <label className="flex items-start gap-2.5 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={agreed}
+                  onChange={(e) => setAgreed(e.target.checked)}
+                  className="mt-0.5 h-4 w-4 flex-shrink-0 accent-krypt-purple"
+                />
+                <span className="text-body leading-relaxed text-krypt-muted">
+                  I am {info.minimumAge} or older, I have read and agree to the{' '}
+                  <span className="text-white">Terms of Service</span>,{' '}
+                  <span className="text-white">Privacy Policy</span> and{' '}
+                  <span className="text-white">Software Terms</span>, and I understand this software carries a risk of
+                  total financial loss and that disputes are resolved by individual arbitration.
+                </span>
+              </label>
+              <div className="mt-3 flex items-center gap-2">
+                <span className="text-label text-krypt-muted/60">Declining closes the app.</span>
+                <div className="flex-1" />
+                <GhostButton onClick={() => void window.krypt.app.quit()} disabled={busy} destructive>
+                  Decline &amp; quit
+                </GhostButton>
+                <PrimaryButton onClick={() => void acceptLegal()} disabled={!agreed || busy}>
+                  {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ShieldAlert className="h-3.5 w-3.5" />}
+                  I agree &amp; continue
+                </PrimaryButton>
+              </div>
+            </div>
+          </>
+        )}
+
+        {/* ── 2. Cost + referral ────────────────────────────────────── */}
+        {step === 'referral' && (
+          <>
+            <div className="px-6 py-6 space-y-3">
+              <div className="flex items-center gap-2 text-white text-value font-semibold">
+                <Gift className="h-4 w-4 text-arc-gold" />
+                Have a friend who referred you?
+              </div>
+              <p className="text-body leading-relaxed text-krypt-muted">
+                Put their Solana address below and they&apos;ll earn rewards as you trade. Leave it blank if not.
+              </p>
+              <input
+                value={addr}
+                onChange={(e) => {
+                  setAddr(e.target.value);
+                  setTouched(true);
+                }}
+                spellCheck={false}
+                placeholder="Their SOL address (optional)"
+                className="w-full rounded bg-black/40 border border-white/15 px-3 py-2 font-mono text-body text-white outline-none focus:border-krypt-purple/60"
+              />
+              {problem && <p className="text-body text-rose-300">{problem}</p>}
+            </div>
+            <div className="px-6 py-4 border-t border-white/10 flex items-center gap-2">
+              <span className="text-label text-krypt-muted/60">You can add this later in Settings.</span>
+              <div className="flex-1" />
+              <PrimaryButton onClick={() => void goFromFee()} disabled={!!problem || busy}>
+                {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ArrowRight className="h-3.5 w-3.5" />}
+                Continue
+              </PrimaryButton>
+            </div>
+          </>
+        )}
+
+        {/* ── 3. API keys ───────────────────────────────────────────── */}
+        {step === 'keys' && (
+          <>
+            <div className="px-6 py-5 space-y-3 max-h-[56vh] overflow-y-auto">
+              <div className="flex items-center gap-2 text-white text-note font-semibold">
+                <KeyRound className="h-3.5 w-3.5 text-krypt-purple" />
+                Connect your data (optional)
+              </div>
+              <p className="text-body leading-relaxed text-krypt-muted">
+                <span className="text-white">Krypto Mirror works right now with no keys at all.</span> It races several free
+                public Solana endpoints for the launch feed. These three are free upgrades — paste them here, or skip
+                and add them any time under Settings.
+              </p>
+
+              {/* The recorded keys guide (Settings › Guides), played right here. */}
+              <InlineGuide id="api-keys" label="Watch: getting your API keys" />
+
+              <Field
+                label="Helius API key"
+                hint="Free tier. Used where it matters — trade simulation, sending, confirmation, fee estimates, and the holder reads the public RPC refuses with 429. Launch scanning stays on public endpoints. Paste the key or the whole URL."
+                value={helius}
+                onChange={(v) => {
+                  setHelius(v);
+                  setSavedHelius(false);
+                }}
+                placeholder="Helius API key, or paste the full https://…?api-key=… URL"
+                saved={savedHelius || !!settings.rpc.heliusApiKey}
+                link="Get a free key"
+                onLink={() => void window.krypt.app.openExternal('https://dashboard.helius.dev')}
+              />
+
+              <Field
+                label="Birdeye API key"
+                hint="Optional. Adds sub-minute price candles for charts. Everything else works without it."
+                value={birdeye}
+                onChange={(v) => {
+                  setBirdeye(v);
+                  setSavedBirdeye(false);
+                }}
+                placeholder="Birdeye API key"
+                saved={savedBirdeye || !!settings.data.birdeyeApiKey}
+                link="Get a key"
+                onLink={() => void window.krypt.app.openExternal('https://bds.birdeye.so')}
+              />
+
+              <Field
+                label="Jupiter API key"
+                hint="Optional and free. It unlocks no extra data — it moves every Jupiter call, buy and sell quotes included, off lite-api.jup.ag, which Jupiter is retiring, onto api.jup.ag at its published 1 request a second."
+                value={jupiter}
+                onChange={(v) => {
+                  setJupiter(v);
+                  setSavedJupiter(false);
+                }}
+                placeholder="Jupiter API key"
+                saved={savedJupiter || !!settings.data.jupiterApiKey}
+                link="Get a free key"
+                onLink={() => void window.krypt.app.openExternal('https://portal.jup.ag')}
+              />
+
+              <p className="text-label leading-relaxed text-krypt-muted/60">
+                Keys are stored on this machine only and are stripped from recordings. They are never sent to Krypt —
+                there is no Krypt server to send them to.
+              </p>
+            </div>
+            <div className="px-6 py-4 border-t border-white/10 flex items-center gap-2">
+              <GhostButton onClick={() => setStep('referral')} disabled={busy}>
+                <ArrowLeft className="h-3.5 w-3.5" /> Back
+              </GhostButton>
+              <div className="flex-1" />
+              <GhostButton onClick={() => setStep('wallet')} disabled={busy}>
+                Skip for now
+              </GhostButton>
+              <PrimaryButton
+                onClick={async () => {
+                  setBusy(true);
+                  if (helius.trim()) await saveHelius();
+                  if (birdeye.trim()) await saveBirdeye();
+                  if (jupiter.trim()) await saveJupiter();
+                  setBusy(false);
+                  setStep('wallet');
+                }}
+                disabled={busy}
+              >
+                {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ArrowRight className="h-3.5 w-3.5" />}
+                Save &amp; continue
+              </PrimaryButton>
+            </div>
+          </>
+        )}
+
+        {/* ── 4. Wallet ─────────────────────────────────────────────── */}
+        {step === 'wallet' && (
+          <>
+            <div className="px-6 py-5 space-y-3 max-h-[56vh] overflow-y-auto">
+              <div className="flex items-center gap-2 text-white text-note font-semibold">
+                <WalletIcon className="h-3.5 w-3.5 text-krypt-purple" />
+                Your trading wallet
+              </div>
+              <p className="text-body leading-relaxed text-krypt-muted">
+                Krypto Mirror can find, check and paper-follow wallets with no wallet of your own. You only need one to copy live.
+              </p>
+              <div className="rounded-md border border-white/10 bg-black/25 px-3 py-2.5 space-y-1.5">
+                <p className="text-body leading-relaxed text-krypt-muted">
+                  <span className="text-white">Use a dedicated hot wallet.</span> Generate a fresh one under Wallet, or
+                  import an existing key. Fund it with an amount you would not mind losing entirely — not your main
+                  wallet.
+                </p>
+                <p className="text-body leading-relaxed text-krypt-muted">
+                  <span className="text-white">Your key is encrypted by your system’s key store</span> (Windows, the macOS
+                  Keychain or your Linux keyring) and never leaves this machine. If it cannot be stored securely, Krypto
+                  Mirror refuses to store it at all rather than leave it in the clear.
+                </p>
+                <p className="text-body leading-relaxed text-krypt-muted">
+                  <span className="text-white">The app stays in Paper after this wallet is made</span> — nothing spends real
+                  SOL until you switch to Live in the top bar and arm a copy yourself. Nothing trades on its own: on
+                  Solana there is a per-trade cap, a balance cap and a kill switch, and the scanner only flags tokens. The
+                  EVM chains (Robinhood, BNB) start in Paper and are armed by hand, each on its own.
+                </p>
+              </div>
+              <div className="rounded-md border border-arc-gold/25 bg-arc-gold/[0.06] px-3 py-2">
+                <p className="text-body leading-relaxed text-krypt-muted">
+                  <AlertTriangle className="inline h-3.5 w-3.5 text-arc-gold mr-1 -mt-0.5" />
+                  Back up your key somewhere safe before you fund it. Nobody — including Krypt — can recover it for you.
+                </p>
+              </div>
+            </div>
+            <div className="px-6 py-4 border-t border-white/10 flex items-center gap-2">
+              <GhostButton onClick={() => setStep('keys')} disabled={busy}>
+                <ArrowLeft className="h-3.5 w-3.5" /> Back
+              </GhostButton>
+              <div className="flex-1" />
+              <GhostButton onClick={() => setStep('ready')} disabled={busy}>
+                Later
+              </GhostButton>
+              <PrimaryButton onClick={() => jump('wallet')} disabled={busy}>
+                <WalletIcon className="h-3.5 w-3.5" /> Set up a wallet
+              </PrimaryButton>
+            </div>
+          </>
+        )}
+
+        {/* ── 5. Ready ──────────────────────────────────────────────── */}
+        {step === 'ready' && (
+          <>
+            <div className="px-6 py-5 space-y-3 max-h-[56vh] overflow-y-auto">
+              <div className="flex items-center gap-2 text-white text-note font-semibold">
+                <Rocket className="h-3.5 w-3.5 text-arc-gold" />
+                You’re set
+              </div>
+              <div className="space-y-2">
+                {[
+                  {
+                    icon: Compass,
+                    title: 'Find someone worth following',
+                    detail:
+                      'Find wallets ranks traders by what a FOLLOWER would have kept — two seconds late and paying fees — not by what they made. Measured over two periods, copying loses on average; the score ranks the least bad.',
+                  },
+                  {
+                    icon: ShieldAlert,
+                    title: 'Paper first, always',
+                    detail:
+                      'Every follow starts on paper: fills at the price after your delay, with fees, so a flat round trip loses. Watch the record before any real money moves.',
+                  },
+                  {
+                    icon: Zap,
+                    title: 'Going live',
+                    detail: `Switch the top bar to Live, then switch a follow to Live and confirm it. Each copy is sized and capped by you, with a daily loss limit. Krypt takes ${feePctLabel()} of every buy and every sell, charged on-chain in the same transaction.`,
+                  },
+                  {
+                    icon: KeyRound,
+                    title: 'Everything is under Settings',
+                    detail:
+                      'Your RPC endpoints and a Measure button to time them, market-data keys, the fee details and your referrer — all there at any time.',
+                  },
+                ].map((row) => (
+                  <div key={row.title} className="rounded-md border border-white/10 bg-black/25 px-3 py-2">
+                    <div className="flex items-center gap-1.5 text-body font-semibold text-white">
+                      <row.icon className="h-3.5 w-3.5 text-krypt-purple flex-shrink-0" />
+                      {row.title}
+                    </div>
+                    <p className="mt-1 text-body leading-relaxed text-krypt-muted">{row.detail}</p>
+                  </div>
+                ))}
+              </div>
+              {/* Offered at the end rather than the start: someone who has
+                  just set up is the person most likely to watch it. It plays
+                  in place (the quickstart under Settings › Guides). */}
+              <InlineGuide id="quickstart" label="Watch the quickstart" />
+              <p className="text-label leading-relaxed text-krypt-muted/60">
+                Start small. Memecoins are the most volatile assets there are, and most go to zero.
+              </p>
+            </div>
+            <div className="px-6 py-4 border-t border-white/10 flex items-center gap-2">
+              <GhostButton onClick={() => setStep('wallet')} disabled={busy}>
+                <ArrowLeft className="h-3.5 w-3.5" /> Back
+              </GhostButton>
+              <div className="flex-1" />
+              <PrimaryButton onClick={() => void finish()} disabled={busy}>
+                {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Compass className="h-3.5 w-3.5" />}
+                Start following
+              </PrimaryButton>
+            </div>
+          </>
+        )}
+      </div>
+      </LiquidGlass>
+    </div>
+  );
+}

@@ -1,0 +1,18 @@
+{
+ "capturedAt": "2026-10-23T11:33:41.026Z",
+ "note": "pump-amm Pool accounts whose virtual quote reserve (i128 @245) is negative; captured for the signed-read regression",
+ "pools": [
+  {
+   "pool": "8CDLER5mY7ZsRfDKLMiVbRLyThjgH45zFmfkwFSB5hLU",
+   "dataBase64": "8ZptBBGxbbz9AAAfcl36eGNA312xolp+1LPurqv2W1+hUuTpgetIkw8Ozz/58DoW9/W1SwbptRyDQxDICnbJMpxQKDbxYzakjAEfBpuIV/6rgYT7aH9jRhjANdrEOdwa6ztVmKDwAAAAAAG7QhXSOSozvn+oIkempLEIZIvibUuiYO0BYqlTPQhW7XHKmqkg/dRbUtS0w8ywUoQoysqGXunh4xnOIIb2Hhr+UEPPZI36Pw6ULMoo9XNWB9/OOAeDJQ+zbNC36VwB4pm6i4BaDwAAACPLI4slei5jpV4YtM35gD5jE2vFM/0nvhVtz11lEAOgAQDBw///////////////////AAAAAAAAAAAAAAAAAAAAAAAAPzwAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+   "i64": "-15423",
+   "hi": "ffffffffffffffff"
+  },
+  {
+   "pool": "26Cw9VBMrMdmZu4YDgCwHZaEy77VRSyqRLau8ktUDrGW",
+   "dataBase64": "8ZptBBGxbbz/AAAPlG2lMyPYDKPtFMTFkT1zih7pVO1+nHb9s1b6qumZ0maV9fG95oBnsB8oKHCCowmpD+am6g0IST3ybG5YSLXfBpuIV/6rgYT7aH9jRhjANdrEOdwa6ztVmKDwAAAAAAELSfP7VA8kYBV095bpuzpwKEhyAa5x8V2fxfJuA2cGnTYCxeo8zPpHIzxnXJzY9hZyLEKWGxazY/8SiXnXOTKlnZZ1TIIQX2xud2tff5QvNeuG6R29GFHo9S6ZYsYbCw9UYE8qLAAAAKI5vn511+DQf3UybymOqBwsV6hGUX88EEksD6VhEm1VAQBd6P//////////////////AAAAAAAAAAAAAAAAAAAAAAAAoxcAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+   "i64": "-6051",
+   "hi": "ffffffffffffffff"
+  }
+ ]
+}

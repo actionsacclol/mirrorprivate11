@@ -41,6 +41,42 @@ import { logger } from './logger';
  * a fused release build carries none of them, so any hit means the build was
  * launched in a way a shipped build never is.
  */
+/**
+ * A launch switch that opens a debugger on a SHIPPED build, or null
+ * (2026-11-02). Checked once at startup, before any window: a packaged build
+ * started with one of these refuses to run rather than merely dropping to
+ * paper, because `--remote-debugging-port` hands the renderer to Chrome's
+ * DevTools (chrome://inspect) whatever `webPreferences.devTools` says.
+ * `--inspect*` is already fused off; it is listed so the refusal says why.
+ */
+export function debugLaunchSwitch(argv: readonly string[], hasSwitch: (name: string) => boolean = () => false): string | null {
+  for (const s of ['remote-debugging-port', 'remote-debugging-pipe', 'remote-debugging-address', 'inspect', 'inspect-brk', 'inspect-port']) {
+    if (hasSwitch(s)) return `--${s}`;
+  }
+  const hit = argv
+    .slice(1)
+    .map((a) => a.toLowerCase())
+    .find((a) => a.startsWith('--remote-debugging') || a.startsWith('--inspect'));
+  return hit ? hit.split('=')[0] : null;
+}
+
+/**
+ * The DevTools and reload shortcuts a shipped build swallows (2026-11-02):
+ * F12, Ctrl/Cmd+Shift+I/J/C, Cmd+Alt+I/J/C, Ctrl/Cmd+R and F5. A second wall
+ * behind `devTools: false` and the removed menu — those already make the
+ * keys do nothing; this keeps it that way if either is ever loosened.
+ */
+export function blockedDevKey(input: { type?: string; key?: string; control?: boolean; meta?: boolean; shift?: boolean; alt?: boolean }): boolean {
+  if (input.type && input.type !== 'keyDown') return false;
+  const key = (input.key ?? '').toLowerCase();
+  if (key === 'f12' || key === 'f5') return true;
+  const mod = input.control === true || input.meta === true;
+  if (mod && input.shift === true && ['i', 'j', 'c'].includes(key)) return true;
+  if (input.meta === true && input.alt === true && ['i', 'j', 'c'].includes(key)) return true;
+  if (mod && !input.shift && !input.alt && key === 'r') return true;
+  return false;
+}
+
 export function selfInspectorPresent(): string | null {
   try {
     if (typeof inspector.url === 'function' && inspector.url()) return 'the V8 inspector is attached';

@@ -275,3 +275,18 @@ export function describeFollowChanges(before: CopyConfig, after: CopyConfig): st
   }
   return out;
 }
+
+/**
+ * The follow ceiling (2026-11-02, Full control): what a live follow must stay
+ * inside for an AI to switch it on or widen it. Empty = inside. Units are the
+ * follow's own chain coin (SOL, ETH or BNB), like every size in its config.
+ *
+ * Per copy is bounded by maxTradeSol alone: it caps a proportional copy, and
+ * a fixed copy spends min(sizeValue, maxTradeSol).
+ */
+export function followCeilingRefusals(cfg: Pick<CopyConfig, 'maxTradeSol' | 'dailyLossLimitSol'>, ceiling: { followMaxCopySol: number; followDailyLossSol: number }): string[] {
+  const out: string[] = [];
+  if (!(cfg.maxTradeSol <= ceiling.followMaxCopySol)) out.push(`maxTradeSol ${shown(cfg.maxTradeSol)} is above the AI’s per-copy ceiling of ${ceiling.followMaxCopySol}`);
+  if (!(cfg.dailyLossLimitSol <= ceiling.followDailyLossSol)) out.push(`dailyLossLimitSol ${shown(cfg.dailyLossLimitSol)} is above the AI’s daily-loss ceiling of ${ceiling.followDailyLossSol}`);
+  return out;
+}

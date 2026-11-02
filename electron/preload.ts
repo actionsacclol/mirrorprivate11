@@ -332,7 +332,8 @@ const api = {
     setAccess: (level: string) => ipcRenderer.invoke('mcp:setAccess', level),
     newToken: () => ipcRenderer.invoke('mcp:newToken'),
     setPort: (port: number) => ipcRenderer.invoke('mcp:setPort', port),
-    setBudget: (budget: { maxBuySol: number; hourlyCapSol: number; maxTradesPerMinute: number }) => ipcRenderer.invoke('mcp:setBudget', budget),
+    setBudget: (budget: { maxBuySol: number; hourlyCapSol: number; maxTradesPerMinute: number; followMaxCopySol?: number; followDailyLossSol?: number }) =>
+      ipcRenderer.invoke('mcp:setBudget', budget),
   },
   // The AI desk (2026-10-28): what the connected AI is deciding.
   aiDesk: {

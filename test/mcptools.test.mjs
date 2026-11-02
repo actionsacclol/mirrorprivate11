@@ -19,7 +19,12 @@ const MINT = 'CopyMint111111111111111111111111111111111';
 const WALLET = 'Whae1111111111111111111111111111111111111';
 
 let access = 'live';
-let budget = { maxBuySol: 0.1, hourlyCapSol: 0.5, maxTradesPerMinute: 4 };
+let budget = { maxBuySol: 0.1, hourlyCapSol: 0.5, maxTradesPerMinute: 4, followMaxCopySol: 0.1, followDailyLossSol: 0.5 };
+// The app's own handlers (2026-11-02): what each channel answers, and every call.
+let invoked = [];
+let handlerAnswers = {};
+let copyRows = [];
+let execution = {};
 let calls;
 let answers;
 // Follows (2026-11-01): an in-memory book the follow tools edit.
@@ -121,7 +126,20 @@ function setup(over = {}) {
     },
     followNotice: (title, line) => notices.push({ title, line }),
     log: () => {},
+    invoke: async (channel, ...args) => {
+      invoked.push({ channel, args });
+      const a = handlerAnswers[channel];
+      if (typeof a === 'function') return a(...args);
+      return a ?? { ok: true, message: `${channel} ok`, data: { channel } };
+    },
+    copyRows: () => copyRows,
+    settingsView: () => ({ routing: { mevMode: 'fast' }, connection: { access, budget } }),
+    execution: () => ({ ...execution }),
   });
+  invoked = [];
+  handlerAnswers = over.handlers ?? {};
+  copyRows = over.copyRows ?? [];
+  execution = over.execution ?? { feeUrgency: 'normal', mevMode: 'fast', maxLiveSol: 0.5, liveEnabled: true, maxOpenCopies: 10 };
   follows = over.follows ?? [];
   liveOpen = over.liveOpen ?? {};
   notices = [];
@@ -596,14 +614,14 @@ const LEAD_C = 'LeadC111111111111111111111111111111111111';
   assert.equal(follows[0].mode, 'live');
   assert.equal(follows[0].enabled, false);
   assert.match(r.text, /LIVE follow .* saved switched OFF \(disarmed\)/);
-  assert.match(r.text, /You asked for it switched on; a live follow the AI creates is always saved off/);
+  assert.match(r.text, /You asked for it switched on; below Full control a live follow the AI creates is always saved off/);
   assert.match(r.text, /until the user switches it on themselves in the app’s Following page/);
   assert.match(notices.at(-1).line, /AI created a live follow of LeadA1… \(Alpha\) on Solana, saved switched OFF — the user must switch it on in Following/);
   // Resuming it is the user's.
   const res = await tools.call('resume_follow', { configId: 'cp_1' });
   assert.equal(res.ok, false);
   assert.match(res.text, /LIVE follow.*only the user can do that, in the app/);
-  assert.match((await tools.call('update_follow', { configId: 'cp_1', enabled: true })).text, /switching it back on \(only the user arms a live follow\)/);
+  assert.match((await tools.call('update_follow', { configId: 'cp_1', enabled: true })).text, /switching it back on \(only the user arms a live follow, unless they give the AI Full control\)/);
   assert.equal(follows[0].enabled, false);
   assert.equal(saves.length, 1);
   ok('create_follow live: saved switched off even when asked on, the answer says the user must arm it, and neither resume_follow nor update_follow can arm it');
@@ -786,4 +804,264 @@ const LEAD_C = 'LeadC111111111111111111111111111111111111';
   ok('update_follow on paper: any valid setting, switching it on, pause and resume; a paper follow holding live copies is judged as live; a reverse follow’s default exits count');
 }
 
-console.log(`\nmcptools: ${passed}/19 passed`);
+// ── research tools (2026-11-02): the app's own handlers, read tier ────────
+{
+  setup();
+  access = 'read';
+  const W = 'Lead1111111111111111111111111111111111111111'.slice(0, 44);
+  // Each goes to its channel with the arguments the button would send.
+  const cases = [
+    ['get_wallets', {}, 'wallet:list', []],
+    ['get_holdings', {}, 'wallet:holdings', []],
+    ['get_portfolio', {}, 'portfolio:summary', [{ stale: true }]],
+    ['search_tokens', { query: 'bonk' }, 'market:search', ['bonk']],
+    ['get_sol_price', {}, 'market:solUsd', []],
+    ['get_holders', { mint: MINT }, 'market:holders', [MINT, 50]],
+    ['get_token_trades', { mint: MINT, limit: 10 }, 'market:trades', [MINT, 10]],
+    ['analyse_holder_funding', { mint: MINT }, 'market:analyseHolders', [MINT, 40]],
+    ['get_launch_intel', { mint: MINT }, 'market:launchIntel', [MINT]],
+    ['scan_token_traders', { mint: MINT }, 'market:traderScan', [MINT]],
+    ['get_creator_history', { creator: W }, 'market:creatorHistory', [W]],
+    ['scout_scan', {}, 'scout:scanStatus', ['solana']],
+    ['scout_scan', { action: 'start', hours: 24 }, 'scout:scan', ['solana', 24, 'recent']],
+    ['scout_scan', { action: 'start', mode: 'winners' }, 'scout:scan', ['solana', 6, 'winners']],
+    ['scout_scan', { action: 'cancel', chain: 'bnb' }, 'scout:scanCancel', ['bnb']],
+    ['read_wallet_history', { action: 'start', address: W }, 'scout:readWallet', ['solana', W]],
+    ['read_wallet_history', { address: W }, 'scout:readWalletStatus', ['solana', W]],
+    ['replay_wallet', { action: 'start', address: W, week: true }, 'scout:replay', [W, { week: true, checks: false }]],
+    ['replay_wallet', { address: W }, 'scout:replayStatus', [W]],
+    ['get_scout_scorecard', {}, 'scout:scorecard', ['solana', null]],
+    ['get_pump_leaderboard', {}, 'scout:pumpLeaderboard', ['weekly', false]],
+    ['find_pump_user', { query: 'alice' }, 'scout:pumpUser', ['alice']],
+    ['get_address_book', {}, 'book:list', []],
+    ['get_watchlist', {}, 'watchlist:get', []],
+    ['get_alerts', {}, 'alerts:list', []],
+  ];
+  for (const [name, args, channel, sent] of cases) {
+    invoked = [];
+    const r = await tools.call(name, args);
+    assert.equal(r.ok, true, `${name}: ${r.text}`);
+    assert.equal(invoked.length, 1, `${name} asks once`);
+    assert.equal(invoked[0].channel, channel, `${name} → ${channel}`);
+    assert.deepEqual(invoked[0].args, sent, `${name} sends what the button sends`);
+  }
+  // Bad arguments never reach a handler.
+  invoked = [];
+  for (const [name, args, why] of [
+    ['get_holders', { mint: 'nope' }, /not a Solana mint/],
+    ['scout_scan', { action: 'start', hours: 5 }, /1, 6 or 24/],
+    ['replay_wallet', { address: '0xabc' }, /not a Solana address/],
+    ['search_tokens', { query: '  ' }, /query is required/],
+    ['get_copies', { state: 'failed' }, /state must be one of/],
+  ]) {
+    const r = await tools.call(name, args);
+    assert.equal(r.ok, false, name);
+    assert.match(r.text, why);
+  }
+  assert.equal(invoked.length, 0, 'a refused call asks nothing');
+  // A handler's refusal comes back in its own words.
+  setup({ handlers: { 'scout:scan': { ok: false, message: 'A scan is already running on solana' } } });
+  access = 'read';
+  const busy = await tools.call('scout_scan', { action: 'start' });
+  assert.equal(busy.ok, false);
+  assert.match(busy.text, /already running/);
+  ok('research tools run the app’s own handlers with the button’s arguments, at read tier; bad arguments ask nothing; a refusal keeps its words');
+}
+
+// ── get_copies and the backtest ──────────────────────────────────────────
+{
+  const rows = [
+    { id: 'a', configId: 'cp_1', mode: 'live', state: 'open' },
+    { id: 'b', configId: 'cp_1', mode: 'paper', state: 'closed' },
+    { id: 'c', configId: 'cp_2', mode: 'live', state: 'skipped' },
+  ];
+  setup({ copyRows: rows, follows: [{ id: 'cp_1', wallet: 'Lead1111111111111111111111111111111111111111'.slice(0, 44), mode: 'paper', enabled: true, maxTradeSol: 0.1, dailyLossLimitSol: 0.3 }] });
+  access = 'read';
+  assert.deepEqual((await tools.call('get_copies', {})).data.map((r) => r.id), ['a', 'b', 'c']);
+  assert.deepEqual((await tools.call('get_copies', { mode: 'live', state: 'open' })).data.map((r) => r.id), ['a']);
+  assert.deepEqual((await tools.call('get_copies', { configId: 'cp_1', limit: 1 })).data.map((r) => r.id), ['a']);
+  invoked = [];
+  assert.equal((await tools.call('backtest_follow', { action: 'start', configId: 'cp_1' })).ok, true);
+  assert.deepEqual(invoked[0], { channel: 'copy:backtest', args: [{ id: 'cp_1' }, { week: false }] });
+  invoked = [];
+  await tools.call('backtest_follow', { action: 'start', configId: 'cp_1', delayMs: 2000 });
+  assert.equal(invoked[0].args[0].config.delayMs, 2000, 'a saved follow with changes is backtested as a draft of itself');
+  assert.equal(invoked[0].args[0].config.wallet, follows[0].wallet);
+  invoked = [];
+  await tools.call('backtest_follow', { action: 'start', wallet: 'Draft111111111111111111111111111111111111111'.slice(0, 44), sizeValue: 0.2 });
+  assert.equal(invoked[0].args[0].config.sizeValue, 0.2, 'a draft carries its settings');
+  assert.equal(invoked[0].args[0].config.mode, 'paper');
+  assert.equal((await tools.call('backtest_follow', { action: 'start' })).ok, false, 'neither a follow nor a wallet');
+  assert.equal((await tools.call('backtest_follow', { configId: 'cp_9' })).ok, false, 'an unknown follow');
+  ok('get_copies filters by follow, state and mode; backtest_follow runs a saved follow, a saved follow with changes, or a draft');
+}
+
+// ── organising tools: paper and up ───────────────────────────────────────
+{
+  setup({ follows: [{ id: 'cp_1', wallet: WALLET, mode: 'paper', enabled: true }, { id: 'cp_2', wallet: 'Live1111111111111111111111111111111111111111'.slice(0, 44), mode: 'live', enabled: false }] });
+  access = 'read';
+  for (const name of ['save_contact', 'remove_contact', 'watch_wallet', 'save_scout_wallet', 'set_alert', 'remove_alert', 'set_paper_bankroll', 'reset_paper_copies', 'delete_follow']) {
+    const r = await tools.call(name, {});
+    assert.equal(r.ok, false, `${name} is refused on a read-only connection`);
+    assert.match(r.text, /read only/i);
+  }
+  assert.equal(invoked.length, 0);
+  access = 'paper';
+  await tools.call('save_contact', { address: WALLET, name: 'Alpha', tags: ['fast'] });
+  assert.deepEqual(invoked.at(-1), { channel: 'book:save', args: [{ address: WALLET, name: 'Alpha', note: '', tags: ['fast'] }] });
+  await tools.call('watch_wallet', { address: WALLET, label: 'w' });
+  assert.deepEqual(invoked.at(-1), { channel: 'watchlist:add', args: [WALLET, 'w'] });
+  await tools.call('watch_wallet', { address: WALLET, remove: true });
+  assert.deepEqual(invoked.at(-1), { channel: 'watchlist:remove', args: [WALLET] });
+  await tools.call('set_alert', { kind: 'price_above', mint: MINT, threshold: 0.001 });
+  assert.deepEqual(invoked.at(-1), { channel: 'alerts:create', args: [{ kind: 'price_above', mint: MINT, symbol: '', threshold: 0.001, repeat: false }] });
+  await tools.call('set_paper_bankroll', { enabled: true, usd: 250 });
+  assert.deepEqual(invoked.at(-1), { channel: 'copy:paperBankroll', args: [{ enabled: true, usd: 250, restart: undefined }] });
+  assert.equal((await tools.call('set_paper_bankroll', { usd: 0 })).ok, false, 'out of range never reaches the engine');
+  // Deleting: a paper follow from paper up; a live one needs Full control.
+  const del = await tools.call('delete_follow', { configId: 'cp_1', reason: 'never copies' });
+  assert.equal(del.ok, true, del.text);
+  assert.deepEqual(invoked.at(-1), { channel: 'copy:remove', args: ['cp_1'] });
+  assert.ok(notices.some((n) => /AI deleted the paper follow/.test(n.line) && /never copies/.test(n.line)));
+  const n = invoked.length;
+  const liveDel = await tools.call('delete_follow', { configId: 'cp_2' });
+  assert.equal(liveDel.ok, false);
+  assert.match(liveDel.text, /needs Full control/);
+  assert.equal(invoked.length, n, 'nothing was asked');
+  ok('organising tools need a trading connection, send the button’s arguments, and a live follow cannot be deleted below Full control');
+}
+
+// ── Full control (2026-11-02) ────────────────────────────────────────────
+{
+  budget = { maxBuySol: 0.1, hourlyCapSol: 0.5, maxTradesPerMinute: 4, followMaxCopySol: 0.1, followDailyLossSol: 0.5 };
+  const LIVE = 'Live1111111111111111111111111111111111111111'.slice(0, 44);
+  const live = (over = {}) => ({ id: 'cp_9', wallet: LIVE, chain: 'solana', mode: 'live', enabled: false, sizing: 'fixed', sizeValue: 0.05, maxTradeSol: 0.05, dailyLossLimitSol: 0.2, dailyTradeLimit: 20, maxSlippagePct: 10, delayMs: 0, copySells: true, ...over });
+
+  // Below Full control the old walls stand.
+  setup({ follows: [live()] });
+  access = 'live';
+  for (const name of ['set_trading_mode', 'sell_all', 'select_wallet', 'update_settings']) {
+    const r = await tools.call(name, name === 'set_trading_mode' ? { mode: 'live' } : {});
+    assert.equal(r.ok, false, name);
+    assert.match(r.text, /needs Full control/);
+  }
+  assert.equal((await tools.call('resume_follow', { configId: 'cp_9' })).ok, false, 'live cannot arm');
+  assert.match((await tools.call('update_follow', { configId: 'cp_9', maxTradeSol: 0.08 })).text, /only make it safer/);
+  assert.equal(invoked.length, 0);
+
+  // Full control arms and widens — inside the ceiling.
+  access = 'full';
+  const armed = await tools.call('resume_follow', { configId: 'cp_9', reason: 'replay was positive' });
+  assert.equal(armed.ok, true, armed.text);
+  assert.equal(follows[0].enabled, true, 'switched on');
+  assert.ok(notices.some((x) => /AI resumed the live follow/.test(x.line)));
+  const wider = await tools.call('update_follow', { configId: 'cp_9', maxTradeSol: 0.1, sizeValue: 0.1 });
+  assert.equal(wider.ok, true, wider.text);
+  assert.equal(follows[0].maxTradeSol, 0.1);
+  // Past the ceiling: refused whole.
+  const over = await tools.call('update_follow', { configId: 'cp_9', maxTradeSol: 0.2, sizeValue: 0.2 });
+  assert.equal(over.ok, false);
+  assert.match(over.text, /follow ceiling/);
+  assert.match(over.text, /maxTradeSol 0.2 is above the AI’s per-copy ceiling of 0.1/);
+  assert.equal(follows[0].maxTradeSol, 0.1, 'nothing changed');
+  const lossy = await tools.call('update_follow', { configId: 'cp_9', dailyLossLimitSol: 2 });
+  assert.equal(lossy.ok, false);
+  assert.match(lossy.text, /daily-loss ceiling of 0.5/);
+  // A follow the USER armed above the ceiling can still be narrowed or relabelled.
+  setup({ follows: [live({ enabled: true, maxTradeSol: 1, sizeValue: 1, dailyLossLimitSol: 3 })] });
+  access = 'full';
+  assert.equal((await tools.call('update_follow', { configId: 'cp_9', label: 'Big one' })).ok, true, 'a relabel is not a widening');
+  assert.equal((await tools.call('update_follow', { configId: 'cp_9', maxTradeSol: 0.5, sizeValue: 0.5 })).ok, true, 'narrowing is always fine');
+  assert.equal((await tools.call('update_follow', { configId: 'cp_9', maxTradeSol: 0.8, sizeValue: 0.8 })).ok, false, 'but widening it past the ceiling is not');
+  // Arming one that is above the ceiling is refused.
+  setup({ follows: [live({ maxTradeSol: 1, sizeValue: 1 })] });
+  access = 'full';
+  assert.match((await tools.call('resume_follow', { configId: 'cp_9' })).text, /follow ceiling/);
+  assert.equal(follows[0].enabled, false);
+
+  // create_follow: born armed with Full control, inside the ceiling only.
+  setup();
+  access = 'full';
+  const made = await tools.call('create_follow', { wallet: LIVE, mode: 'live', enabled: true, sizeValue: 0.05, maxTradeSol: 0.05, dailyLossLimitSol: 0.2 });
+  assert.equal(made.ok, true, made.text);
+  assert.match(made.text, /switched it on/);
+  assert.equal(follows[0].enabled, true);
+  assert.equal(saves[0].enabled, false, 'saved disarmed first, as upsert requires');
+  setup();
+  access = 'full';
+  const big = await tools.call('create_follow', { wallet: LIVE, mode: 'live', enabled: true, sizeValue: 1, maxTradeSol: 1, dailyLossLimitSol: 0.2 });
+  assert.equal(big.ok, false);
+  assert.match(big.text, /Not created/);
+  assert.equal(follows.length, 0, 'nothing saved');
+  // Without enabled:true it is still created off.
+  assert.match((await tools.call('create_follow', { wallet: LIVE, mode: 'live', sizeValue: 0.05, maxTradeSol: 0.05, dailyLossLimitSol: 0.2 })).text, /saved switched OFF/);
+
+  // delete_follow: a live follow goes with Full control, never with live copies open.
+  setup({ follows: [live()], liveOpen: { cp_9: 2 } });
+  access = 'full';
+  const open = await tools.call('delete_follow', { configId: 'cp_9' });
+  assert.equal(open.ok, false);
+  assert.match(open.text, /2 live copies open/);
+  assert.equal(invoked.length, 0);
+  liveOpen = {};
+  assert.equal((await tools.call('delete_follow', { configId: 'cp_9' })).ok, true);
+
+  // The app-wide switches go to their own handlers and tell the user.
+  setup();
+  access = 'full';
+  await tools.call('set_trading_mode', { mode: 'live', reason: 'user asked' });
+  assert.deepEqual(invoked.at(-1), { channel: 'live:setLive', args: [true] });
+  assert.ok(notices.some((x) => /AI switched the app to LIVE/.test(x.title)));
+  await tools.call('sell_all', {});
+  assert.equal(invoked.at(-1).channel, 'live:sellAll');
+  await tools.call('sell_all', { dust: true });
+  assert.equal(invoked.at(-1).channel, 'live:sellDust');
+  await tools.call('select_wallet', { walletId: 'w2' });
+  assert.deepEqual(invoked.at(-1), { channel: 'wallet:select', args: ['w2'] });
+  ok('Full control: the four app-wide tools need it; it arms and widens live follows only inside the ceiling, a user-armed follow above it can still be narrowed, create can be born armed, delete never strands live copies');
+}
+
+// ── update_settings: the one settings door ───────────────────────────────
+{
+  setup();
+  access = 'full';
+  const r = await tools.call('update_settings', { mevMode: 'private', maxOpenCopies: 20 });
+  assert.equal(r.ok, true, r.text);
+  const sent = invoked.at(-1);
+  assert.equal(sent.channel, 'settings:update');
+  // The whole execution section goes back, with only the asked fields changed:
+  // the live safety limits and the Paper/Live bit are what they were.
+  assert.deepEqual(sent.args[0], { execution: { feeUrgency: 'normal', mevMode: 'private', maxLiveSol: 0.5, liveEnabled: true, maxOpenCopies: 20 } });
+  assert.match(r.text, /mevMode fast → private/);
+  assert.ok(notices.some((x) => x.title === 'AI changed settings'));
+  invoked = [];
+  for (const [args, why] of [
+    [{ maxLiveSol: 5 }, /does not take maxLiveSol/],
+    [{ liveEnabled: true }, /does not take liveEnabled/],
+    [{ referrer: 'x' }, /does not take referrer/],
+    [{ heliusApiKey: 'x' }, /does not take heliusApiKey/],
+    [{ mevMode: 'yolo' }, /mevMode must be one of/],
+    [{ liveSlippagePct: 80 }, /at most 50/],
+    [{ maxOpenCopies: 2.5 }, /whole number/],
+    [{ useJito: 'yes' }, /true or false/],
+    [{}, /Nothing to change/],
+  ]) {
+    const x = await tools.call('update_settings', args);
+    assert.equal(x.ok, false, JSON.stringify(args));
+    assert.match(x.text, why);
+  }
+  assert.equal(invoked.length, 0, 'a refused change never reaches the store');
+  ok('update_settings sends the stored execution section with only routing fields changed; limits, the mode, keys and the referrer are refused before the store');
+}
+
+// ── the never-list holds even if a tool asked for it ─────────────────────
+{
+  // A host handed a channel off the list must never be asked: the guard in
+  // mcpTools refuses before invoke. Proven by a tool whose channel is fine,
+  // and by the module's own list — no listed channel is a never channel.
+  const mcp = await import('./.mcp.mjs');
+  for (const c of mcp.MCP_NEVER_CHANNELS) assert.ok(!mcp.MCP_IPC_CHANNELS.includes(c), c);
+  ok('no never-list channel is on the list mcpTools may invoke');
+}
+
+console.log(`\nmcptools: ${passed}/25 passed`);

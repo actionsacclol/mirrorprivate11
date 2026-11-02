@@ -69,6 +69,8 @@ const BOUNDS: Record<string, { min: number; max: number; int?: boolean }> = {
   'mcp.budget.maxBuySol': { min: 0.000001, max: 25 },
   'mcp.budget.hourlyCapSol': { min: 0.000001, max: 100 },
   'mcp.budget.maxTradesPerMinute': { min: 1, max: 60, int: true },
+  'mcp.budget.followMaxCopySol': { min: 0.000001, max: 25 },
+  'mcp.budget.followDailyLossSol': { min: 0.000001, max: 100 },
   'execution.maxLiveSol': { min: 0.000001, max: 25 },
   'execution.liveSlippagePct': { min: 0, max: 50 },
   // Both live breakers are OFF at 0 (the shipped default since revision 3;

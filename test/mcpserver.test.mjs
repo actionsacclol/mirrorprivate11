@@ -137,11 +137,17 @@ const modernHeaders = (method, name) => ({ 'mcp-protocol-version': MODERN, 'mcp-
   access = 'read';
   const readOnly = (await post(legacy(4, 'tools/list'))).json.result.tools;
   assert.ok(readOnly.length > 0);
+  // Read tier, not all read-only (2026-11-02): a Scout scan or a replay
+  // writes the Scout's record, and says so — but nothing a read-only
+  // connection is shown trades or destroys.
   assert.ok(
-    readOnly.every((t) => t.annotations.readOnlyHint === true),
-    'a read-only connection is shown only read tools',
+    readOnly.every((t) => t.annotations.destructiveHint === false),
+    'a read-only connection is shown nothing destructive',
   );
-  assert.ok(!readOnly.some((t) => t.name === 'buy_token'));
+  assert.ok(readOnly.some((t) => t.annotations.readOnlyHint === true));
+  for (const n of ['buy_token', 'sell_token', 'create_follow', 'delete_follow', 'set_trading_mode', 'update_settings']) {
+    assert.ok(!readOnly.some((t) => t.name === n), `${n} is not shown to a read-only connection`);
+  }
   for (const t of readOnly) {
     assert.equal(t.inputSchema.type, 'object', 'every advertised schema is an object schema');
     assert.equal(t.annotations.openWorldHint, true, 'every tool reaches a chain or a provider');

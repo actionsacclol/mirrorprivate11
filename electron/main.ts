@@ -16,7 +16,7 @@ import * as heliusBudget from './system/heliusBudget';
 import * as chainPrice from './engine/chainPrice';
 import { guardWebContents, applyCsp, guardWebviews } from './system/webSecurity';
 import { logger } from './system/logger';
-import { startTamperGuards } from './system/tamperGuard';
+import { blockedDevKey, debugLaunchSwitch, startTamperGuards } from './system/tamperGuard';
 import { startDiscordRpc, stopDiscordRpc, setActivity } from './system/discord';
 import * as crashGuard from './system/crashGuard';
 import * as acceptance from './system/acceptance';
@@ -226,6 +226,18 @@ if (process.env.KRYPT_DEBUG_PORT && !app.isPackaged) {
   app.commandLine.appendSwitch('remote-debugging-port', process.env.KRYPT_DEBUG_PORT);
 }
 
+// A shipped build never runs with a debugger switch (2026-11-02). Until now
+// `--remote-debugging-port` on the installed exe only dropped live to paper,
+// and Chrome's chrome://inspect still opened the whole renderer in DevTools.
+// Refused before any window exists; `showErrorBox` is safe before 'ready'.
+if (app.isPackaged) {
+  const debugSwitch = debugLaunchSwitch(process.argv, (s) => app.commandLine.hasSwitch(s));
+  if (debugSwitch) {
+    dialog.showErrorBox('Krypto Mirror', `Krypto Mirror does not run with ${debugSwitch}. Start it from its shortcut, without debugging switches.`);
+    app.exit(1);
+  }
+}
+
 // Taskbar identity on Windows. Measured on 2026-09-03: the window's own
 // icons are correct either way (WM_GETICON returns our K at 16 and 32 px),
 // but the taskbar BUTTON follows the app identity, not the window. With no
@@ -421,6 +433,10 @@ function showMainWindow(): BrowserWindow {
     // inputs are native and unaffected.
     Menu.setApplicationMenu(null);
     win.webContents.on('devtools-opened', () => win.webContents.closeDevTools());
+    // And the keys themselves (2026-11-02): F12, Ctrl+Shift+I/J/C, reload.
+    win.webContents.on('before-input-event', (e, input) => {
+      if (blockedDevKey(input)) e.preventDefault();
+    });
   }
 
   // A renderer error in the MAIN window only ever existed in DevTools, so a
@@ -647,7 +663,12 @@ function openPanelWindow(panelId: string): { ok: boolean; message: string } {
     },
     show: false,
   });
-  if (app.isPackaged) win.webContents.on('devtools-opened', () => win.webContents.closeDevTools());
+  if (app.isPackaged) {
+    win.webContents.on('devtools-opened', () => win.webContents.closeDevTools());
+    win.webContents.on('before-input-event', (e, input) => {
+      if (blockedDevKey(input)) e.preventDefault();
+    });
+  }
   // The same navigation and window-open guards the main window gets. A second
   // window carrying window.krypt has to be as locked down as the first, and
   // this was missed when the window was added.
@@ -1129,7 +1150,11 @@ async function bootstrap(): Promise<void> {
   // development. Both are non-destructive: nothing is uninstalled or deleted.
   //   • a debugger on OUR process -> drop to paper (exits still work),
   //   • a known analysis tool running -> close the app (reopenable).
-  if (app.isPackaged && !process.env.KRYPT_DEBUG_PORT) {
+  // Packaged alone decides (2026-11-02): this also skipped them whenever
+  // KRYPT_DEBUG_PORT was set, so one environment variable switched every
+  // guard off on an installed build. The tutorial instance that sets it is
+  // an unpackaged run and is unaffected.
+  if (app.isPackaged) {
     startTamperGuards({
       onInspector: () => {
         // Disarm live (onDisarm turns execution.liveEnabled off); open

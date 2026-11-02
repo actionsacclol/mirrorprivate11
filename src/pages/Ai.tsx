@@ -91,6 +91,15 @@ export function AiPage() {
       });
       if (!yes) return;
     }
+    if (level === 'full') {
+      const yes = await modal.confirm({
+        title: 'Give an AI full control?',
+        message:
+          'On top of live trading, the AI will be able to switch live follows on and widen them (each inside the follow ceiling on this page), delete follows, sell everything, switch the whole app between Paper and Live, pick which of your wallets is active, and change trade routing. It still cannot touch the fee, see or move your keys, send funds to any address, change RPC or API keys, or change its own access and limits. Live follows it switches on copy with real funds while you are away.',
+        confirmLabel: 'Allow full control',
+      });
+      if (!yes) return;
+    }
     await apply(() => window.krypt.mcp.setAccess(level));
   };
 
@@ -147,20 +156,20 @@ export function AiPage() {
                           className={cls(
                             'rounded-lg border px-3 py-2 text-note font-semibold transition disabled:opacity-50',
                             s.access === level
-                              ? level === 'live'
+                              ? level === 'live' || level === 'full'
                                 ? 'border-down/50 bg-down/15 text-white'
                                 : 'border-accent/50 bg-accent/15 text-white'
                               : 'border-white/10 bg-raised text-krypt-muted hover:border-white/20 hover:text-white',
-                            level === 'read' && 'col-span-2',
+                            (level === 'read' || level === 'full') && 'col-span-2',
                           )}
                         >
                           {MCP_ACCESS_TEXT[level].label}
                         </button>
                       ))}
                     </div>
-                    <p className={cls('mt-1.5 text-body leading-relaxed', s.access === 'live' ? 'text-down' : 'text-krypt-muted')}>{MCP_ACCESS_TEXT[s.access].why}</p>
+                    <p className={cls('mt-1.5 text-body leading-relaxed', s.access === 'live' || s.access === 'full' ? 'text-down' : 'text-krypt-muted')}>{MCP_ACCESS_TEXT[s.access].why}</p>
                     <p className="mt-1 text-body leading-relaxed text-krypt-muted">
-                      Deciding a follow’s trades needs Paper trading for paper follows and Live trading for live ones.
+                      Deciding a follow’s trades needs Paper trading for paper follows and Live trading for live ones. Switching live follows on needs Full control.
                     </p>
                   </div>
 
@@ -244,21 +253,42 @@ export function AiPage() {
             )}
 
             {s?.enabled && (
-              <Panel title="Limits" subtitle={s.access === 'live' ? 'What the AI may spend with its own buy_token calls.' : 'They bind once you allow live trading.'}>
+              <Panel
+                title="Limits"
+                subtitle={s.access === 'live' || s.access === 'full' ? 'What the AI may spend with its own buy_token calls.' : 'They bind once you allow live trading.'}
+              >
                 <div className="grid grid-cols-3 gap-3">
                   <NumberField label="Max per buy" hint="SOL" value={s.budget.maxBuySol} onSave={(v) => void apply(() => window.krypt.mcp.setBudget({ ...s.budget, maxBuySol: v }))} />
                   <NumberField label="Max an hour" hint="SOL" value={s.budget.hourlyCapSol} onSave={(v) => void apply(() => window.krypt.mcp.setBudget({ ...s.budget, hourlyCapSol: v }))} />
                   <NumberField label="Trades a minute" hint="1–60" value={s.budget.maxTradesPerMinute} onSave={(v) => void apply(() => window.krypt.mcp.setBudget({ ...s.budget, maxTradesPerMinute: Math.round(v) }))} />
                 </div>
                 <p className="mt-2 text-body leading-relaxed text-krypt-muted">
-                  A follow’s copies keep the follow’s own size and limits: the AI can only shrink or skip them. Sells are never capped — getting out is the point.
+                  A follow’s copies keep the follow’s own size and limits: below Full control the AI can only shrink or skip them. Sells are never capped — getting out is the point.
+                </p>
+                <div className="mt-4 mb-1.5 text-label uppercase tracking-label text-krypt-muted">Follow ceiling (Full control)</div>
+                <div className="grid grid-cols-2 gap-3" data-testid="ai-follow-ceiling">
+                  <NumberField
+                    label="Max per copy"
+                    hint="SOL"
+                    value={s.budget.followMaxCopySol}
+                    onSave={(v) => void apply(() => window.krypt.mcp.setBudget({ ...s.budget, followMaxCopySol: v }))}
+                  />
+                  <NumberField
+                    label="Max loss a day"
+                    hint="SOL"
+                    value={s.budget.followDailyLossSol}
+                    onSave={(v) => void apply(() => window.krypt.mcp.setBudget({ ...s.budget, followDailyLossSol: v }))}
+                  />
+                </div>
+                <p className="mt-2 text-body leading-relaxed text-krypt-muted">
+                  A live follow the AI switches on or widens must copy at most this much a trade and stop for the day at a loss no bigger than this. Follows you arm yourself are not bound by it.
                 </p>
               </Panel>
             )}
 
             <p className="text-body leading-relaxed text-krypt-muted">
-              Whatever you allow, the AI can never withdraw or transfer, change a setting, arm or edit a follow, see your key, or hand the app a transaction to sign. It
-              asks; the app checks and builds.
+              Whatever you allow, the AI can never touch the fee, see or move your keys, withdraw or send funds to any address, change RPC endpoints or API keys, change
+              its own access or limits, or hand the app a transaction to sign. It asks; the app checks and builds — with the same fee and breakers as your own buttons.
             </p>
           </div>
         </div>
@@ -271,7 +301,7 @@ function StatusPills({ on, access, desk }: { on: boolean; access: McpAccess; des
   const polled = desk?.lastPollAt ? fmtAgo(desk.lastPollAt) : null;
   return (
     <div className="flex flex-wrap items-center gap-2" data-testid="ai-status">
-      <Tag tone={on ? (access === 'live' ? 'down' : 'accent') : 'neutral'}>{on ? `Connection: ${MCP_ACCESS_TEXT[access].label}` : 'Connection off'}</Tag>
+      <Tag tone={on ? (access === 'live' || access === 'full' ? 'down' : 'accent') : 'neutral'}>{on ? `Connection: ${MCP_ACCESS_TEXT[access].label}` : 'Connection off'}</Tag>
       <Tag tone={desk?.online ? 'up' : 'neutral'} title={polled ? `Last heard ${polled}` : 'No AI has polled since the app started'}>
         {desk?.online ? (desk.listening ? 'AI listening now' : `AI online · ${polled}`) : 'No AI connected'}
       </Tag>

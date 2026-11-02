@@ -1,4 +1,6 @@
-// Your AI on the desk (2026-10-28): the AI page, then the per-follow gate.
+// Your AI on the desk (2026-10-28; re-recorded 2026-11-02 for the research
+// tools, Full control and the follow ceiling): the AI page, then the
+// per-follow gate. Full control is hovered, never pressed.
 // It switches the connection on at Paper trading (a port on 127.0.0.1 of the
 // tutorial instance), never shows the token (the snippet on screen is
 // masked; "Show token" is never pressed), never allows Live trading, and
@@ -11,6 +13,8 @@ const PAGE = '[data-testid=follow-page]';
 const CARD = '[data-testid=follow-card]';
 const AI = '[data-testid=ai-page]';
 const sw = (label) => `${PAGE} [role=switch][aria-label="${label}"]`;
+// A number field's label: its name, then its unit ("Max per copy SOL").
+const field = (name) => ({ text: `^${name}`, sel: 'label > span', within: AI });
 const isOn = (label) => ({ expr: `document.querySelector('${sw(label)}')?.getAttribute('aria-checked') === 'true'` });
 
 async function setSwitch(ui, label, want) {
@@ -55,15 +59,23 @@ export default {
     {
       line: 2,
       do: async (ui) => {
-        await ui.hover({ testid: 'ai-access-read' }, { hold: 1200 });
-        await ui.hover({ testid: 'ai-access-live' }, { hold: 1400 });
-        await ui.click({ testid: 'ai-access-paper' });
-        await ui.pause(500);
-        await ui.point({ text: '^Deciding a follow', sel: 'p', within: AI }, { hold: 3000 });
+        await ui.point({ testid: 'ai-access-read' }, { hold: 1400, glow: 1400 });
+        await ui.point({ text: '^The agent can look at tokens', sel: 'p', within: AI }, { hold: 3600 });
+        await ui.hover({ testid: 'ai-access-paper' }, { hold: 1600 });
+        await ui.hover({ testid: 'ai-access-live' }, { hold: 1800 });
       },
     },
     {
       line: 3,
+      do: async (ui) => {
+        await ui.point({ testid: 'ai-access-full' }, { hold: 2600, glow: 2600 });
+        await ui.click({ testid: 'ai-access-paper' });
+        await ui.pause(500);
+        await ui.point({ text: '^Deciding a follow', sel: 'p', within: AI }, { hold: 3400 });
+      },
+    },
+    {
+      line: 4,
       do: async (ui) => {
         await ui.point({ testid: 'ai-client' }, { hold: 1600, glow: 1600 });
         await ui.point({ testid: 'ai-client-snippet' }, { hold: 2400, glow: 2400 });
@@ -72,23 +84,32 @@ export default {
       },
     },
     {
-      line: 4,
+      line: 5,
       do: async (ui) => {
         await ui.point({ testid: 'ai-prompt' }, { hold: 3200, glow: 3400 });
         await ui.hover({ testid: 'ai-prompt-copy' }, { hold: 1600 });
       },
     },
     {
-      line: 5,
+      line: 6,
       do: async (ui) => {
         await ui.point(heading('Limits', AI), { hold: 1200, glow: 1600 });
-        for (const t of ['Max per buy', 'Max an hour', 'Trades a minute']) await opt(ui.hover(heading(t, AI), { hold: 900 }));
+        for (const t of ['Max per buy', 'Max an hour', 'Trades a minute']) await opt(ui.hover(field(t), { hold: 900 }));
         await opt(ui.point({ text: 'Sells are never capped', sel: 'p', within: AI }, { hold: 2000 }));
       },
     },
-    { line: 6, do: async (ui) => ui.point({ text: '^Whatever you allow', sel: 'p', within: AI }, { hold: 5200, glow: 5200 }) },
     {
       line: 7,
+      do: async (ui) => {
+        await ui.point({ text: '^Follow ceiling', sel: 'div', within: AI }, { hold: 1600, glow: 1800 });
+        await ui.hover(field('Max per copy'), { hold: 1400 });
+        await ui.hover(field('Max loss a day'), { hold: 1400 });
+        await opt(ui.point({ text: '^A live follow the AI switches on', sel: 'p', within: AI }, { hold: 2600 }));
+      },
+    },
+    { line: 8, do: async (ui) => ui.point({ text: '^Whatever you allow', sel: 'p', within: AI }, { hold: 5200, glow: 5200 }) },
+    {
+      line: 9,
       do: async (ui) => {
         await go(ui, 'following', /Following/);
         await ui.waitFor(CARD, 10_000);
@@ -103,7 +124,7 @@ export default {
       },
     },
     {
-      line: 8,
+      line: 10,
       do: async (ui) => {
         await ui.point(heading('Answer within', PAGE), { hold: 2400, glow: 2400 });
         await ui.point(heading('If the AI does not answer a buy', PAGE), { hold: 2600, glow: 2600 });
@@ -111,7 +132,7 @@ export default {
       },
     },
     {
-      line: 9,
+      line: 11,
       do: async (ui) => {
         // Shown only with the sell gate on: point at it, then put it back.
         await setSwitch(ui, 'Your AI decides each sell', true);
@@ -120,7 +141,7 @@ export default {
       },
     },
     {
-      line: 10,
+      line: 12,
       do: async (ui) => {
         await ui.click({ testid: 'follow-start' });
         await ui.waitFor(CARD, 10_000);
@@ -131,7 +152,7 @@ export default {
         await opt(ui.point(heading('Decisions', AI), { hold: 2000, glow: 2000 }));
       },
     },
-    { line: 11, do: async (ui) => ui.point({ testid: 'ai-access-paper' }, { hold: 3600, glow: 3600 }) },
+    { line: 13, do: async (ui) => ui.point({ testid: 'ai-access-paper' }, { hold: 3600, glow: 3600 }) },
   ],
   async cleanup(ui) {
     // The follow's gate back off, and the connection off: the next takes

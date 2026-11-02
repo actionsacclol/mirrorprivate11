@@ -154,7 +154,7 @@ import * as httpLayer from './data/http';
 import * as mcpTools from './engine/mcpTools';
 import * as aiDesk from './engine/aiDesk';
 import { setTraderClaimCheck } from './engine/traderClaims';
-import { MCP_ACCESS_LEVELS, MCP_PORT_MAX, MCP_PORT_MIN, mcpAddCommand, mcpJsonConfig, mcpServerNameFor, type McpAccess } from '@shared/mcp';
+import { MCP_ACCESS_LEVELS, MCP_IPC_CHANNELS, MCP_NEVER_CHANNELS, MCP_PORT_MAX, MCP_PORT_MIN, mcpAddCommand, mcpJsonConfig, mcpServerNameFor, type McpAccess } from '@shared/mcp';
 import * as profiles from './system/profiles';
 import { attachChain as attachScoutChain, sourceFor as scoutSourceFor } from './engine/scoutScanSources';
 import * as evmWallet from './evm/evmWallet';
@@ -553,7 +553,35 @@ let aioFloatReset: () => void = () => undefined;
  *  or revealed through the native dialog). Only then can "backed up" be set. */
 let aioPhraseShown = false;
 
+/**
+ * The handlers MCP tools may run (2026-11-02), captured as they register.
+ *
+ * The research and Full-control tools reach the app through these — the
+ * exact code its buttons run, validation and logging included — so there is
+ * no second implementation to drift. Only channels on MCP_IPC_CHANNELS are
+ * captured, and one on the never-list cannot be even if a later edit put it
+ * on both lists.
+ */
+const mcpHandlers = new Map<string, (e: unknown, ...args: unknown[]) => unknown>();
+
+function captureMcpHandlers(): void {
+  const real = ipcMain.handle.bind(ipcMain);
+  ipcMain.handle = ((channel: string, fn: (e: unknown, ...args: unknown[]) => unknown) => {
+    if (MCP_IPC_CHANNELS.includes(channel) && !MCP_NEVER_CHANNELS.includes(channel)) mcpHandlers.set(channel, fn);
+    return real(channel, fn as Parameters<typeof real>[1]);
+  }) as typeof ipcMain.handle;
+}
+
+/** Run a captured handler the way the renderer would, with no window behind it. */
+async function invokeForMcp(channel: string, args: unknown[]): Promise<{ ok: boolean; message: string; data?: unknown }> {
+  const fn = mcpHandlers.get(channel);
+  if (!fn) return { ok: false, message: `${channel} is not open to the AI.` };
+  const r = (await fn({ sender: null, senderFrame: null }, ...args)) as { ok?: unknown; message?: unknown; data?: unknown } | null;
+  return { ok: r?.ok === true, message: typeof r?.message === 'string' ? r.message : r?.ok === true ? 'ok' : 'Refused', data: r?.data };
+}
+
 export function registerIpc(): void {
+  captureMcpHandlers();
   // Construct the engine eagerly. It is otherwise built on first use, and
   // the terminal's data layer gets its context from the engine constructor —
   // a Discover call before the engine existed would throw "context not
@@ -2668,6 +2696,33 @@ export function registerIpc(): void {
       getEngine().pushNotification(title, line);
     },
     log: (level, line) => (level === 'error' ? logger.error(line) : level === 'warn' ? logger.warn(line) : logger.info(line)),
+    // Research and Full control (2026-11-02): the app's own handlers.
+    invoke: (channel, ...args) => invokeForMcp(channel, args),
+    copyRows: () => copyTrade.snapshot().recent,
+    execution: () => ({ ...store.load().execution }),
+    settingsView: () => {
+      const s = store.load();
+      const x = s.execution;
+      const snap = copyTrade.snapshot();
+      return {
+        appMode: x.liveEnabled ? 'live' : 'paper',
+        routing: {
+          feeUrgency: x.feeUrgency,
+          useJito: x.useJito,
+          jitoTipPercentile: x.jitoTipPercentile,
+          useHeliusSender: x.useHeliusSender,
+          mevMode: x.mevMode,
+          feeLane: x.feeLane ?? 'fast',
+          liveSlippagePct: x.liveSlippagePct,
+        },
+        copies: { maxOpenCopies: x.maxOpenCopies, autoSellOnExit: x.autoSellOnExit },
+        // The live safety limits: the user's, readable, never the AI's to move.
+        liveSafety: { maxLiveSol: x.maxLiveSol, maxLiveSessionLossSol: x.maxLiveSessionLossSol, maxLiveConsecutiveLosses: x.maxLiveConsecutiveLosses },
+        paperBankroll: snap.paperBankroll ?? null,
+        connection: { access: s.mcp.access, budget: s.mcp.budget },
+        keys: { heliusKeySet: !!s.rpc.heliusApiKey, customRpcSet: !!s.rpc.httpUrl },
+      };
+    },
   });
 
   // The AI desk's broker: whether a decision may be asked is the
@@ -2794,8 +2849,9 @@ export function registerIpc(): void {
     mcpTools.resetBudget();
     await syncMcp();
     if (level === 'live') logger.warn('MCP: the AI connection was set to LIVE — an agent can now spend real funds within its budget');
+    else if (level === 'full') logger.warn('MCP: the AI connection was set to FULL CONTROL — an agent can spend real funds, arm live follows inside the follow ceiling and switch the app to live');
     else logger.info(`MCP: the AI connection was set to ${level}`);
-    const said = level === 'off' ? 'off' : level === 'read' ? 'read only' : level === 'paper' ? 'paper trading' : 'LIVE trading';
+    const said = level === 'off' ? 'off' : level === 'read' ? 'read only' : level === 'paper' ? 'paper trading' : level === 'full' ? 'FULL CONTROL' : 'LIVE trading';
     return ok(`The AI connection is now ${said}.`, mcpPayload());
   });
 
@@ -2825,11 +2881,16 @@ export function registerIpc(): void {
       maxBuySol: Number(b.maxBuySol),
       hourlyCapSol: Number(b.hourlyCapSol),
       maxTradesPerMinute: Math.round(Number(b.maxTradesPerMinute)),
+      // The follow ceiling (2026-11-02); an older panel that does not send it keeps the stored one.
+      followMaxCopySol: b.followMaxCopySol === undefined ? m.budget.followMaxCopySol : Number(b.followMaxCopySol),
+      followDailyLossSol: b.followDailyLossSol === undefined ? m.budget.followDailyLossSol : Number(b.followDailyLossSol),
     };
     if (!(next.maxBuySol > 0) || next.maxBuySol > 25) return fail('Max per trade must be between 0 and 25');
     if (!(next.hourlyCapSol > 0) || next.hourlyCapSol > 100) return fail('The hourly cap must be between 0 and 100');
     if (next.maxBuySol > next.hourlyCapSol) return fail('Max per trade is above the hourly cap');
     if (!Number.isInteger(next.maxTradesPerMinute) || next.maxTradesPerMinute < 1 || next.maxTradesPerMinute > 60) return fail('Trades per minute must be between 1 and 60');
+    if (!(next.followMaxCopySol > 0) || next.followMaxCopySol > 25) return fail('The follow ceiling per copy must be between 0 and 25');
+    if (!(next.followDailyLossSol > 0) || next.followDailyLossSol > 100) return fail('The follow ceiling for a day’s loss must be between 0 and 100');
     store.update({ mcp: { ...m, budget: next } });
     return ok('Saved.', mcpPayload());
   });

@@ -48,6 +48,8 @@ import {
   type SwapChecks,
 } from '@shared/copyReplay';
 import { SNIPER_SLOTS, dayOf } from '@shared/walletScout';
+import { PAPER_DEFAULT_DEPTH_SOL } from '@shared/copytrade';
+import { backtestCopies, backtestPlanOf, backtestRefusal, type BacktestConfig, type BacktestLag, type BacktestPlan, type BacktestSpec } from '@shared/copyBacktest';
 
 const BASE58 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
@@ -103,6 +105,11 @@ export interface ReplayOpts {
   slowMax?: number;
   /** The chain read's depth for this replay. */
   read?: walletHistory.ReadOpts;
+  /** A copy backtest (2026-11-01): the follow's lag, exits and rules over
+   *  these trips (shared/copyBacktest.ts). Its lag replaces the board's; a
+   *  trip a rule refuses without a price is not priced; the result is built
+   *  when the run ends. Never with `lags` or `checks`. */
+  backtest?: BacktestSpec;
 }
 
 /**
@@ -215,7 +222,11 @@ function fresh(address: string): CopyReplayStatus {
 }
 
 export function status(address: string): CopyReplayStatus {
-  const st = jobs.get(address) ?? fresh(address);
+  return statusOf(address, address);
+}
+
+function statusOf(key: string, address: string): CopyReplayStatus {
+  const st = jobs.get(key) ?? fresh(address);
   return { ...st, trips: st.trips.map((t) => ({ ...t })) };
 }
 
@@ -241,29 +252,148 @@ export function wait(address: string): Promise<void> {
 /** Start a replay. Returns at once; one per wallet. */
 export function start(address: string, httpUrl: string, deps: ReplayDeps = realDeps, now = Date.now(), opts: ReplayOpts = {}): { ok: boolean; message: string } {
   if (!BASE58.test(address)) return { ok: false, message: 'Not a Solana wallet address' };
-  if (running.has(address)) return { ok: false, message: 'Already replaying this wallet' };
+  // A backtest runs under its own key (startBacktest), never as a replay.
+  const plain: ReplayOpts = { ...opts };
+  delete plain.backtest;
+  return begin(address, address, httpUrl, deps, now, plain);
+}
+
+/** One job under `key` (the wallet for a replay, backtestKey for a backtest). */
+function begin(key: string, address: string, httpUrl: string, deps: ReplayDeps, now: number, opts: ReplayOpts): { ok: boolean; message: string } {
+  if (running.has(key)) return { ok: false, message: opts.backtest ? 'Already backtesting this wallet' : 'Already replaying this wallet' };
   const st = fresh(address);
   st.running = true;
   st.startedAt = now;
-  st.sample = opts.sample ?? 'newest';
+  st.sample = opts.backtest ? 'newest' : (opts.sample ?? 'newest');
   st.span = opts.span ?? 'newest';
   st.weekShort = null;
   st.slowSkipped = 0;
-  jobs.set(address, st);
-  cancels.delete(address);
+  if (opts.backtest) st.backtest = null;
+  jobs.set(key, st);
+  cancels.delete(key);
   while (jobs.size > 50) {
     const oldest = jobs.keys().next().value;
-    if (oldest === undefined || oldest === address) break;
+    if (oldest === undefined || oldest === key) break;
     if (!running.has(oldest)) jobs.delete(oldest);
     else break;
   }
-  const p = run(address, httpUrl, st, deps, opts, now).finally(() => running.delete(address));
-  running.set(address, p);
+  const p = run(key, address, httpUrl, st, deps, opts, now).finally(() => running.delete(key));
+  running.set(key, p);
   return { ok: true, message: 'started' };
 }
 
-async function run(address: string, httpUrl: string, st: CopyReplayStatus, deps: ReplayDeps, opts: ReplayOpts, now: number): Promise<void> {
+// ── The copy backtest (2026-11-01) ──────────────────────────────────────
+//
+// The same read and the same fast-first pricing as a replay, under the
+// follow's own lag and exits, with the follow's rules applied to the trips
+// (shared/copyBacktest.ts). Its own job per wallet, so a backtest and a
+// Check replay of one wallet never overwrite each other — they do share the
+// chain read, and chainPrice's cache for any leg both priced.
+
+/** The job key of a wallet's backtest. */
+export const backtestKey = (wallet: string): string => `backtest:${wallet}`;
+
+/** A session's measured copy latency, as copyTrade.latency() reports it. */
+export interface MeasuredLatency {
+  slotGap: number | null;
+  slotSamples: number;
+  delayMs: number | null;
+}
+
+/** Live copies with a read slot gap before it counts as a measurement. */
+export const BACKTEST_MIN_LATENCY_SAMPLES = 5;
+
+/**
+ * The lag a copy lands behind their trade: the follower's base latency —
+ * this session's measured slot gap between their transaction and our landed
+ * buy (live copies), when there are enough of them, else the board's 2 s —
+ * plus the follow's own delay. The measured gap already includes whatever
+ * delay those copies waited, so that median delay is taken back out.
+ */
+export function backtestLagOf(delayMs: number, measured: MeasuredLatency | null | undefined): BacktestLag {
+  const delay = Math.max(0, Number.isFinite(delayMs) ? delayMs : 0);
+  if (measured && measured.slotGap !== null && measured.slotSamples >= BACKTEST_MIN_LATENCY_SAMPLES) {
+    const base = Math.max(0, Math.round(measured.slotGap * chainPrice.SLOT_MS - (measured.delayMs ?? 0)));
+    return {
+      lagMs: base + delay,
+      baseLagMs: base,
+      delayMs: delay,
+      source: 'measured',
+      note: `this session’s measured latency (median ${measured.slotGap} slot${measured.slotGap === 1 ? '' : 's'} behind theirs over ${measured.slotSamples} live copies, about ${(base / 1000).toFixed(1)} s)`,
+    };
+  }
+  return { lagMs: FOLLOWER_LAG_MS + delay, baseLagMs: FOLLOWER_LAG_MS, delayMs: delay, source: 'board', note: `the board’s ${FOLLOWER_LAG_MS / 1000} s follower lag (no measured copy latency this session)` };
+}
+
+export interface BacktestInput {
+  config: BacktestConfig;
+  span?: 'newest' | 'week';
+  measured?: MeasuredLatency | null;
+  /** The app-wide open-copies ceiling (execution.maxOpenCopies). */
+  maxOpenCopies?: number | null;
+}
+
+/** Start a backtest of a follow's settings over its wallet's trades. */
+export function startBacktest(input: BacktestInput, httpUrl: string, deps: ReplayDeps = realDeps, now = Date.now()): { ok: boolean; message: string } {
+  const c = input.config;
+  if (!BASE58.test(c.wallet)) return { ok: false, message: 'Not a Solana wallet address' };
+  const refused = backtestRefusal(c);
+  if (refused) return { ok: false, message: refused };
+  const span = input.span === 'week' ? 'week' : 'newest';
+  const spec: BacktestSpec = {
+    config: c,
+    lag: backtestLagOf(c.delayMs, input.measured),
+    depthSol: PAPER_DEFAULT_DEPTH_SOL,
+    depthSource: 'default',
+    maxOpenCopies: typeof input.maxOpenCopies === 'number' && input.maxOpenCopies > 0 ? input.maxOpenCopies : null,
+    span,
+  };
+  // Always the NEWEST trades, in order: the limits count copies through a
+  // day, so a random sample would judge them on gaps that never happened.
+  const opts: ReplayOpts = { ...(span === 'week' ? weekOpts(now, false) : {}), sample: 'newest', checks: false, backtest: spec };
+  return begin(backtestKey(c.wallet), c.wallet, httpUrl, deps, now, opts);
+}
+
+export function backtestStatus(wallet: string): CopyReplayStatus {
+  return statusOf(backtestKey(wallet), wallet);
+}
+
+export function cancelBacktest(wallet: string): boolean {
+  return cancel(backtestKey(wallet));
+}
+
+export function waitBacktest(wallet: string): Promise<void> {
+  return wait(backtestKey(wallet));
+}
+
+/** Where one trip's copy buys and sells: the chain's slots and the swap
+ *  API's moments, at the replay's lag or the backtest's. */
+interface Legs {
+  lagSlots: number;
+  /** Their slot the exit leg is counted from (their sell, or the copy's buy
+   *  plus the max hold), and the same as a moment. */
+  exitBaseSlot: number | null;
+  entryAt: number;
+  exitAt: number;
+}
+
+function legsOf(t: ReplayTrip, plan: BacktestPlan | null): Legs {
+  if (!plan) {
+    return { lagSlots: chainPrice.LAG_SLOTS, exitBaseSlot: typeof t.closeSlot === 'number' ? t.closeSlot : null, entryAt: t.openedAt + FOLLOWER_LAG_MS, exitAt: t.closedAt + FOLLOWER_LAG_MS };
+  }
+  const hold = plan.holdOf(t);
+  const open = typeof t.openSlot === 'number' ? t.openSlot : null;
+  return {
+    lagSlots: Math.max(0, Math.round(plan.lagMs / chainPrice.SLOT_MS)),
+    exitBaseSlot: hold !== null ? (open === null ? null : open + Math.round(hold / chainPrice.SLOT_MS)) : typeof t.closeSlot === 'number' ? t.closeSlot : null,
+    entryAt: t.openedAt + plan.lagMs,
+    exitAt: hold !== null ? t.openedAt + plan.lagMs + hold : t.closedAt + plan.lagMs,
+  };
+}
+
+async function run(key: string, address: string, httpUrl: string, st: CopyReplayStatus, deps: ReplayDeps, opts: ReplayOpts, now: number): Promise<void> {
   let sw: SwapChecks | null = null;
+  const plan = opts.backtest ? backtestPlanOf(opts.backtest) : null;
   try {
     st.phase = 'reading';
     const week = opts.span === 'week';
@@ -298,11 +428,15 @@ async function run(address: string, httpUrl: string, st: CopyReplayStatus, deps:
     // What the swaps alone say — wash trades, shared payers — costs nothing.
     if (opts.checks) sw = swapChecks(swaps, address);
     const built = buildTrips(swaps);
-    builtKept.set(address, built.trips);
-    while (builtKept.size > 50) {
-      const oldest = builtKept.keys().next().value;
-      if (oldest === undefined || oldest === address) break;
-      builtKept.delete(oldest);
+    // The board labeler's coverage figure reads a replay's trips; a
+    // backtest's are judged at its own lag, so they are not kept for it.
+    if (!plan) {
+      builtKept.set(address, built.trips);
+      while (builtKept.size > 50) {
+        const oldest = builtKept.keys().next().value;
+        if (oldest === undefined || oldest === address) break;
+        builtKept.delete(oldest);
+      }
     }
     st.open = built.open;
     // A window, when asked for: the trips opened inside it and no other.
@@ -324,6 +458,9 @@ async function run(address: string, httpUrl: string, st: CopyReplayStatus, deps:
     // board label, a random sample of them (unbiased; the same for the same
     // wallet on the same day).
     const trips = sampleTrips(windowed, opts.max ?? REPLAY_MAX_TRIPS, opts.sample ?? 'newest', sampleSeed(`${address}:${dayOf(now)}`));
+    // A backtest judges "too fast" at its own lag: a 3 s delay makes a 4 s
+    // trip one the copy misses, and with their sells not copied no trip is.
+    if (plan) for (const t of trips) t.note = plan.tooFast(t) ? 'too-fast' : 'unpriced';
     st.toPrice = trips.length;
     st.trips = trips;
     st.phase = 'pricing';
@@ -340,16 +477,16 @@ async function run(address: string, httpUrl: string, st: CopyReplayStatus, deps:
         waits += 1;
         const ms = Math.min(90_000, Math.max(5_000, deps.cooldownMs?.() ?? 0));
         st.waitingUntil = Date.now() + ms;
-        for (let left = ms; left > 0 && !cancels.has(address); left -= 1_000) await sleep(Math.min(1_000, left));
+        for (let left = ms; left > 0 && !cancels.has(key); left -= 1_000) await sleep(Math.min(1_000, left));
         st.waitingUntil = null;
-        if (cancels.has(address)) return r;
+        if (cancels.has(key)) return r;
       }
     };
     // a. The chain first, several trips at once, inside the allowance.
-    const chainDone = await priceFromChain(address, httpUrl, st, trips, deps, opts.lags);
+    const chainDone = await priceFromChain(key, httpUrl, st, trips, deps, plan ? undefined : opts.lags, plan);
     let slowTried = 0;
     for (const t of trips) {
-      if (cancels.has(address)) {
+      if (cancels.has(key)) {
         st.cancelled = true;
         break;
       }
@@ -357,7 +494,12 @@ async function run(address: string, httpUrl: string, st: CopyReplayStatus, deps:
       // already counted is not priced twice — and a replay priced at several
       // lags takes no swap-API fill, which knows no slots and would put one
       // leg on a different footing from the rest.
-      if (chainDone.has(t) || opts.lags?.length) continue;
+      if (chainDone.has(t) || (!plan && opts.lags?.length)) continue;
+      // A backtest leaves a trip its rules refuse without a price unpriced.
+      if (plan && t.note !== 'too-fast' && plan.skip(t)) {
+        st.priced += 1;
+        continue;
+      }
       // A week check caps the slow path (2026-10-28): past the cap a trip
       // stays unpriced and is counted, rather than holding the check for
       // half an hour at the swap API's 2 s pace.
@@ -368,11 +510,12 @@ async function run(address: string, httpUrl: string, st: CopyReplayStatus, deps:
       }
       if (t.note !== 'too-fast') slowTried += 1;
       if (t.note !== 'too-fast') {
-        const entry = await price(t.mint, t.openedAt + FOLLOWER_LAG_MS);
+        const legs = legsOf(t, plan);
+        const entry = await price(t.mint, legs.entryAt);
         if (entry.price === null) {
           if (entry.failed && !providerTrouble) providerTrouble = entry.message;
         } else {
-          const exit = await price(t.mint, t.closedAt + FOLLOWER_LAG_MS);
+          const exit = await price(t.mint, legs.exitAt);
           if (exit.price === null) {
             if (exit.failed && !providerTrouble) providerTrouble = exit.message;
           } else {
@@ -400,20 +543,32 @@ async function run(address: string, httpUrl: string, st: CopyReplayStatus, deps:
     }
     // c. The checks, after the pricing, so a spent allowance costs prices
     // nothing: each coin's birth once, for every sampled trip on it.
-    if (sw) await runChecks(address, httpUrl, st, trips, deps, sw);
+    if (sw) await runChecks(key, address, httpUrl, st, trips, deps, sw);
   } catch (e) {
-    st.message = st.message || `Replay stopped — ${(e as Error).message ?? String(e)}`.slice(0, 200);
+    st.message = st.message || `${plan ? 'Backtest' : 'Replay'} stopped — ${(e as Error).message ?? String(e)}`.slice(0, 200);
   } finally {
+    // The backtest's figures, before the run reads as done, so a poll never
+    // sees a finished backtest without them.
+    if (opts.backtest) {
+      try {
+        st.backtest = st.trips.length ? backtestCopies(st.trips, opts.backtest) : null;
+      } catch (e) {
+        st.backtest = null;
+        st.message = st.message || `Backtest stopped — ${(e as Error).message ?? String(e)}`.slice(0, 200);
+      }
+    }
     st.running = false;
     st.phase = 'done';
     st.finishedAt = Date.now();
-    cancels.delete(address);
+    cancels.delete(key);
     const filled = st.trips.filter((t) => t.note === 'filled').length;
     const c = st.checks;
     log(
       st.message ? 'warn' : 'info',
-      `copy replay ${address.slice(0, 6)}…: ${st.cancelled ? 'cancelled' : 'done'} — ${st.span === 'week' ? 'whole week, ' : ''}${st.swaps} swap(s), ${st.tripsFound} trip(s), ${filled}/${st.toPrice} priced (${st.sample ?? 'newest'}; ${st.viaChain ?? 0} from the chain, ${st.credits ?? 0} credits; ${st.viaPump ?? 0} from pump's history), ${st.calls} call(s)${st.fallbackWhy ? ` · slower path because ${st.fallbackWhy}` : ''}${
+      `copy ${plan ? 'backtest' : 'replay'} ${address.slice(0, 6)}…:${st.cancelled ? 'cancelled' : 'done'} — ${st.span === 'week' ? 'whole week, ' : ''}${st.swaps} swap(s), ${st.tripsFound} trip(s), ${filled}/${st.toPrice} priced (${st.sample ?? 'newest'}; ${st.viaChain ?? 0} from the chain, ${st.credits ?? 0} credits; ${st.viaPump ?? 0} from pump's history), ${st.calls} call(s)${st.fallbackWhy ? ` · slower path because ${st.fallbackWhy}` : ''}${
         c ? ` · checks: ${c.washTrips} wash, ${c.sharedPayers} other payer(s), ${c.sniperTrips} snipe(s) and ${c.bundleTrips} bundle buy(s) over ${c.mintsChecked} checked` : ''
+      }${
+        st.backtest ? ` · backtest: ${st.backtest.copies} copies (${st.backtest.priced} priced), ${st.backtest.skippedTotal} refused, lag ${st.backtest.lagMs} ms (${st.backtest.lagSource})` : ''
       }${st.message ? ` · ${st.message}` : ''}`,
     );
   }
@@ -425,7 +580,7 @@ async function run(address: string, httpUrl: string, st: CopyReplayStatus, deps:
  * marked against it. Inside the allowance like the pricing; a read that is
  * refused or keeps failing ends the checks, and what was checked stands.
  */
-async function runChecks(address: string, httpUrl: string, st: CopyReplayStatus, trips: ReplayTrip[], deps: ReplayDeps, sw: SwapChecks): Promise<void> {
+async function runChecks(key: string, address: string, httpUrl: string, st: CopyReplayStatus, trips: ReplayTrip[], deps: ReplayDeps, sw: SwapChecks): Promise<void> {
   const checks: ReplayChecks = { ...sw, sniperTrips: 0, bundleTrips: 0, mintsChecked: 0, credits: 0 };
   st.checks = checks;
   if (!deps.mintBirth || !isHeliusRpc(httpUrl)) return;
@@ -436,7 +591,7 @@ async function runChecks(address: string, httpUrl: string, st: CopyReplayStatus,
   let fails = 0;
   let stopped = false;
   const worker = async (): Promise<void> => {
-    while (next < mints.length && !stopped && !cancels.has(address)) {
+    while (next < mints.length && !stopped && !cancels.has(key)) {
       const mint = mints[next++];
       if ((deps.chainCreditsLeft?.() ?? 0) < BIRTH_CREDITS * CHAIN_CONCURRENCY) {
         stopped = true;
@@ -474,15 +629,31 @@ async function runChecks(address: string, httpUrl: string, st: CopyReplayStatus,
  * asking (and says why) when the allowance cannot cover another trip, or the
  * reads keep failing; whatever is left goes to the swap API.
  */
-async function priceFromChain(address: string, httpUrl: string, st: CopyReplayStatus, trips: ReplayTrip[], deps: ReplayDeps, lags?: readonly number[]): Promise<Set<ReplayTrip>> {
+async function priceFromChain(
+  key: string,
+  httpUrl: string,
+  st: CopyReplayStatus,
+  trips: ReplayTrip[],
+  deps: ReplayDeps,
+  lags?: readonly number[],
+  plan: BacktestPlan | null = null,
+): Promise<Set<ReplayTrip>> {
   const settled = new Set<ReplayTrip>();
-  const todo = trips.filter((t) => t.note !== 'too-fast');
+  // A backtest prices only the trips its price-free rules let through.
+  const todo = trips.filter((t) => t.note !== 'too-fast' && !(plan && plan.skip(t)));
   if (!todo.length) return settled;
   if (!deps.chainPrice || !isHeliusRpc(httpUrl)) {
     st.fallbackWhy = 'there is no Helius key — add one in Settings to price a replay in seconds';
     return settled;
   }
-  const ready = todo.filter((t) => typeof t.openSlot === 'number' && typeof t.closeSlot === 'number');
+  // A backtest at its own lag (or exiting on the max hold) needs the lagged
+  // read: chainPrice alone prices the board's nine slots behind their sell.
+  const btLegs = plan ? new Map(todo.map((t) => [t, legsOf(t, plan)] as const)) : null;
+  if (btLegs && !deps.chainPriceLags && [...btLegs.entries()].some(([t, l]) => l.lagSlots !== chainPrice.LAG_SLOTS || l.exitBaseSlot !== t.closeSlot)) {
+    st.fallbackWhy = 'the chain read for a custom lag is not available';
+    return settled;
+  }
+  const ready = todo.filter((t) => typeof t.openSlot === 'number' && (btLegs ? btLegs.get(t)?.exitBaseSlot != null : typeof t.closeSlot === 'number'));
   if (ready.length < todo.length) st.fallbackWhy = `${todo.length - ready.length} trip(s) came without slots`;
   // Several lags: every lag's legs from one read, the usual lag's as the
   // trip's own figure. Reserve for the back pages the extra legs may need.
@@ -492,7 +663,7 @@ async function priceFromChain(address: string, httpUrl: string, st: CopyReplaySt
   let stopped = '';
   let next = 0;
   const worker = async (): Promise<void> => {
-    while (next < ready.length && !stopped && !cancels.has(address)) {
+    while (next < ready.length && !stopped && !cancels.has(key)) {
       const t = ready[next++];
       // Reserve the most a trip can cost before asking, so the allowance is
       // never overrun by the trips in flight.
@@ -507,7 +678,15 @@ async function priceFromChain(address: string, httpUrl: string, st: CopyReplaySt
         break;
       }
       let r: chainPrice.TripPrice;
-      if (multi) {
+      const bt = btLegs?.get(t);
+      if (bt && deps.chainPriceLags) {
+        // The backtest's one lag, from the copy's buy to its sell — their
+        // sell, or the max hold after the copy's buy.
+        const m = await deps.chainPriceLags(httpUrl, t.mint, t.openSlot as number, bt.exitBaseSlot as number, [bt.lagSlots]);
+        const leg = m.at[bt.lagSlots] ?? { entry: null, exit: null };
+        r = { ok: m.ok, entry: leg.entry, exit: leg.exit, calls: m.calls, credits: m.credits, cached: m.cached, message: m.message, ...(m.refused ? { refused: true } : {}) };
+      } else if (bt) r = await deps.chainPrice!(httpUrl, t.mint, t.openSlot as number, bt.exitBaseSlot as number);
+      else if (multi) {
         const m = await deps.chainPriceLags!(httpUrl, t.mint, t.openSlot as number, t.closeSlot as number, multi);
         const usual = m.at[chainPrice.LAG_SLOTS] ?? { entry: null, exit: null };
         r = { ok: m.ok, entry: usual.entry, exit: usual.exit, calls: m.calls, credits: m.credits, cached: m.cached, message: m.message, ...(m.refused ? { refused: true } : {}) };

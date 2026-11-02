@@ -192,6 +192,27 @@ function install() {
     }
 
     if (host === 'frontend-api-v3.pump.fun') {
+      // pump's coin trade tape and candles — on this host since swap-api's
+      // route went 410 (2026-11-01). Counted under the tape's own provider.
+      if (p.startsWith('/trades/') || p.startsWith('/candles/')) {
+        bump('pumpswap:trades');
+        return json({
+          trades: Array.from({ length: 8 }, (_, i) => ({
+            ordinalKey: `${310_000_000 + i}-0-0-${Date.now() - AGE_MS + i * 400}`,
+            blockId: String(310_000_000 + i),
+            blockTimeMs: Date.now() - AGE_MS + i * 400,
+            txId: `tx${i}`,
+            trader: { address: i === 0 ? 'Creator0' : `Buyer${i}` },
+            side: 'buy',
+            kind: 'swap',
+            venue: 'pump',
+            baseAmount: { raw: String(1e12 * 1e6), decimals: 6 },
+            quoteAmount: { raw: String(5e8), decimals: 9 },
+            quote: { id: 'So11111111111111111111111111111111111111112' },
+          })),
+          cursor: null,
+        });
+      }
       if (p === '/coins') {
         if (pumpDown) {
           bump('pump:list');
@@ -215,23 +236,6 @@ function install() {
       }
       bump('pump:other');
       return json({});
-    }
-
-    if (host === 'swap-api.pump.fun') {
-      bump('pumpswap:trades');
-      return json({
-        trades: Array.from({ length: 8 }, (_, i) => ({
-          slotIndexId: String(310_000_000_000 + i * 10).padStart(22, '0'),
-          tx: `tx${i}`,
-          timestamp: new Date(Date.now() - AGE_MS + i * 400).toISOString(),
-          userAddress: i === 0 ? 'Creator0' : `Buyer${i}`,
-          type: 'buy',
-          program: 'pump',
-          amountSol: '0.5',
-          baseAmount: String(1e12),
-        })),
-        pagination: { hasMore: false, nextCursor: null },
-      });
     }
 
     if (host === 'lite-api.jup.ag' || host === 'api.jup.ag') {

@@ -364,8 +364,9 @@ export function ReplayPanel({
   );
 }
 
-/** The copies by the day they closed: one cell a day, what that day made. */
-function DayStrip({ days }: { days: ReplayDay[] }) {
+/** The copies by the day they closed: one cell a day, what that day made.
+ *  Also the backtest's (BacktestPanel). */
+export function DayStrip({ days }: { days: ReplayDay[] }) {
   const up = days.filter((d) => d.totalSol !== null && d.totalSol > 0).length;
   return (
     <div className="mt-4" data-testid="replay-days">

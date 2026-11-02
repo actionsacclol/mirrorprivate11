@@ -28,8 +28,12 @@
 // withdrawals or transfers. No bridging. No token launching. No Wallet Lab
 // fan-out. No settings writes of any kind — including, especially, anything
 // touching fees, the treasury, referrals or RPC endpoints. No arming of a
-// copy config (reading them is fine; arming one starts unattended spending
-// and stays a decision a person makes in front of the app). No raw RPC. No
+// copy config (arming one starts unattended spending and stays a decision a
+// person makes in front of the app). Since 2026-11-01 an agent may CREATE and
+// EDIT follows (create_follow, update_follow, pause_follow, resume_follow):
+// a live follow it creates is always saved switched off, and on a live follow
+// it may only make things safer — the narrow-only rule of the AI desk, field
+// by field in shared/followEdit.ts. No deleting a follow. No raw RPC. No
 // creating, funding, starting, resuming or configuring a Krypto Trader
 // session: an agent may only act for a session the user set to MCP, inside
 // its envelope, on the seq it read (trader_act).
@@ -94,7 +98,9 @@ export const MCP_SERVER_NAME = 'krypto-mirror';
 export const MCP_INSTRUCTIONS = [
   'This is Krypto Mirror, a desktop copy-trading app for memecoins, running on the user’s own machine with their own wallet.',
   '',
-  'Read tools report what the app has recorded. Trade tools place orders through the app’s own pipeline — the same one its buttons use, with the same fees, limits and safety breakers. You cannot sign, build or modify a transaction here, and you cannot change any setting.',
+  'Read tools report what the app has recorded. Trade tools place orders through the app’s own pipeline — the same one its buttons use, with the same fees, limits and safety breakers. You cannot sign, build or modify a transaction here, and you cannot change any app setting.',
+  '',
+  'Follows: create_follow, update_follow, pause_follow and resume_follow set up and tune copy-trading follows. A paper follow can be created switched on and edited freely. A LIVE follow you create is always saved switched OFF — only the user can arm it, in the app’s Following page. On a live follow you may only make it safer (smaller sizes and limits, tighter stops and exits, stricter filters, pausing); anything that widens its risk is refused and stays with the user. You cannot delete a follow.',
   '',
   'Every trade tool runs in the mode the user set for this connection. In paper mode nothing is bought: fills are simulated and booked to a paper record. In live mode real funds move. get_wallet tells you which mode you are in — check it before you trade, and say which one you are in when you report back.',
   '',
@@ -157,6 +163,98 @@ const MINT = str('The token’s address — base58 on Solana, 0x… on the EVM c
 /** Solana-only tools say so rather than taking a chain they cannot honour. */
 const SOL_MINT = str('The token’s mint address — Solana, base58.');
 const CHAIN = str('Which chain. Defaults to Solana.', { enum: ['solana', 'robinhood', 'bnb'] });
+
+// ── Follow settings an agent may send (2026-11-01) ───────────────────────
+//
+// The CopyConfig fields create_follow and update_follow read, and nothing
+// else. Deliberately absent: the followed wallet and chain after creation,
+// paper/live after creation, the wallet copies sign with (walletId), the AI
+// gate (`ai`), the convergence crowd (fomo*), and main's own bookkeeping
+// (lossStopFrom, pausedReason, pausedAt). Which way each field is "safer" on
+// a live follow is decided in shared/followEdit.ts, keyed on this list.
+
+export type FollowFieldKind = 'number' | 'numberOrOff' | 'boolean' | 'list' | 'text' | 'choice';
+
+export interface FollowField {
+  key: string;
+  kind: FollowFieldKind;
+  about: string;
+  choices?: readonly string[];
+}
+
+export const FOLLOW_FIELDS = [
+  { key: 'label', kind: 'text', about: 'A name for the follow, up to 40 characters.' },
+  {
+    key: 'direction',
+    kind: 'choice',
+    choices: ['copy', 'reverse', 'watch'],
+    about: 'copy: buy when they buy, mirror their sells. reverse: buy when they SELL, out on its own exits. watch: never trades, alerts only (paper only). Default copy. Fixed on a live follow.',
+  },
+  {
+    key: 'sizing',
+    kind: 'choice',
+    choices: ['fixed', 'proportional'],
+    about: 'fixed: sizeValue is the chain’s coin per copy. proportional: sizeValue is a percent of their trade, capped by maxTradeSol. Default fixed. Fixed on a live follow.',
+  },
+  { key: 'sizeValue', kind: 'number', about: 'fixed: SOL (or ETH / BNB) per copy. proportional: percent of their trade, up to 500. Live: may only go down.' },
+  { key: 'maxTradeSol', kind: 'number', about: 'The most one copy may spend, in the chain’s coin, up to 25. Live: may only go down.' },
+  { key: 'dailyLossLimitSol', kind: 'number', about: 'Stop copying for the day after losing this much. Required, never off. Live: may only go down.' },
+  { key: 'dailyTradeLimit', kind: 'number', about: 'At most this many copies a day, 1–500. Live: may only go down.' },
+  { key: 'maxCopiesPerMinute', kind: 'numberOrOff', about: 'At most this many copies in any minute, 1–120; null = the default 10. Live: may only go down.' },
+  { key: 'walletLossStopSol', kind: 'numberOrOff', about: 'Pause this follow once its copies have lost this much since it was switched on; null = off. Live: may only go down or be added, never removed.' },
+  { key: 'maxSlippagePct', kind: 'number', about: 'The most slippage a copy accepts, percent, up to 50. Live: may only go down.' },
+  { key: 'delayMs', kind: 'number', about: 'Wait this long after their trade before copying, milliseconds, 0–60000. Fixed on a live follow.' },
+  { key: 'minLiquidityUsd', kind: 'numberOrOff', about: 'Skip coins with less liquidity than this, USD; null = off. Live: may only go up or be added.' },
+  { key: 'minMarketCapUsd', kind: 'numberOrOff', about: 'Skip coins under this market cap, USD; null = off. Live: may only go up or be added.' },
+  { key: 'maxMarketCapUsd', kind: 'numberOrOff', about: 'Skip coins over this market cap, USD; null = off. Live: may only go down or be added.' },
+  { key: 'minKryptScore', kind: 'numberOrOff', about: 'Skip coins under this safety score; null = off. Live: may only go up or be added.' },
+  { key: 'onlyPumpfun', kind: 'boolean', about: 'Only copy pump.fun coins. Live: may only be switched on.' },
+  { key: 'minLeaderSol', kind: 'numberOrOff', about: 'Skip their buys smaller than this, in the chain’s coin; null = off. Live: may only go up or be added.' },
+  { key: 'maxLeaderSol', kind: 'numberOrOff', about: 'Skip their buys bigger than this; null = off. Live: may only go down or be added.' },
+  { key: 'minTokenAgeSec', kind: 'numberOrOff', about: 'Skip coins younger than this at their buy, seconds; null = off. Live: may only go up or be added.' },
+  { key: 'maxTokenAgeSec', kind: 'numberOrOff', about: 'Skip coins older than this at their buy, seconds; null = off. Live: may only go down or be added.' },
+  { key: 'maxBuysPerToken', kind: 'numberOrOff', about: 'At most this many entries per coin, whole number 1–100; null = no limit. Live: may only go down or be added.' },
+  { key: 'blockedMints', kind: 'list', about: 'Never copy these token addresses (the whole list; null = none). Live: may only add, never remove.' },
+  { key: 'blockedCreators', kind: 'list', about: 'Never copy coins made by these creator addresses (the whole list; null = none). Live: may only add, never remove.' },
+  { key: 'onePositionPerCoin', kind: 'boolean', about: 'Refuse a buy of a coin any follow already holds. Live: may only be switched on.' },
+  {
+    key: 'activeFromMin',
+    kind: 'numberOrOff',
+    about: 'Trading hours start, minutes after local midnight (0–1439); set both ends or neither (null = all day). Live: the hours may only shrink.',
+  },
+  { key: 'activeToMin', kind: 'numberOrOff', about: 'Trading hours end, minutes after local midnight (0–1439). A start past the end wraps midnight. Live: the hours may only shrink.' },
+  { key: 'copySells', kind: 'boolean', about: 'Mirror their sells. Live: may only be switched on.' },
+  { key: 'minLeaderSellPct', kind: 'numberOrOff', about: 'Only mirror their sells of at least this share of their bag, percent; null = mirror every sell. Live: may only go down or be removed.' },
+  { key: 'copyOtherExits', kind: 'boolean', about: 'Follow them out when they leave a coin without selling it for SOL (a transfer, a stablecoin or token swap). Live: may only be switched on.' },
+  { key: 'exitTakeProfitPct', kind: 'numberOrOff', about: 'Sell the copy at this gain, percent; null = off on a copy follow, the default 25 on reverse. Live: may only go down or be added.' },
+  { key: 'exitStopLossPct', kind: 'numberOrOff', about: 'Sell the copy at this loss, percent (1–95); null = off on a copy follow, the default 20 on reverse. Live: may only go down (tighter) or be added, never removed.' },
+  { key: 'exitMaxHoldMin', kind: 'numberOrOff', about: 'Sell the copy after holding it this many minutes (1–1440); null = off on a copy follow, the default 30 on reverse. Live: may only go down or be added.' },
+  { key: 'exitTrailingPct', kind: 'numberOrOff', about: 'Trailing stop, percent below the highest mark since entry (1–95); null = off. Live: may only go down (tighter) or be added, never removed.' },
+  { key: 'exitOnCreatorSellPct', kind: 'numberOrOff', about: 'Sell the copy when the coin’s creator sells at least this share of their bag, percent (0 = any sell); null = off. Live: may only go down or be added.' },
+  { key: 'exitOnMigration', kind: 'boolean', about: 'Sell the copy when the coin graduates to PumpSwap. Live: may only be switched on.' },
+] as const satisfies readonly FollowField[];
+
+export type FollowFieldKey = (typeof FOLLOW_FIELDS)[number]['key'];
+
+function followProp(f: FollowField): Record<string, unknown> {
+  switch (f.kind) {
+    case 'number':
+      return num(f.about);
+    case 'numberOrOff':
+      return { type: ['number', 'null'], description: f.about };
+    case 'boolean':
+      return { type: 'boolean', description: f.about };
+    case 'list':
+      return { type: ['array', 'null'], items: { type: 'string' }, maxItems: 100, description: f.about };
+    case 'text':
+      return str(f.about, { maxLength: 40 });
+    case 'choice':
+      return str(f.about, { enum: [...(f.choices ?? [])] });
+  }
+}
+
+const FOLLOW_PROPS: Record<string, unknown> = Object.fromEntries((FOLLOW_FIELDS as readonly FollowField[]).map((f) => [f.key, followProp(f)]));
+const CONFIG_ID = str('The follow’s id (configId), from get_copy_configs or create_follow.');
 
 /**
  * Every tool, in the order a client sees them. Read tools first: an agent
@@ -246,7 +344,7 @@ export const MCP_TOOLS: McpToolSpec[] = [
     name: 'get_copy_configs',
     title: 'Copy trading setup',
     description:
-      'The copy-trading configs and how each is doing: who is followed, direction, paper or live, whether it is armed, and its record. Read only — arming a config starts unattended spending and stays something the user does in the app.',
+      'The copy-trading follows and how each is doing: each one’s id (configId), who is followed, direction, paper or live, whether it is switched on, every setting, and its record. To change them use create_follow / update_follow / pause_follow / resume_follow — arming a LIVE follow stays something the user does in the app.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
     tier: 'read',
     readOnly: true,
@@ -437,6 +535,76 @@ export const MCP_TOOLS: McpToolSpec[] = [
     tier: 'trade',
     readOnly: false,
     destructive: true,
+  },
+  {
+    name: 'create_follow',
+    title: 'Create a follow',
+    description:
+      'Follow a wallet: create a copy-trading follow from its address plus any of the settings below; the rest get the Follow page’s defaults, with the limits derived from sizeValue / maxTradeSol. Checked like the app’s own form — a bad setting is refused with the reason. PAPER (the default): copies are simulated and spend nothing, and it starts switched on unless you send enabled:false. LIVE: it is ALWAYS saved switched OFF (disarmed), whatever enabled says — it copies nothing until the user switches it on themselves in the app’s Following page; you cannot arm it. Creating a live follow needs a live connection. Convergence (crowd) follows, the wallet copies sign with and the AI gate are set in the app. A wallet already followed on that chain is refused. Returns the new configId.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        wallet: str('The wallet to follow — base58 on Solana, 0x… on the EVM chains.'),
+        chain: CHAIN,
+        mode: str('paper (default) or live. A live follow is saved switched off; only the user can arm it.', { enum: ['paper', 'live'] }),
+        enabled: { type: 'boolean', description: 'Paper only: start it switched on (default true). A live follow is always created switched off.' },
+        ...FOLLOW_PROPS,
+      },
+      required: ['wallet'],
+      additionalProperties: false,
+    },
+    tier: 'trade',
+    readOnly: false,
+    destructive: false,
+  },
+  {
+    name: 'update_follow',
+    title: 'Change a follow’s settings',
+    description:
+      'Change one follow’s settings by configId; only the fields you send change, and the result is checked like the app’s own form. PAPER follow: any setting below may change, and enabled:true switches it back on. LIVE follow (or a paper one that still has live copies open): you may only make it SAFER — lower sizeValue, maxTradeSol, dailyLossLimitSol, dailyTradeLimit, maxCopiesPerMinute, maxSlippagePct or walletLossStopSol; tighter or added exits (a lower take-profit, stop-loss, trailing stop, max hold or creator-sell share; copySells, copyOtherExits or exitOnMigration switched on; a lower minLeaderSellPct); stricter filters (a minimum raised or added, a maximum lowered or added, more blocked tokens or creators, onlyPumpfun or onePositionPerCoin switched on, shorter trading hours); a new label; or pausing it (enabled:false). Anything that widens a live follow’s risk — raising a size or limit, removing a stop, exit or filter, unblocking, longer hours, changing direction, sizing or delayMs, switching it back on — is refused whole (nothing changes) and has to be done by the user in the app. The followed wallet, its chain, paper/live, the wallet copies sign with and the AI gate never change here.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        configId: CONFIG_ID,
+        enabled: { type: 'boolean', description: 'false pauses the follow. true switches a PAPER follow back on; a live follow is switched back on only by the user.' },
+        ...FOLLOW_PROPS,
+      },
+      required: ['configId'],
+      additionalProperties: false,
+    },
+    tier: 'trade',
+    readOnly: false,
+    destructive: false,
+  },
+  {
+    name: 'pause_follow',
+    title: 'Pause a follow',
+    description:
+      'Switch one follow off, paper or live: it opens no new copies. Copies it already holds keep being managed and exit by its rules as usual. Always allowed — it only makes the follow safer. Switching a live follow back on is the user’s, in the app.',
+    inputSchema: {
+      type: 'object',
+      properties: { configId: CONFIG_ID, reason: str('One line on why. Shown to the user.', { maxLength: 200 }) },
+      required: ['configId'],
+      additionalProperties: false,
+    },
+    tier: 'trade',
+    readOnly: false,
+    destructive: false,
+  },
+  {
+    name: 'resume_follow',
+    title: 'Switch a paper follow back on',
+    description:
+      'Switch a PAPER follow back on, so it starts simulating copies again. Refused on a LIVE follow: arming one starts unattended spending, so only the user switches it on, in the app’s Following page.',
+    inputSchema: {
+      type: 'object',
+      properties: { configId: CONFIG_ID, reason: str('One line on why. Shown to the user.', { maxLength: 200 }) },
+      required: ['configId'],
+      additionalProperties: false,
+    },
+    tier: 'trade',
+    readOnly: false,
+    destructive: false,
   },
   {
     name: 'place_order',

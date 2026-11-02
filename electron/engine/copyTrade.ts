@@ -52,6 +52,15 @@ import {
   describeCopyTiming,
   PAPER_MODEL,
   paperExitPnl,
+  paperDepthSol,
+  skipRuleOf,
+  defaultPaperBankroll,
+  PAPER_BANKROLL_MIN_USD,
+  PAPER_BANKROLL_MAX_USD,
+  type PaperBankroll,
+  type PaperBankrollView,
+  type SkipRuleCount,
+  type CopyHold,
   chainOf, isBlocked, isDustRemainder, rawOf, uiTokens } from '@shared/copytrade';
 import type { DeliveryTiming } from './walletWatcher';
 import * as recorder from './recorder';
@@ -234,6 +243,9 @@ export interface CopyHost {
   /** Token facts used by the filters. `createdAt` (ms) and `creator` feed
    *  the 2026-09-21 age and creator filters; a host that cannot say leaves
    *  them absent, which those filters read as unknown and refuse on. */
+  /** SOL in USD, for the paper model's pool depth. Optional: without it
+   *  paper falls back to the pump curve's depth. */
+  solUsd?(): Promise<number | null>;
   tokenFacts(mint: string, chain?: ChainKind): Promise<{ liquidityUsd: number | null; marketCapUsd: number | null; kryptScore: number | null; isPumpfun: boolean; createdAt?: number | null; creator?: string | null }>;
   log(level: 'info' | 'warn' | 'error', line: string): void;
   toast(level: 'info' | 'success' | 'warn' | 'error', message: string): void;
@@ -341,10 +353,15 @@ export function init(userDataDir: string): void {
       trades: CopyTrade[];
       leaders?: Record<string, LeaderBook>;
       pendingExits?: Array<{ key: string; trade: WalletTrade }>;
+      skipTallies?: Record<string, Record<string, SkipTally>>;
+      paperBankroll?: Partial<PaperBankroll>;
     };
     configs = Array.isArray(raw?.configs) ? raw.configs : [];
     trades = Array.isArray(raw?.trades) ? raw.trades : [];
     leaders = raw?.leaders && typeof raw.leaders === 'object' && !Array.isArray(raw.leaders) ? raw.leaders : {};
+    if (raw?.skipTallies && typeof raw.skipTallies === 'object' && !Array.isArray(raw.skipTallies)) skipTallies = raw.skipTallies;
+    else tallySkipsFromRows();
+    bankroll = readBankroll(raw?.paperBankroll);
     for (const row of Array.isArray(raw?.pendingExits) ? raw.pendingExits : []) {
       if (row && typeof row.key === 'string' && row.trade && typeof row.trade.mint === 'string') {
         restoredExits.set(row.key, row.trade);
@@ -454,6 +471,8 @@ function writeNow(): void {
             // the same bug as dropping it in memory: the position stays
             // open and nothing remembers it was meant to close.
             pendingExits: [...pendingExits.entries()].map(([key, trade]) => ({ key, trade })),
+            skipTallies,
+            paperBankroll: bankroll,
           },
           null,
           2,
@@ -552,6 +571,7 @@ export function remove(id: string): { ok: boolean; message: string } {
   }
   pendingCopies.delete(id);
   recentCopies.delete(id);
+  for (const key of Object.keys(skipTallies)) if (key.startsWith(`${id}:`)) delete skipTallies[key];
   for (const key of [...buysInFlight.keys()]) if (key.startsWith(`${id}:`)) buysInFlight.delete(key);
   for (const key of [...pendingExits.keys()]) if (key.startsWith(`${id}:`)) pendingExits.delete(key);
   for (const key of [...staleBuys]) if (key.startsWith(`${id}:`)) staleBuys.delete(key);
@@ -565,6 +585,101 @@ export function remove(id: string): { ok: boolean; message: string } {
   persist();
   host?.changed();
   return { ok: true, message: 'Stopped following' };
+}
+
+// ── The paper bankroll (2026-11-01) ───────────────────────────────────
+// See shared/copytrade.ts. Solana paper copies only: an EVM paper copy is
+// sized in that chain's coin and keeps spending from nothing.
+
+let bankroll: PaperBankroll = defaultPaperBankroll();
+
+function readBankroll(v: Partial<PaperBankroll> | undefined): PaperBankroll {
+  const d = defaultPaperBankroll();
+  if (!v || typeof v !== 'object') return d;
+  const num = (x: unknown): number | null => (typeof x === 'number' && Number.isFinite(x) ? x : null);
+  const usd = num(v.usd);
+  const startSol = num(v.startSol);
+  return {
+    enabled: v.enabled === true,
+    usd: usd !== null && usd >= PAPER_BANKROLL_MIN_USD && usd <= PAPER_BANKROLL_MAX_USD ? usd : d.usd,
+    startSol: startSol !== null && startSol > 0 ? startSol : null,
+    startedAt: num(v.startedAt),
+    startSolUsd: num(v.startSolUsd),
+    realizedSol: num(v.realizedSol) ?? 0,
+  };
+}
+
+/** The run a NEW copy of this config would be paid from, or null when the
+ *  bankroll does not apply (off, not started, live, or not Solana). */
+function bankrollRunFor(c: CopyConfig): number | null {
+  if (!bankroll.enabled || bankroll.startedAt === null || bankroll.startSol === null) return null;
+  if (c.mode !== 'paper' || chainOf(c) !== 'solana') return null;
+  return bankroll.startedAt;
+}
+
+/** Cost still held by this run: its open copies, plus its buys in flight. */
+function paperHeld(): { sol: number; open: number } {
+  const run = bankroll.startedAt;
+  let sol = 0;
+  let open = 0;
+  if (run === null) return { sol, open };
+  for (const t of trades) {
+    if (t.kind === 'exit' || t.state !== 'open' || t.paperBank !== run) continue;
+    sol += t.ourSol * ((t.remainingPct ?? 100) / 100);
+    open += 1;
+  }
+  for (const f of buysInFlight.values()) if (f.paperSol !== undefined) sol += f.paperSol;
+  return { sol, open };
+}
+
+/** Free to spend now, SOL; null when the bankroll is off or not started. */
+function paperCashSol(): number | null {
+  if (!bankroll.enabled || bankroll.startSol === null || bankroll.startedAt === null) return null;
+  return bankroll.startSol + bankroll.realizedSol - paperHeld().sol;
+}
+
+function bankrollView(): PaperBankrollView {
+  const held = paperHeld();
+  const started = bankroll.startSol !== null && bankroll.startedAt !== null;
+  return {
+    ...bankroll,
+    heldSol: started ? held.sol : 0,
+    openCopies: started ? held.open : 0,
+    cashSol: started && bankroll.startSol !== null ? bankroll.startSol + bankroll.realizedSol - held.sol : null,
+  };
+}
+
+/**
+ * Switch the bankroll, set its amount, or start it over. Switching it on,
+ * a new amount, or `restart` starts a fresh run: the dollars are turned into
+ * SOL at today's price, and copies already open stay outside it (they were
+ * paid from the old run, or from nothing). Switching it off keeps the run,
+ * so switching back on without a change carries on where it was.
+ */
+export async function setPaperBankroll(input: { enabled?: boolean; usd?: number; restart?: boolean }): Promise<{ ok: boolean; message: string; bankroll: PaperBankrollView }> {
+  const fail = (message: string) => ({ ok: false, message, bankroll: bankrollView() });
+  if (input.usd !== undefined && !(Number.isFinite(input.usd) && input.usd >= PAPER_BANKROLL_MIN_USD && input.usd <= PAPER_BANKROLL_MAX_USD)) {
+    return fail(`The amount must be between $${PAPER_BANKROLL_MIN_USD} and $${PAPER_BANKROLL_MAX_USD.toLocaleString('en-US')}.`);
+  }
+  const enabled = input.enabled ?? bankroll.enabled;
+  const usd = input.usd ?? bankroll.usd;
+  if (!enabled) {
+    bankroll = { ...bankroll, enabled: false, usd };
+    persist();
+    host?.changed();
+    host?.log('info', 'copy: paper bankroll off — paper copies spend without a balance');
+    return { ok: true, message: 'Paper bankroll off. Paper copies no longer draw from a balance.', bankroll: bankrollView() };
+  }
+  const fresh = input.restart === true || !bankroll.enabled || usd !== bankroll.usd || bankroll.startSol === null || bankroll.startedAt === null;
+  if (!fresh) return { ok: true, message: 'No change.', bankroll: bankrollView() };
+  const price = (await host?.solUsd?.().catch(() => null)) ?? null;
+  if (price === null || !(price > 0)) return fail('The SOL price is not available right now, so the dollars cannot be turned into SOL. Try again in a moment.');
+  bankroll = { enabled: true, usd, startSol: usd / price, startedAt: Date.now(), startSolUsd: price, realizedSol: 0 };
+  persist();
+  host?.changed();
+  const sol = (usd / price).toFixed(3);
+  host?.log('info', `copy: paper bankroll started — $${usd} = ${sol} SOL at $${price.toFixed(2)}`);
+  return { ok: true, message: `Paper bankroll started: $${usd.toLocaleString('en-US')} = ${sol} SOL at today's price. Copies already open are outside it.`, bankroll: bankrollView() };
 }
 
 /**
@@ -594,6 +709,11 @@ export function resetPaper(configId?: string): { ok: boolean; message: string; c
     return configId !== undefined && t.configId !== configId;
   });
   const cleared = before - trades.length;
+  for (const key of Object.keys(skipTallies)) {
+    if (!key.endsWith(':paper')) continue;
+    if (configId !== undefined && key !== `${configId}:paper`) continue;
+    delete skipTallies[key];
+  }
   // Paper rows carry no runtime state a live row needs, but a parked exit or
   // an abandoned buy keyed to a config whose paper rows just vanished has
   // nothing left to apply to.
@@ -602,6 +722,12 @@ export function resetPaper(configId?: string): { ok: boolean; message: string; c
     if (c.mode !== 'paper') continue;
     for (const key of [...pendingExits.keys()]) if (key.startsWith(`${c.id}:`)) pendingExits.delete(key);
     for (const key of [...staleBuys]) if (key.startsWith(`${c.id}:`)) staleBuys.delete(key);
+  }
+  // Every paper result gone: the bankroll starts over at its own start, with
+  // the SOL it started with (a new dollar price needs Settings' restart).
+  if (configId === undefined && bankroll.startedAt !== null) {
+    bankroll.startedAt = Date.now();
+    bankroll.realizedSol = 0;
   }
   persist();
   host?.changed();
@@ -693,6 +819,8 @@ function statsFor(c: CopyConfig): CopyStats {
     openCostSol: open.reduce((a, t) => a + t.ourSol * ((t.remainingPct ?? 100) / 100), 0),
     skipped: copies.filter((t) => t.state === 'skipped' && t.reason !== null && !t.reason.startsWith('limit')).length,
     blocked: copies.filter((t) => t.state === 'skipped' && t.reason?.startsWith('limit')).length,
+    skipRules: skipRulesFor(c),
+    hold: holdOf(c),
     firstAt: mine.length ? Math.min(...mine.map((t) => t.at)) : null,
     lastAt: mine.length ? Math.max(...mine.map((t) => t.at)) : null,
     unpriced: mine.filter((t) => t.kind === 'exit' && t.state === 'closed' && t.pnlBasis === 'pending').length,
@@ -739,12 +867,14 @@ export function snapshot(): CopySnapshot {
     liveBlockedReason: blocked,
     exitBlockedReason: host ? (host.exitBlockedReason ?? host.liveBlockedReason)() : null,
     liveOpen: liveOpenByConfig(),
+    paperBankroll: bankrollView(),
     watch,
     leaders: leaderStats,
     loadFailure,
     crowd,
     latency: copyLatency(recentTimings()),
     pnlByDay: pnlByDay(now),
+    bestCopy: bestCopy(),
   };
 }
 
@@ -755,6 +885,26 @@ function localDay(at: number): number {
   const d = new Date(at);
   d.setHours(0, 0, 0, 0);
   return Math.floor(d.getTime() / 86_400_000);
+}
+
+/** The best copy per mode: every priced closed slice summed by its copy. */
+function bestCopy(): NonNullable<CopySnapshot['bestCopy']> {
+  const out: NonNullable<CopySnapshot['bestCopy']> = { paper: null, live: null };
+  const sums: Record<CopyMode, Map<string, { pnlSol: number; symbol: string; mint: string; configId: string }>> = { paper: new Map(), live: new Map() };
+  // Scored like the tiles: each follow in its CURRENT mode only.
+  const modeOf = new Map(configs.map((c) => [c.id, c.mode]));
+  for (const t of trades) {
+    if (t.state !== 'closed' || t.pnlSol === null) continue;
+    if (modeOf.get(t.configId) !== t.mode) continue;
+    const key = t.parentId ?? t.id;
+    const cur = sums[t.mode].get(key) ?? { pnlSol: 0, symbol: t.symbol, mint: t.mint, configId: t.configId };
+    cur.pnlSol += t.pnlSol;
+    sums[t.mode].set(key, cur);
+  }
+  for (const mode of ['paper', 'live'] as const) {
+    for (const v of sums[mode].values()) if (!out[mode] || v.pnlSol > (out[mode]?.pnlSol ?? -Infinity)) out[mode] = v;
+  }
+  return out;
 }
 
 /** Realised result per day and mode, from every priced closed row. */
@@ -1061,7 +1211,10 @@ function limitHit(c: CopyConfig, mint?: string): string | null {
   // used four of the day's copies. Their realised losses DO count below.
   // Copies still in flight count: they are already spending.
   const used = today.filter((t) => t.kind !== 'exit').length + (pendingCopies.get(c.id) ?? 0);
-  if (used >= c.dailyTradeLimit) return `limit: ${c.dailyTradeLimit} copies today`;
+  if (used >= c.dailyTradeLimit) {
+    noteDailyTrades(c);
+    return `limit: ${c.dailyTradeLimit} copies today`;
+  }
   const cap = perMinuteCap(c);
   if (recentFor(c.id, now).length >= cap) return `limit: ${cap} copies per minute`;
   // A live exit whose fill has not been read yet counts at the model's
@@ -1079,8 +1232,96 @@ function limitHit(c: CopyConfig, mint?: string): string | null {
     return `paused — ${stopped}`;
   }
   const open = openCeilingHit(c, mint);
-  if (open) return open;
+  if (open) {
+    noteOpenCap(c);
+    return open;
+  }
   return null;
+}
+
+// ── Holds the user can see (2026-11-01) ───────────────────────────────
+//
+// "Follows just go quiet": a follow past its daily loss limit, out of the
+// day's copies, or held by the open-copies ceiling refused every buy with a
+// row in a shared activity list and nothing on its own card. `holdOf` is
+// what the card shows; the alerts say it once when it starts.
+
+function nextMidnight(): number {
+  const d = new Date();
+  d.setHours(24, 0, 0, 0);
+  return d.getTime();
+}
+
+/** What is holding this follow's new copies right now, or null. */
+function holdOf(c: CopyConfig): CopyHold | null {
+  if (!c.enabled) return null;
+  const today = todayFor(c);
+  const used = today.filter((t) => t.kind !== 'exit').length + (pendingCopies.get(c.id) ?? 0);
+  const realized = today.filter((t) => t.state === 'closed').reduce((a, t) => a + (t.pnlSol ?? t.estPnlSol ?? 0), 0);
+  if (realized <= -c.dailyLossLimitSol) {
+    return {
+      kind: 'daily-loss',
+      message: `Stopped for today — down ${Math.abs(realized).toFixed(3)} SOL, past its ${c.dailyLossLimitSol} SOL daily loss limit. Starts again at midnight; open copies are still managed.`,
+      until: nextMidnight(),
+    };
+  }
+  if (used >= c.dailyTradeLimit) {
+    return {
+      kind: 'daily-trades',
+      message: `Stopped for today — all ${c.dailyTradeLimit} of today's copies are used. Starts again at midnight; open copies are still managed.`,
+      until: nextMidnight(),
+    };
+  }
+  if (bankrollRunFor(c) !== null) {
+    const cash = paperCashSol();
+    // A fixed size says exactly what the next copy needs; a share of theirs
+    // does not, so it holds only once nothing at all is left.
+    const need = c.sizing === 'fixed' ? Math.min(c.sizeValue, c.maxTradeSol) : 0.001;
+    if (cash !== null && cash < need) {
+      return {
+        kind: 'paper-balance',
+        message: `Waiting — the paper balance is ${Math.max(0, cash).toFixed(3)} SOL, under this follow's ${c.sizing === 'fixed' ? `${need} SOL copy` : 'next copy'}. Copies start again when a paper copy sells, or start the bankroll over in Settings.`,
+        until: null,
+      };
+    }
+  }
+  const cap = host?.maxOpenCopies?.() ?? null;
+  if (cap !== null && cap > 0) {
+    const { keys, inFlight } = openPositions(c.mode);
+    if (keys.size + inFlight >= cap) {
+      return {
+        kind: 'open-cap',
+        message: `Waiting — ${cap} of ${cap} ${c.mode} copies are open across all follows (the max-open setting). New copies start again when one closes.`,
+        until: null,
+      };
+    }
+  }
+  return null;
+}
+
+/** The open ceiling started holding copies: said once per filling, not per
+ *  refused buy. It is app-wide, so one alert covers every follow it holds. */
+let openCapNotedAt = 0;
+const OPEN_CAP_NOTE_MS = 60 * 60_000;
+function noteOpenCap(c: CopyConfig): void {
+  const now = Date.now();
+  if (now - openCapNotedAt < OPEN_CAP_NOTE_MS) return;
+  openCapNotedAt = now;
+  const cap = host?.maxOpenCopies?.() ?? null;
+  alertUser(
+    'New copies are on hold',
+    `${cap ?? 'All'} ${c.mode} copies are open across all follows — the max-open setting. Every follow skips new buys until one closes; open copies are still managed. Raise Max open copies on the Wallet page if you want more at once.`,
+  );
+}
+
+/** The day's copies ran out: said once a day per follow, like the loss stop. */
+const dailyTradesNoted = new Map<string, number>();
+function noteDailyTrades(c: CopyConfig): void {
+  const day = startOfDay();
+  if (dailyTradesNoted.get(c.id) === day) return;
+  dailyTradesNoted.set(c.id, day);
+  const who = c.label || c.wallet.slice(0, 6);
+  alertUser(`Copying ${who} stopped for today`, `All ${c.dailyTradeLimit} of today's copies are used. It starts again at midnight; open copies are still managed.`);
 }
 
 // ── Guardrails across follows (2026-10-23) ────────────────────────────
@@ -1272,7 +1513,46 @@ function trimTrades(): void {
   if (drop.size) trades = trades.filter((t) => !drop.has(t.id));
 }
 
+// ── Skips by rule (2026-11-01) ────────────────────────────────────────
+//
+// `${configId}:${mode}` → rule key → how many, and the newest words. Kept
+// beside the rows rather than derived from them: the book is trimmed at
+// MAX_TRADES, skips first, and a follow that skipped 289 buys must still be
+// able to say which rule did it.
+type SkipTally = { count: number; lastReason: string; lastAt: number };
+let skipTallies: Record<string, Record<string, SkipTally>> = {};
+
+function noteSkip(t: CopyTrade): void {
+  if (t.state !== 'skipped' || t.kind === 'exit' || !t.reason) return;
+  const book = (skipTallies[`${t.configId}:${t.mode}`] ??= {});
+  const key = skipRuleOf(t.reason).key;
+  const cur = book[key] ?? { count: 0, lastReason: '', lastAt: 0 };
+  cur.count += 1;
+  if (t.at >= cur.lastAt) {
+    cur.lastReason = t.reason;
+    cur.lastAt = t.at;
+  }
+  book[key] = cur;
+}
+
+/** Counts from the rows themselves — for a book saved before the tallies. */
+function tallySkipsFromRows(): void {
+  skipTallies = {};
+  for (const t of [...trades].reverse()) noteSkip(t);
+}
+
+function skipRulesFor(c: CopyConfig): SkipRuleCount[] {
+  const book = skipTallies[`${c.id}:${c.mode}`] ?? {};
+  return Object.entries(book)
+    .map(([key, v]) => {
+      const rule = skipRuleOf(v.lastReason);
+      return { key, label: rule.key === key ? rule.label : key, limit: rule.limit, count: v.count, lastReason: v.lastReason, lastAt: v.lastAt };
+    })
+    .sort((a, b) => b.count - a.count || b.lastAt - a.lastAt);
+}
+
 function record(t: CopyTrade): void {
+  noteSkip(t);
   trades.unshift(t);
   trimTrades();
   persist();
@@ -1607,12 +1887,49 @@ export function noteUnreadableLeaderTx(wallet: string, signature: string): void 
   if (!ids.size) return;
   const open = trades.filter((t) => ids.has(t.configId) && t.mode === 'live' && t.state === 'open' && t.kind !== 'exit');
   if (!open.length) return;
+  // One alert per leader per window (2026-11-01): an RPC outage gives up
+  // reads by the hundred, and a toast per signature buried the app. The
+  // first is said at once; the rest of the window become one line.
+  const now = Date.now();
+  const w = unreadAlerts.get(wallet);
+  if (w && now - w.at < UNREAD_ALERT_WINDOW_MS) {
+    w.more += 1;
+    if (!w.timer) {
+      w.timer = setTimeout(() => flushUnreadAlert(wallet), Math.max(0, w.at + UNREAD_ALERT_WINDOW_MS - now));
+      w.timer.unref?.();
+    }
+    return;
+  }
+  unreadAlerts.set(wallet, { at: now, more: 0, timer: null });
   const c = configs.find((x) => ids.has(x.id));
   const who = c?.label || wallet.slice(0, 6);
   const coins = [...new Set(open.map((t) => t.symbol || t.mint.slice(0, 6)))].slice(0, 3).join(', ');
   alertUser(
     `${who}: a trade could not be read`,
     `Transaction ${signature.slice(0, 8)}… could not be read after retries, so it was not copied. If it was a sell, your live copy (${coins}) is still open — check it on Following.`,
+  );
+}
+
+const UNREAD_ALERT_WINDOW_MS = 10 * 60_000;
+const unreadAlerts = new Map<string, { at: number; more: number; timer: NodeJS.Timeout | null }>();
+
+function flushUnreadAlert(wallet: string): void {
+  const w = unreadAlerts.get(wallet);
+  if (!w) return;
+  w.timer = null;
+  const more = w.more;
+  w.more = 0;
+  w.at = Date.now();
+  if (!more) return;
+  const ids = new Set(configs.filter((c) => c.wallet === wallet).map((c) => c.id));
+  const open = trades.filter((t) => ids.has(t.configId) && t.mode === 'live' && t.state === 'open' && t.kind !== 'exit');
+  if (!open.length) return;
+  const c = configs.find((x) => ids.has(x.id));
+  const who = c?.label || wallet.slice(0, 6);
+  const coins = [...new Set(open.map((t) => t.symbol || t.mint.slice(0, 6)))].slice(0, 3).join(', ');
+  alertUser(
+    `${who}: ${more} more trades could not be read`,
+    `${more} more of their transactions could not be read in the last ${UNREAD_ALERT_WINDOW_MS / 60_000} minutes, so they were not copied. If one was a sell, your live copy (${coins}) is still open — check it on Following.`,
   );
 }
 
@@ -1763,7 +2080,9 @@ const exitChains = new Map<string, Promise<void>>();
 //      the remembered sell closes it immediately.
 
 /** `${configId}:${mint}` → the buy is between `evaluateBuy` and its record. */
-const buysInFlight = new Map<string, { since: number; submitted: boolean }>();
+/** `paperSol`: a bankroll-paid paper buy's size, held against the balance
+ *  until its row opens, so two buys in one slot cannot spend the same SOL. */
+const buysInFlight = new Map<string, { since: number; submitted: boolean; paperSol?: number }>();
 /** `${configId}:${mint}` → the leader sell that landed mid-buy, newest wins. */
 const pendingExits = new Map<string, WalletTrade>();
 /** `${configId}:${mint}` marked abandoned: the leader left before we sent. */
@@ -2190,6 +2509,58 @@ async function readWalletTokens(h: CopyHost, c: CopyConfig, mint: string): Promi
  * the old percentage path: wrong in a way the record has always described,
  * rather than wrong in a way it hides.
  */
+// ── Two follows, one coin, one wallet (2026-11-01) ───────────────────
+//
+// `exitChains` serialises the exits of ONE copy. Two follows that bought the
+// same coin into the same wallet each have their own chain, so when both
+// leaders sold within a second the two sells raced: each converted its token
+// count to a share of the SAME balance read and rounded that share up one
+// basis point. The first landed (37.23 %); the second asked for 62.78 % of a
+// balance that now held 62.77 %, and the venue refused it — "Overflow
+// (6024). You still hold it." (support bundle 2026-11-01, five coins).
+//
+// So the mirrored sells of one coin in one wallet go out one at a time, and a
+// sell that confirmed holds the turn until a balance read shows it (bounded),
+// so the next one sizes against what is really left — and, as the last
+// holder, comes out as "all of it".
+
+const walletSells = new Map<string, Promise<void>>();
+const SELL_SETTLE_MS = 4_000;
+const SELL_SETTLE_POLL_MS = 250;
+
+async function withWalletSell<R extends { ok: boolean }>(
+  c: CopyConfig,
+  mint: string,
+  knownBalance: bigint | null,
+  h: CopyHost,
+  send: () => Promise<R>,
+): Promise<R> {
+  const key = `${chainOf(c)}:${c.walletId ?? 'main'}:${mint}`;
+  const prev = walletSells.get(key);
+  let release!: () => void;
+  const turn = new Promise<void>((r) => (release = r));
+  const mine = (prev ?? Promise.resolve()).then(() => turn);
+  walletSells.set(key, mine);
+  try {
+    if (prev) await prev;
+    // Waited behind another sell: the balance the plan read is stale.
+    const before = prev ? ((await readWalletTokens(h, c, mint))?.raw ?? null) : knownBalance;
+    const res = await send();
+    if (res.ok && before !== null && before > 0n) {
+      const until = Date.now() + SELL_SETTLE_MS;
+      while (Date.now() < until) {
+        const now = await readWalletTokens(h, c, mint);
+        if (!now || now.raw !== before) break;
+        await new Promise((r) => setTimeout(r, SELL_SETTLE_POLL_MS));
+      }
+    }
+    return res;
+  } finally {
+    release();
+    if (walletSells.get(key) === mine) walletSells.delete(key);
+  }
+}
+
 /** Fill reads still running, by copy row id (noteBuyQuantity). */
 const quantityReads = new Map<string, Promise<void>>();
 /** How long an exit waits for its buy's fill read before sizing without it. */
@@ -2437,7 +2808,9 @@ function applyExit(
   const cost = x.ourSol * (slicePct / 100);
   const shareOfCopy = Math.max(0, Math.min(1, slicePct / 100));
   const modelled =
-    exit !== null && x.entryPriceSol !== null && x.entryPriceSol > 0 ? paperExitPnl(cost, shareOfCopy, x.entryPriceSol, exit, x.chain ?? 'solana') : null;
+    exit !== null && x.entryPriceSol !== null && x.entryPriceSol > 0
+      ? paperExitPnl(cost, shareOfCopy, x.entryPriceSol, exit, x.chain ?? 'solana', x.paperDepthSol ? { copySol: x.ourSol, depthSol: x.paperDepthSol } : null)
+      : null;
   // Paper is priced by the model. Live is priced from what the chain says
   // the sell returned (`priceLiveExit`), which is never known at this point:
   // until it is, the slice has no PnL and carries the model's estimate only
@@ -2483,6 +2856,7 @@ function applyExit(
   }
 
   if (pnl !== null) x.realizedSol = (x.realizedSol ?? 0) + pnl;
+  if (!live && pnl !== null && x.paperBank !== undefined && x.paperBank === bankroll.startedAt) bankroll.realizedSol += pnl;
   // A live row's mark is moved by the tape (markToMarket); its exit price
   // comes from the fill, set when the fill is read.
   if (exit !== null && !live) x.exitPriceSol = exit;
@@ -2662,12 +3036,14 @@ async function mirrorSell(
       break;
     }
 
-    const res = await h.sell(t.mint, plan.pct, {
-      slippagePct: c.maxSlippagePct,
-      walletId: c.walletId ?? undefined,
-      chain: chainOf(c),
-      tokensRaw: plan.wantRaw !== null ? plan.wantRaw.toString() : undefined,
-    });
+    const res = await withWalletSell(c, t.mint, plan.balanceRaw, h, () =>
+      h.sell(t.mint, plan.pct, {
+        slippagePct: c.maxSlippagePct,
+        walletId: c.walletId ?? undefined,
+        chain: chainOf(c),
+        tokensRaw: plan.wantRaw !== null ? plan.wantRaw.toString() : undefined,
+      }),
+    );
     if (!stillConfigured(c.id)) return out;
 
     if (!res.ok) {
@@ -3449,11 +3825,23 @@ async function evaluateBuy(c: CopyConfig, t: WalletTrade, extra: Partial<CopyTra
     record({ ...base, reason: limit });
     return;
   }
+  // The paper bankroll (2026-11-01): a copy the balance cannot cover is
+  // skipped, as a live one is when the wallet is short of SOL. Checked
+  // here, synchronously, with the buys already in flight counted.
+  const run = bankrollRunFor(c);
+  if (run !== null) {
+    const cash = paperCashSol();
+    if (cash !== null && base.ourSol > cash + 1e-9) {
+      record({ ...base, reason: `paper balance too low — ${Math.max(0, cash).toFixed(3)} SOL left, this copy is ${base.ourSol.toFixed(3)} SOL` });
+      return;
+    }
+    base.paperBank = run;
+  }
   // The slot is taken NOW, before the first await, so the next swap in this
   // same slot sees it (copy-1). Everything below runs inside the try.
   reserve(c, Date.now());
   const key = flightKey(c.id, t.mint);
-  buysInFlight.set(key, { since: Date.now(), submitted: false });
+  buysInFlight.set(key, { since: Date.now(), submitted: false, ...(run !== null ? { paperSol: base.ourSol } : {}) });
   try {
     await copyOnce(c, t, base, h);
   } finally {
@@ -3777,7 +4165,19 @@ async function copyOnce(c: CopyConfig, t: WalletTrade, base: CopyTrade, h: CopyH
     }
     const paperTiming = timingFor(null);
     clearAiQuiet(c.id, t.mint);
-    record({ ...base, state: 'open', entryPriceSol: entry, timing: paperTiming, paperModel: PAPER_MODEL });
+    // The pool this copy would have bought into (PAPER_MODEL 3): its depth
+    // prices the buy and the sells with impact, so a thin pool cannot hand
+    // paper a profit no real sell could take. Paper only — nothing live
+    // waits on these reads. Solana only: the depth floor is a pump curve's.
+    let depthSol: number | null = null;
+    if (chainOf(c) === 'solana') {
+      let liq = facts.liquidityUsd;
+      if (liq === null && !needsFacts(c)) liq = (await h.tokenFacts(t.mint, chainOf(c)).catch(() => null))?.liquidityUsd ?? null;
+      const solUsd = liq !== null ? ((await h.solUsd?.().catch(() => null)) ?? null) : null;
+      depthSol = paperDepthSol(liq, solUsd);
+      if (!stillConfigured(c.id)) return;
+    }
+    record({ ...base, state: 'open', entryPriceSol: entry, paperDepthSol: depthSol, timing: paperTiming, paperModel: PAPER_MODEL });
     h.log('info', `paper-${directionOf(c)} ${c.label || (isFomo(c) ? 'crowd' : c.wallet.slice(0, 6))}: ${base.ourSol} SOL of ${t.symbol}`);
     // Paper has no order, so the line stops at the checks — which is still
     // the whole detection half, and the half a tester can benchmark without
@@ -4838,6 +5238,7 @@ export function _reset(): void {
   configs = [];
   trades = [];
   leaders = {};
+  bankroll = defaultPaperBankroll();
   filePath = '';
   loadFailure = null;
   handled.clear();
@@ -4854,6 +5255,12 @@ export function _reset(): void {
   holdingCache.clear();
   recentCopies.clear();
   exitChains.clear();
+  walletSells.clear();
+  skipTallies = {};
+  openCapNotedAt = 0;
+  dailyTradesNoted.clear();
+  for (const w of unreadAlerts.values()) if (w.timer) clearTimeout(w.timer);
+  unreadAlerts.clear();
   flaggedLeftovers.clear();
   skewRing.length = 0;
   lastSwept.clear();

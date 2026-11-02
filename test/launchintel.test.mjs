@@ -21,7 +21,7 @@ import {
   summariseCreator,
   SNIPER_WINDOW_SLOTS,
 } from './.launchintel.mjs';
-import { normaliseTrade, parseSlot, parseCandles, rebucket, candlesSupported } from './.pumpswap.mjs';
+import { normaliseTrade, rowPriceSol, priceAt, launchTrades, recentTrades, _resetAnchors, _setPageSource, parseCandles, rebucket, candlesSupported } from './.pumpswap.mjs';
 
 let passed = 0;
 const cases = [];
@@ -187,52 +187,182 @@ test('pricing one cohort leaves the others untouched', () => {
   assert.equal(priced.snipers.heldPct, null);
 });
 
-// ── Provider normalisation ────────────────────────────────────────────
+// ── Provider normalisation (pump's coin tape, 2026-11-01) ─────────────
 
-test('the slot is the first 12 digits of slotIndexId', () => {
-  // Verified against getSlot on a live trade, 2026-08-24: delta 0.
-  assert.equal(parseSlot('0004415020890001520000'), 441502089);
-  assert.equal(parseSlot('short'), null);
-  assert.equal(parseSlot(undefined), null);
+const WSOL_ID = 'So11111111111111111111111111111111111111112';
+/** A tape row in the route's shape — this one is the live row from 2026-11-01. */
+const row = (over = {}) => ({
+  ordinalKey: '464319340-626-401-1793584802000',
+  blockId: '464319340',
+  blockTimeMs: 1793584802000,
+  txId: 'sig',
+  side: 'sell',
+  kind: 'swap',
+  venue: 'pump_amm',
+  trader: { address: 'wallet' },
+  baseAmount: { raw: '4695052546321', decimals: 6 },
+  quoteAmount: { raw: '240563168', decimals: 9 },
+  quote: { id: WSOL_ID },
+  priceQuote: '0.000000051480502591',
+  valueNative: '0.240563168',
+  ...over,
 });
 
-test('a malformed trade is dropped, not coerced', () => {
-  assert.equal(normaliseTrade({ slotIndexId: '0004415020890001520000', type: 'buy' }), null, 'no timestamp');
-  assert.equal(
-    normaliseTrade({ slotIndexId: 'x', timestamp: '2026-08-24T23:21:45.000Z', type: 'buy', userAddress: 'u', baseAmount: '1' }),
-    null,
-    'no slot',
-  );
-  assert.equal(
-    normaliseTrade({
-      slotIndexId: '0004415020890001520000',
-      timestamp: '2026-08-24T23:21:45.000Z',
-      type: 'transfer',
-      userAddress: 'u',
-      baseAmount: '1',
-    }),
-    null,
-    'not a swap',
-  );
+test('a malformed tape row is dropped, not coerced', () => {
+  assert.equal(normaliseTrade(row({ blockTimeMs: undefined })), null, 'no time');
+  assert.equal(normaliseTrade(row({ blockId: 'x' })), null, 'no slot');
+  assert.equal(normaliseTrade(row({ side: 'transfer' })), null, 'not a buy or sell');
+  assert.equal(normaliseTrade(row({ kind: 'perp_fill' })), null, 'not a swap');
+  assert.equal(normaliseTrade(row({ trader: null })), null, 'no trader');
+  assert.equal(normaliseTrade(row({ baseAmount: { raw: '-1', decimals: 6 } })), null, 'no token amount');
 });
 
-test('a well-formed trade normalises with the fields the analysis needs', () => {
-  const n = normaliseTrade({
-    slotIndexId: '0004415020890001520000',
-    tx: 'sig',
-    timestamp: '2026-08-24T23:21:45.000Z',
-    userAddress: 'wallet',
-    type: 'sell',
-    program: 'pump_amm',
-    amountSol: '-0.068',
-    baseAmount: '320649.50408',
-  });
-  assert.equal(n.slot, 441502089);
+test('a well-formed tape row normalises with the fields the analysis needs', () => {
+  const n = normaliseTrade(row());
+  assert.equal(n.slot, 464319340, 'blockId is the slot');
   assert.equal(n.isBuy, false);
   assert.equal(n.user, 'wallet');
-  assert.ok(Math.abs(n.base - 320649.50408) < 1e-6);
-  assert.equal(n.sol, 0.068, 'SOL is a magnitude — the direction is in isBuy');
-  assert.equal(n.ts, Date.parse('2026-08-24T23:21:45.000Z'));
+  assert.ok(Math.abs(n.base - 4695052.546321) < 1e-6, 'raw over decimals');
+  assert.equal(n.sol, 0.240563168, 'SOL from the quote leg on a SOL pair');
+  assert.equal(n.ts, 1793584802000);
+  assert.equal(n.program, 'pump_amm');
+  assert.equal(n.tx, 'sig');
+  assert.equal(normaliseTrade(row({ venue: 'pump' })).program, 'pump', 'the curve keeps the name the analysis uses');
+  // A row quoted in something else: pump's SOL value of it.
+  assert.equal(normaliseTrade(row({ quote: { id: 'USDC' }, valueNative: '1.5' })).sol, 1.5);
+  assert.equal(rowPriceSol(row()), 0.000000051480502591, "pump's price on a SOL pair");
+  assert.ok(Math.abs(rowPriceSol(row({ priceQuote: null })) - 0.240563168 / 4695052.546321) < 1e-18, 'else the average');
+});
+
+// ── Seeking the tape by slot ──────────────────────────────────────────
+//
+// A simulated tape that answers the way the route's table says it does:
+// `before` newest first below a slot, `after` oldest first from one, an
+// opaque cursor that carries on in the same direction. The chain's slot rate
+// CHANGES part-way (400 ms, then 213 ms — Alpenglow), so a seek cannot just
+// multiply.
+const SWITCH_SLOT = 400_000_000;
+const SWITCH_MS = 1_790_000_000_000;
+const msAt = (slot) => Math.floor((SWITCH_MS + (slot < SWITCH_SLOT ? (slot - SWITCH_SLOT) * 400 : (slot - SWITCH_SLOT) * 213)) / 1000) * 1000;
+// `by`: which half of a seek key the simulated server reads. The schema says
+// the slot leads; live (2026-11-01) it sought on the TIME, so every seek test
+// runs against both.
+function tape(slots, by = 'slot') {
+  const sorted = [...slots].sort((a, b) => a - b);
+  const rows = sorted.map((s, i) => row({ ordinalKey: `${s}-${i}-0-${msAt(s)}`, blockId: String(s), blockTimeMs: msAt(s), side: 'buy', priceQuote: String(s), txId: `t${i}` }));
+  const calls = [];
+  const fetch = async (path) => {
+    const q = new URL(path, 'https://x').searchParams;
+    calls.push(Object.fromEntries(q));
+    const limit = Number(q.get('limit') ?? 100);
+    // The first row at or past a slot — `after` reads from it, `before` stops short of it.
+    const at = (key) => {
+      const parts = key.split('-').map(Number);
+      const i = by === 'time' ? rows.findIndex((r) => r.blockTimeMs >= parts[3]) : rows.findIndex((r) => Number(r.blockId) >= parts[0]);
+      return i < 0 ? rows.length : i;
+    };
+    let dir;
+    let idx;
+    if (q.get('cursor')) ({ dir, idx } = JSON.parse(q.get('cursor')));
+    else if (q.get('after')) [dir, idx] = ['after', at(q.get('after'))];
+    else if (q.get('before')) [dir, idx] = ['before', at(q.get('before'))];
+    else [dir, idx] = ['before', rows.length];
+    let pick;
+    let next = null;
+    if (dir === 'after') {
+      pick = rows.slice(idx, idx + limit);
+      if (idx + limit < rows.length) next = { dir, idx: idx + limit };
+    } else {
+      const lo = Math.max(0, idx - limit);
+      pick = rows.slice(lo, idx).reverse();
+      if (lo > 0) next = { dir, idx: lo };
+    }
+    return { ok: true, message: 'ok', ms: 1, status: 200, data: { trades: pick, cursor: next ? JSON.stringify(next) : null } };
+  };
+  return { fetch, calls };
+}
+
+for (const by of ['slot', 'time']) {
+  test(`price at a moment: the newest trade before it, found from far away, in a few calls (seek by ${by})`, async () => {
+    // Known pairs a month off, on the other side of the rate change.
+    _resetAnchors([[SWITCH_SLOT + 12_000_000, msAt(SWITCH_SLOT + 12_000_000)]]);
+    const slots = Array.from({ length: 3000 }, (_, i) => SWITCH_SLOT - 500_000 + i * 37);
+    const tp = tape(slots, by);
+    _setPageSource(tp.fetch);
+    const target = SWITCH_SLOT - 450_000 + 5; // between two trades
+    const at = msAt(target);
+    const want = [...slots].reverse().find((s) => msAt(s) <= at);
+    const r = await priceAt('M', at);
+    assert.equal(r.price, want, `the newest trade at or before the moment (got ${r.price}, want ${want})`);
+    assert.ok(tp.calls.length <= 4, `${tp.calls.length} calls`);
+    // Now the map knows this stretch: the next moment nearby is one call.
+    const before = tp.calls.length;
+    const r2 = await priceAt('M', msAt(target + 900));
+    assert.equal(r2.price, [...slots].reverse().find((s) => msAt(s) <= msAt(target + 900)));
+    assert.equal(tp.calls.length - before, 1, 'one call once the stretch is known');
+    // Before the coin's first trade: no price, and not a failure.
+    const none = await priceAt('M', msAt(slots[0] - 10_000));
+    assert.equal(none.price, null);
+    assert.equal(none.failed, false);
+    _setPageSource(null);
+  });
+
+  test(`price at a moment on a busy coin: 30 s past the moment is pages of trades, so the seek narrows (seek by ${by})`, async () => {
+    // 40 trades in every slot: half a minute is ~5,600 trades, 56 pages.
+    _resetAnchors([[SWITCH_SLOT + 2_000_000, msAt(SWITCH_SLOT + 2_000_000)]]);
+    const base = SWITCH_SLOT + 1_000_000;
+    const slots = Array.from({ length: 2_000 * 40 }, (_, i) => base + Math.floor(i / 40));
+    const tp = tape(slots, by);
+    _setPageSource(tp.fetch);
+    const at = msAt(base + 1_000) + 500;
+    const want = [...slots].reverse().find((s) => msAt(s) <= at);
+    const r = await priceAt('M', at);
+    assert.equal(r.price, want, `the newest trade at or before the moment (got ${r.price}, want ${want})`);
+    assert.ok(tp.calls.length <= 4, `${tp.calls.length} calls`);
+    _setPageSource(null);
+  });
+
+  test(`launch read: trade #1 from a creation time, a busy launch paged, an unreachable one refused (seek by ${by})`, async () => {
+    _resetAnchors();
+    const created = SWITCH_SLOT + 3_000_000;
+    // 250 trades in the first 12 slots, then a quiet tail.
+    const slots = [...Array.from({ length: 250 }, (_, i) => created + Math.floor(i / 21)), ...Array.from({ length: 50 }, (_, i) => created + 1_000 + i * 50)];
+    const tp = tape(slots, by);
+    _setPageSource(tp.fetch);
+    const scan = await launchTrades('M', msAt(created));
+    assert.equal(scan.complete, true);
+    assert.equal(scan.trades[0].slot, created, 'the first row is trade #1');
+    assert.ok(scan.trades.length >= 250, `the busy launch was paged (${scan.trades.length})`);
+    assert.equal(new Set(scan.trades.map((t) => t.tx)).size, scan.trades.length, 'no row twice');
+    assert.ok(scan.calls <= 5, `${scan.calls} calls`);
+
+    // A coin whose first indexed trade is hours after creation: not a launch.
+    _resetAnchors();
+    _setPageSource(tape([created + 40_000, created + 40_100], by).fetch);
+    const far = await launchTrades('M', msAt(created));
+    assert.equal(far.complete, false);
+    assert.match(far.message, /does not reach/);
+
+    // Never traded.
+    _setPageSource(tape([], by).fetch);
+    const never = await launchTrades('M', msAt(created));
+    assert.deepEqual([never.complete, never.message], [true, 'no trades']);
+    _setPageSource(null);
+  });
+}
+
+test('recent trades: newest pages back to the cut-off, handed over oldest first', async () => {
+  _resetAnchors();
+  const slots = Array.from({ length: 250 }, (_, i) => SWITCH_SLOT + i * 10);
+  _setPageSource(tape(slots).fetch);
+  const since = msAt(SWITCH_SLOT + 1_000);
+  const r = await recentTrades('M', since, 3);
+  assert.equal(r.complete, true);
+  assert.equal(r.calls, 2);
+  assert.ok(r.trades.every((t) => t.ts >= since));
+  assert.ok(r.trades.every((t, i) => i === 0 || t.slot > r.trades[i - 1].slot), 'oldest first');
+  assert.equal(r.trades[r.trades.length - 1].slot, slots[slots.length - 1]);
+  _setPageSource(null);
 });
 
 // ── Creator track record ──────────────────────────────────────────────
@@ -368,6 +498,7 @@ test('odds create slot: earliest slot only when the scan reached the launch', ()
 
 // pump.fun's candle route (2026-10-01): rows as captured from
 // swap-api.pump.fun/v1/coins/{mint}/candles — ms timestamps, string numbers.
+// The current route (2026-11-01) names them openTimeMs and volumeUsd.
 test('pump candles: ms timestamps become seconds, strings become numbers, oldest first', () => {
   const rows = parseCandles([
     { timestamp: 1790896320000, open: '0.0000036617', high: '0.0000040', low: '0.0000030', close: '0.0000035', volume: '12.5' },
@@ -377,6 +508,11 @@ test('pump candles: ms timestamps become seconds, strings become numbers, oldest
   assert.equal(rows[0].time, 1790896260, 'seconds, oldest first');
   assert.ok(Math.abs(rows[0].open - 3.303073718443616e-6) < 1e-18, 'the long decimal string parses');
   assert.equal(rows[1].volume, 12.5);
+});
+
+test('pump candles: the current route\'s openTimeMs and volumeUsd read the same', () => {
+  const rows = parseCandles([{ openTimeMs: 1790896260000, open: '0.1', high: '0.2', low: '0.05', close: '0.15', volumeUsd: '42.5', trades: 3, final: true }]);
+  assert.deepEqual(rows, [{ time: 1790896260, open: 0.1, high: 0.2, low: 0.05, close: 0.15, volume: 42.5 }]);
 });
 
 test('pump candles: a row missing a price is dropped, never drawn as zero', () => {

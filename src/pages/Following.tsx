@@ -27,6 +27,7 @@ import {
   ownExitsOf,
   winRate,
   type CopyConfig,
+  type SkipRuleCount,
 } from '@shared/copytrade';
 import type { WalletSummary, WatchedWallet } from '@shared/types';
 import { useAppState } from '../state/AppStateProvider';
@@ -462,7 +463,7 @@ function FollowCard({
             <Fact label={`Won${closed ? ` (of ${closed})` : ''}`} value={wr === null ? DASH : `${Math.round(wr)}%`} />
             <Fact label="Open" value={String(st?.openCount ?? 0)} />
             <Fact label="Copies" value={String(st?.trades ?? 0)} />
-            <Fact label="Skipped" value={String((st?.skipped ?? 0) + (st?.blocked ?? 0))} hint="Refused by your filters or limits — see Activity for why" />
+            <Fact label="Skipped" value={String((st?.skipped ?? 0) + (st?.blocked ?? 0))} hint="Refused by your filters or limits — the rule behind each is listed below" />
             {(st?.unpriced ?? 0) > 0 && <Fact label="Awaiting fill" value={String(st.unpriced)} tone="text-warn" />}
           </div>
           )}
@@ -492,6 +493,13 @@ function FollowCard({
         </div>
       </div>
 
+      {!watchOnly && st?.hold && (
+        // Why the follow went quiet, on the follow itself (2026-11-01).
+        <p className="border-t border-white/[0.06] px-5 py-3 text-body text-warn" data-testid="follow-hold">
+          {st.hold.message}
+        </p>
+      )}
+      {!watchOnly && (st?.skipRules?.length ?? 0) > 0 && <SkipRules rules={st.skipRules ?? []} />}
       {chain === 'solana' && liveHeld > 0 && snap.exitBlockedReason && (
         <p className="border-t border-white/[0.06] px-5 py-3 text-body text-warn" data-testid="follow-exits-blocked">
           {`Exits are not selling: ${snap.exitBlockedReason}. ${liveHeld} live cop${liveHeld === 1 ? 'y is' : 'ies are'} open, and ${liveHeld === 1 ? 'its' : 'their'} stop-loss and exits wait until Live is back on. Sell from the Wallet page if you want out now.`}
@@ -503,6 +511,38 @@ function FollowCard({
             ? `${st.openCount} open cop${st.openCount === 1 ? 'y is' : 'ies are'} ordinary holdings in your wallet — sell from the Wallet page any time. They also close when this wallet sells, or when an exit rule fires.`
             : `${st?.openCount ?? open} open cop${(st?.openCount ?? open) === 1 ? 'y is' : 'ies are'} simulated — nothing was bought. They close when this wallet sells, or when an exit rule fires.`}
         </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Which rule skipped how many copies (2026-11-01). A crowd follow showed
+ * "289 blocked" and nothing on the page could say which filter did it.
+ * Collapsed to the top three; the newest reason of each is one hover away.
+ */
+function SkipRules({ rules }: { rules: SkipRuleCount[] }) {
+  const [all, setAll] = useState(false);
+  const total = rules.reduce((a, r) => a + r.count, 0);
+  const shown = all ? rules : rules.slice(0, 3);
+  return (
+    <div className="border-t border-white/[0.06] px-5 py-3" data-testid="follow-skip-rules">
+      <div className="mb-1.5 text-body font-medium text-krypt-muted">
+        Why {total} cop{total === 1 ? 'y was' : 'ies were'} skipped
+      </div>
+      <ul className="space-y-1">
+        {shown.map((r) => (
+          <li key={r.key} className="flex min-w-0 items-baseline gap-3 text-body" title={`Latest: ${r.lastReason}`}>
+            <span className="w-12 shrink-0 text-right tabular-nums text-white">{r.count}</span>
+            <span className={cls('shrink-0', r.limit ? 'text-warn' : 'text-white')}>{r.label}</span>
+            <span className="min-w-0 truncate text-note text-krypt-muted">{r.lastReason}</span>
+          </li>
+        ))}
+      </ul>
+      {rules.length > 3 && (
+        <button onClick={() => setAll((v) => !v)} className="mt-1.5 text-note text-krypt-muted hover:text-white">
+          {all ? 'Show fewer' : `Show all ${rules.length} rules`}
+        </button>
       )}
     </div>
   );

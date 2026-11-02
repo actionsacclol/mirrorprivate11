@@ -91,7 +91,8 @@ agree.
 The takes depend on the profile's state, so record them in this order from
 a set-up profile with **no follows and no key** (`instance.ps1 unfollow`:
 closes the instance, deletes `…Profiles\tutorial\copytrade.json` and any
-Helius key, starts it again): `api-keys`, `follow-settings` (makes the
+Helius key, starts it again): `api-keys`, `rpc-speed` (saves nothing: its made-up execution
+endpoint is typed and cleared, and Measure times the saved public endpoints), `follow-settings` (makes the
 follow the next take needs), `wallet-live` (generates the tutorial wallet),
 `ai-desk` (switches the AI connection on at Paper trading, gates that follow,
 then puts both back and fails its cleanup loudly if the gate stays on),

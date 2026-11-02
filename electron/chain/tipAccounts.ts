@@ -40,3 +40,11 @@ export const ALL_TIP_ACCOUNTS: ReadonlySet<string> = new Set([
   ...HELIUS_TIP_ACCOUNTS,
   ...JITO_TIP_ACCOUNTS,
 ]);
+
+/**
+ * Jito's "don't front-run me" marker (see electron/engine/dontFront.ts). Every
+ * buy the pump and PumpSwap builders make carries a ZERO-lamport transfer to
+ * it. The signer allows that transfer on a trade only when it moves nothing —
+ * one lamport to this address is refused like any unknown destination.
+ */
+export const JITO_DONT_FRONT = 'jitodontfront111111111111111111111111111111';

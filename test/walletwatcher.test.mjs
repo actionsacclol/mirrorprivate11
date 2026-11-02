@@ -334,6 +334,7 @@ const notification = (sub, sig) =>
     return { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ jsonrpc: '2.0', result: null }) };
   };
   watcher._reset();
+  watcher._setReadClocks({ summaryMs: 50 });
   watcher.attach({ wssUrl: () => s.url, httpUrl: () => 'https://rpc.test/', onSwap: (ev) => swaps.push(ev), log: (level, line) => logs.push(line) });
   watcher.setWallets([W1]);
   assert.ok(await waitFor(() => watcher.status()[W1]?.state === 'watching'));
@@ -670,6 +671,169 @@ async function twoHosts({ refuseTx = false, refuseParsed = false } = {}) {
   watcher._reset();
   await h.close();
   console.log('ok  a key that refuses transactionSubscribe moves followed wallets to Parsed Streams');
+}
+
+// ── The read storm (support bundle 2026-11-01) ───────────────────────────
+//
+// 34,653 "could not read … timeout" lines, 30,066 for ONE leader, 448 trades
+// not copied. Every notification ran its own read loop, so an outage turned
+// into thousands of concurrent reads; and the "one more round" set evicted
+// signatures before their second round, so the same batch was re-chased every
+// ~3 minutes forever. These pin the queue that replaced it.
+
+/** A socket that acks logsSubscribe per wallet and remembers the ids. */
+async function leaderSocket() {
+  let subId = 2000;
+  const ids = new Map();
+  let sock = null;
+  const s = await server((ws) => {
+    sock = ws;
+    ws.on('message', (raw) => {
+      const req = JSON.parse(String(raw));
+      if (req.method !== 'logsSubscribe') return;
+      const id = ++subId;
+      ids.set(req.params[0].mentions[0], id);
+      ws.send(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: id }));
+    });
+  });
+  return { s, ids, send: (wallet, sig) => sock.send(notification(ids.get(wallet), sig)) };
+}
+
+const sigOf = (init) => {
+  try {
+    const body = JSON.parse(String(init?.body ?? '{}'));
+    return (Array.isArray(body) ? body[0] : body)?.params?.[0] ?? null;
+  } catch {
+    return null;
+  }
+};
+
+// An outage: bounded concurrency, a pause with a probe, nothing given up
+// while it lasts, everything read when it ends, and no loop afterwards.
+{
+  const { s, send } = await leaderSocket();
+  const per = new Map();
+  let inFlight = 0;
+  let most = 0;
+  let down = true;
+  let total = 0;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => {
+    if (rpcMethodOf(init) === 'getSignaturesForAddress') return { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ jsonrpc: '2.0', result: [] }) };
+    const sig = sigOf(init);
+    per.set(sig, (per.get(sig) ?? 0) + 1);
+    total += 1;
+    inFlight += 1;
+    most = Math.max(most, inFlight);
+    try {
+      await sleep(15);
+      if (down) throw new Error('The operation was aborted due to timeout');
+      return { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ jsonrpc: '2.0', result: BUY_TX }) };
+    } finally {
+      inFlight -= 1;
+    }
+  };
+  const swaps = [];
+  const logs = [];
+  const unreadable = [];
+  watcher._reset();
+  watcher._setReadClocks({ rereadMs: 200, probeMs: 100, summaryMs: 50 });
+  watcher.attach({
+    wssUrl: () => s.url,
+    httpUrl: () => 'https://down.test/',
+    onSwap: (ev) => swaps.push(ev),
+    onUnreadable: (w, sig) => unreadable.push(sig),
+    log: (level, line) => logs.push(line),
+  });
+  watcher.setWallets([W1]);
+  assert.ok(await waitFor(() => watcher.status()[W1]?.state === 'watching'));
+  for (let i = 0; i < 100; i++) send(W1, `storm${i}`);
+  assert.ok(await waitFor(() => logs.some((l) => /pausing reads/.test(l)), 5000), `the outage is noticed: ${JSON.stringify(logs.slice(0, 3))}`);
+  assert.ok(most <= 6, `never more than six reads at once (saw ${most})`);
+  // While it lasts: one probe per 100 ms, not a hundred loops.
+  const before = total;
+  await sleep(1000);
+  assert.ok(total - before <= 15, `a paused queue probes, it does not hammer (${total - before} reads in 1 s)`);
+  assert.equal(unreadable.length, 0, 'and nothing is given up while the endpoint is down');
+  down = false;
+  assert.ok(await waitFor(() => swaps.length === 100, 15000), `every trade is read once the RPC answers (${swaps.length}/100)`);
+  assert.ok(logs.some((l) => /answering again/.test(l)), 'and the recovery is said');
+  const hot = [...per.values()].filter((n) => n > 6).length;
+  assert.ok(hot <= 1, `only the probe signature was asked repeatedly (${hot} signatures read more than 6 times)`);
+  const settled = total;
+  await sleep(800);
+  assert.equal(total, settled, 'nothing is read again afterwards — no loop');
+  globalThis.fetch = realFetch;
+  watcher._reset();
+  await s.close();
+  console.log('ok  an RPC outage pauses reads behind one probe, gives nothing up, reads everything after, and never loops');
+}
+
+// A refused read gets exactly one more round — the round is on the job, so
+// no cap or eviction can turn it into a third.
+{
+  const { s, send } = await leaderSocket();
+  const per = new Map();
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => {
+    if (rpcMethodOf(init) === 'getSignaturesForAddress') return { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ jsonrpc: '2.0', result: [] }) };
+    const sig = sigOf(init);
+    per.set(sig, (per.get(sig) ?? 0) + 1);
+    // Refuse only this one; everything else is served, so no outage.
+    if (sig === 'stubborn') throw new Error('The operation was aborted due to timeout');
+    return { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ jsonrpc: '2.0', result: BUY_TX }) };
+  };
+  const logs = [];
+  const unreadable = [];
+  watcher._reset();
+  watcher._setReadClocks({ rereadMs: 150, probeMs: 100, summaryMs: 50 });
+  watcher.attach({ wssUrl: () => s.url, httpUrl: () => 'https://rpc.test/', onSwap: () => {}, onUnreadable: (w, sig) => unreadable.push(sig), log: (level, line) => logs.push(line) });
+  watcher.setWallets([W1]);
+  assert.ok(await waitFor(() => watcher.status()[W1]?.state === 'watching'));
+  send(W1, 'stubborn');
+  for (let i = 0; i < 20; i++) send(W1, `fine${i}`);
+  assert.ok(await waitFor(() => unreadable.includes('stubborn'), 10000), 'given up after its second round');
+  const reads = per.get('stubborn');
+  await sleep(600);
+  assert.equal(per.get('stubborn'), reads, 'and never asked for again');
+  assert.ok(reads <= 6, `two rounds of at most three refusals (${reads} reads)`);
+  watcher.flushReadSummary();
+  const lines = logs.filter((l) => /could not read/.test(l));
+  assert.ok(lines.length <= 2, `summarised, not a line per attempt: ${JSON.stringify(lines)}`);
+  assert.ok(lines.some((l) => /not copied/.test(l)), 'and the give-up says the trade was not copied');
+  globalThis.fetch = realFetch;
+  watcher._reset();
+  await s.close();
+  console.log('ok  a refused read gets exactly one more round, then one summary line — never a third');
+}
+
+// One busy leader cannot starve another.
+{
+  const { s, send } = await leaderSocket();
+  const W2 = 'Whae2222222222222222222222222222222222222';
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => {
+    if (rpcMethodOf(init) === 'getSignaturesForAddress') return { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ jsonrpc: '2.0', result: [] }) };
+    await sleep(60);
+    // The quiet leader's own buy: the same shape, signed by W2.
+    const tx = sigOf(init) === 'quiet1' ? JSON.parse(JSON.stringify(BUY_TX).split(W1).join(W2)) : BUY_TX;
+    return { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ jsonrpc: '2.0', result: tx }) };
+  };
+  const order = [];
+  watcher._reset();
+  watcher.attach({ wssUrl: () => s.url, httpUrl: () => 'https://rpc.test/', onSwap: (ev) => order.push(ev.signature), log: () => {} });
+  watcher.setWallets([W1, W2]);
+  assert.ok(await waitFor(() => watcher.status()[W1]?.state === 'watching' && watcher.status()[W2]?.state === 'watching'));
+  for (let i = 0; i < 60; i++) send(W1, `busy${i}`);
+  await sleep(30);
+  send(W2, 'quiet1');
+  assert.ok(await waitFor(() => order.includes('quiet1'), 5000), 'the quiet leader is read');
+  const at = order.indexOf('quiet1');
+  assert.ok(at < 10, `within the first few reads, not after the busy leader's backlog (position ${at})`);
+  globalThis.fetch = realFetch;
+  watcher._reset();
+  await s.close();
+  console.log('ok  a busy leader fills only its own queue — a quiet leader is still read at once');
 }
 
 console.log('\nwalletwatcher: all tests passed');

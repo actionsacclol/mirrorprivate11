@@ -455,6 +455,23 @@ export interface CopyStats {
   skipped: number;
   /** Skipped because a limit was hit. */
   blocked: number;
+  /**
+   * Every skipped copy in this mode, counted by the rule that refused it
+   * (2026-11-01), most first. A user's crowd follow showed "289 blocked"
+   * and nothing could say which rule did it: the rows that said why were in
+   * an activity list shared by every follow and trimmed at 2,000. These
+   * counts are kept apart from the rows, so the trim cannot erase them.
+   * Absent on older snapshots.
+   */
+  skipRules?: SkipRuleCount[];
+  /**
+   * Why this follow is not taking new copies right now, when a limit holds
+   * it (2026-11-01). A follow past its daily loss limit, out of the day's
+   * copies, or held by the app-wide open-copies ceiling used to just go
+   * quiet. Null when it is taking copies (or switched off — a pause has
+   * its own `pausedReason`). Absent on older snapshots.
+   */
+  hold?: CopyHold | null;
   firstAt: number | null;
   lastAt: number | null;
   /**
@@ -491,6 +508,10 @@ export interface CopyTrade {
   /** What we did (or would have done). */
   ourSol: number;
   entryPriceSol: number | null;
+  /** Paper: the pool's SOL side when the copy opened (PAPER_MODEL 3), which
+   *  prices the copy's buy and sells with impact. Absent on older rows,
+   *  which keep the model they were recorded under. */
+  paperDepthSol?: number | null;
   exitPriceSol: number | null;
   closedAt: number | null;
   pnlSol: number | null;
@@ -525,6 +546,9 @@ export interface CopyTrade {
   leaderPct?: number;
   /** Copy: how much of it is still held, 0–100. Absent = all of it. */
   remainingPct?: number;
+  /** Paper: the bankroll run this copy was paid from — its `startedAt`
+   *  (2026-11-01). Absent = bought with no bankroll on, or before a restart. */
+  paperBank?: number;
   /** Copy: realised across its exits so far, SOL. */
   realizedSol?: number;
   /** Transaction of a live fill, when there was one. */
@@ -698,6 +722,54 @@ export interface CopyWatchStatus {
   feed?: 'logs' | 'tx' | 'parsed';
 }
 
+// ── The paper bankroll (2026-11-01) ───────────────────────────────────
+//
+// Paper used to have no balance: every copy spent its size out of nothing,
+// so a paper run never ran out, never had to choose, and never felt like a
+// wallet. With the bankroll on, Solana paper copies draw from a fixed
+// amount set in dollars (100 by default), converted to SOL once when the
+// run starts — a live wallet holds SOL, so its dollar value moves with SOL
+// the same way. A buy takes its size out; each sell puts back the cost of
+// the share sold plus its result, fees included; a copy the balance cannot
+// cover is skipped and says so, as a live one would be for want of SOL.
+//
+// The balance is never stored as a running total of the cash itself: it is
+// the start, plus every realised paper result booked under this run, minus
+// what the run's open copies still hold. Open rows are never trimmed, and
+// the realised sum is kept apart from the rows, so trimming old history
+// cannot move it.
+
+export const PAPER_BANKROLL_DEFAULT_USD = 100;
+export const PAPER_BANKROLL_MIN_USD = 1;
+export const PAPER_BANKROLL_MAX_USD = 10_000_000;
+
+export interface PaperBankroll {
+  enabled: boolean;
+  /** What the run starts with, in US dollars. */
+  usd: number;
+  /** The dollars in SOL at the price when the run started. Null = never started. */
+  startSol: number | null;
+  /** When this run started; rows paid from it carry it as `paperBank`. */
+  startedAt: number | null;
+  /** The SOL price in USD the run started at. */
+  startSolUsd: number | null;
+  /** Every realised paper result booked under this run, SOL, fees included. */
+  realizedSol: number;
+}
+
+export interface PaperBankrollView extends PaperBankroll {
+  /** Cost still held in this run's open paper copies, SOL (buys in flight included). */
+  heldSol: number;
+  /** Open paper copies paid from this run. */
+  openCopies: number;
+  /** What is free to spend: start + realised − held. Null when not started. */
+  cashSol: number | null;
+}
+
+export function defaultPaperBankroll(): PaperBankroll {
+  return { enabled: false, usd: PAPER_BANKROLL_DEFAULT_USD, startSol: null, startedAt: null, startSolUsd: null, realizedSol: 0 };
+}
+
 export interface CopySnapshot {
   configs: CopyConfig[];
   stats: Record<string, CopyStats>;
@@ -715,6 +787,9 @@ export interface CopySnapshot {
   exitBlockedReason?: string | null;
   /** Open LIVE copies per follow id, whatever the follow's mode is now. */
   liveOpen?: Record<string, number>;
+  /** The paper bankroll and where it stands (2026-11-01). Absent on older
+   *  snapshots. */
+  paperBankroll?: PaperBankrollView;
   /** Per followed wallet: is it being watched, and when was it last seen. */
   watch: Record<string, CopyWatchStatus>;
   /** Per followed wallet: THEIR record, from every swap seen (below). */
@@ -739,6 +814,13 @@ export interface CopySnapshot {
    * oldest first, the last 60 days.
    */
   pnlByDay?: Record<CopyMode, Array<{ day: number; pnl: number; closed: number }>>;
+  /**
+   * The single best copy per mode, its slices summed (2026-11-01). A user's
+   * paper book read +54 SOL at a 38 % win rate, carried by one copy; the
+   * Home tile now says how much of the total that one copy is. Null when
+   * nothing priced has closed. Absent on older snapshots.
+   */
+  bestCopy?: Record<CopyMode, { pnlSol: number; symbol: string; mint: string; configId: string } | null>;
 }
 
 // ── The leader's own record ───────────────────────────────────────────
@@ -1276,7 +1358,7 @@ export function describeConfig(c: CopyConfig): string {
 // charges. Rows carry `paperModel` so an older record is never silently
 // compared with a newer one.
 
-export const PAPER_MODEL = 2;
+export const PAPER_MODEL = 3;
 /** pump.fun's curve fee per side, tiered at ~1.25 % — the venue most copies
  *  land on. PumpSwap and the routed DEXes charge less; paper does not get
  *  the benefit of the doubt. */
@@ -1303,10 +1385,163 @@ export function paperFixedCost(chain: ChainKind = 'solana', side: 'buy' | 'sell'
  * copy sold in three goes pays it once), and the sell's fixed fee is charged
  * in full on every slice: each slice IS a sell transaction.
  */
-export function paperExitPnl(cost: number, shareOfCopy: number, entry: number, exit: number, chain: ChainKind = 'solana'): number {
+export function paperExitPnl(
+  cost: number,
+  shareOfCopy: number,
+  entry: number,
+  exit: number,
+  chain: ChainKind = 'solana',
+  impact?: PaperImpact | null,
+): number {
   const s = paperSideCost(chain);
   const share = Math.max(0, Math.min(1, shareOfCopy));
-  return cost * ((exit / entry) * (1 - s) - (1 + s)) - paperFixedCost(chain, 'buy') * share - paperFixedCost(chain, 'sell');
+  const fixed = paperFixedCost(chain, 'buy') * share + paperFixedCost(chain, 'sell');
+  if (!impact || !(impact.depthSol > 0)) return cost * ((exit / entry) * (1 - s) - (1 + s)) - fixed;
+  // The tokens this slice holds were bought at the impacted price; what they
+  // are worth at the exit's spot is sold into a pool that has moved with it.
+  const paid = entry * buyImpactFactor(impact.copySol, impact.depthSol);
+  const atSpot = cost * (exit / paid);
+  const got = atSpot * sellImpactFactor(atSpot, impact.depthSol, entry, exit);
+  return got * (1 - s) - cost * (1 + s) - fixed;
+}
+
+// ── Price impact (PAPER_MODEL 3, 2026-11-01) ──────────────────────────
+//
+// Paper used to fill every size at the quoted price, both ways. On a thin
+// pool that is the whole lie: a user's paper book showed +54 SOL at a 38 %
+// win rate, carried by a few copies marked up 50–130x on pools a real sell
+// of that bag would have emptied. Both sides are now priced as a constant-
+// product pool would fill them — the shape of the pump curve (on virtual
+// reserves) and of PumpSwap/Raydium pools alike:
+//
+//   • a buy of s SOL into a pool holding R SOL pays spot × (1 + s/R);
+//   • a pool's SOL side grows with the square root of its price (x·y = k),
+//     so at the exit the pool holds R × √(exit/entry);
+//   • a bag worth V at spot sells for V × R' / (R' + V).
+//
+// R comes from the token's reported liquidity at the copy (half of it is
+// the SOL side). Unknown, it is the pump curve's 30 SOL virtual reserve —
+// the floor of the venue most copies meet. The live result is still the
+// truth; this only stops paper from being cheaper than reality.
+
+/** The SOL side of a fresh pump curve — the depth used when none is known. */
+export const PAPER_DEFAULT_DEPTH_SOL = 30;
+
+/** What a paper copy knew about the pool when it was opened. */
+export interface PaperImpact {
+  /** The whole copy's buy, SOL (the impact is paid once, on the buy). */
+  copySol: number;
+  /** The pool's SOL side at the copy, SOL. */
+  depthSol: number;
+}
+
+/** The pool's SOL side from a reported USD liquidity, or the curve floor. */
+export function paperDepthSol(liquidityUsd: number | null | undefined, solUsd: number | null | undefined): number {
+  if (typeof liquidityUsd === 'number' && liquidityUsd > 0 && typeof solUsd === 'number' && solUsd > 0) {
+    return Math.max(1, liquidityUsd / 2 / solUsd);
+  }
+  return PAPER_DEFAULT_DEPTH_SOL;
+}
+
+/** Average price paid over spot for a buy of `sol` into `depthSol`. */
+export function buyImpactFactor(sol: number, depthSol: number): number {
+  if (!(sol > 0) || !(depthSol > 0)) return 1;
+  return 1 + sol / depthSol;
+}
+
+/** Share of a bag's spot value a sell actually returns, the pool having
+ *  moved from `entry` to `exit` since the copy. */
+export function sellImpactFactor(valueSol: number, depthSol: number, entry: number, exit: number): number {
+  if (!(valueSol > 0) || !(depthSol > 0) || !(entry > 0) || !(exit > 0)) return 1;
+  const depthAtExit = depthSol * Math.sqrt(exit / entry);
+  return depthAtExit / (depthAtExit + valueSol);
+}
+
+/**
+ * A whole copy's return under the paper model, % — fees, fixed costs and
+ * impact both ways. The backtest prices a replayed copy with this, so a
+ * replay and a paper book of the same trades say the same thing.
+ */
+export function paperCopyReturnPct(
+  sizeSol: number,
+  entry: number,
+  exit: number,
+  depthSol: number | null,
+  chain: ChainKind = 'solana',
+): number | null {
+  if (!(sizeSol > 0) || !(entry > 0) || !(exit > 0)) return null;
+  const impact = depthSol !== null && depthSol > 0 ? { copySol: sizeSol, depthSol } : null;
+  const pnl = paperExitPnl(sizeSol, 1, entry, exit, chain, impact);
+  return Number.isFinite(pnl) ? (pnl / sizeSol) * 100 : null;
+}
+
+// ── Why a copy was skipped, by rule (2026-11-01) ──────────────────────
+
+/** A limit holding a follow's new copies (CopyStats.hold). */
+export interface CopyHold {
+  kind: 'daily-loss' | 'daily-trades' | 'open-cap' | 'paper-balance';
+  /** One sentence for the follow's card. */
+  message: string;
+  /** When it lifts by itself (local midnight), or null when it lifts when
+   *  something else happens (a copy closing, for the open ceiling). */
+  until: number | null;
+}
+
+/** One rule's share of a follow's skipped copies. */
+export interface SkipRuleCount {
+  key: string;
+  /** The rule in the words of the follow's settings page. */
+  label: string;
+  /** A limit (counted under `blocked`) rather than a filter. */
+  limit: boolean;
+  count: number;
+  /** The newest reason this rule gave, verbatim. */
+  lastReason: string;
+  lastAt: number;
+}
+
+/**
+ * The rule behind a skip reason. The reasons are written by the copier
+ * (electron/engine/copyTrade.ts); every one it can write maps to a named
+ * rule here, and the test pins that. Anything new falls to "other" with
+ * its words kept, never to a wrong rule.
+ */
+const SKIP_RULES: ReadonlyArray<readonly [RegExp, string, string, boolean]> = [
+  [/^limit: \d+ copies today/, 'daily-trades', 'Daily copy limit', true],
+  [/^limit: \d+ copies per minute/, 'per-minute', 'Copies-per-minute limit', true],
+  [/^limit: down .* SOL today/, 'daily-loss', 'Daily loss limit', true],
+  [/^limit: \d+ copies open across all follows/, 'open-cap', 'Max open copies (all follows)', true],
+  [/^limit:/, 'limit-other', 'Another limit', true],
+  [/^paused — /, 'paused', 'Follow paused (loss stop)', true],
+  [/^their trade of .* under your .* minimum/, 'their-min', 'Their trade under your minimum', false],
+  [/^their trade of .* over your .* maximum/, 'their-max', 'Their trade over your maximum', false],
+  [/^outside your trading hours/, 'hours', 'Trading hours', false],
+  [/one position per coin/, 'one-per-coin', 'One position per coin', false],
+  [/unknown — the filter you set could not be checked/, 'filter-unknown', 'A filter could not be checked', false],
+  [/^could not read token/, 'token-unreadable', 'Coin data unavailable', false],
+  [/^not a pump\.fun token/, 'pump-only', 'pump.fun coins only', false],
+  [/^liquidity below/, 'liquidity', 'Minimum liquidity', false],
+  [/^market cap above/, 'mcap-max', 'Maximum market cap', false],
+  [/^market cap below/, 'mcap-min', 'Minimum market cap', false],
+  [/^score .* below/, 'score', 'Minimum Krypt score', false],
+  [/old — under your .* minimum/, 'age-min', 'Minimum coin age', false],
+  [/old — over your .* maximum/, 'age-max', 'Maximum coin age', false],
+  [/blocklist/, 'blocklist', 'Blocklist', false],
+  [/^no price at copy time/, 'no-price', 'No price when copying', false],
+  [/they had already .* before this .* was sent|too old to copy|old by the time this copy could be sent/, 'too-late', 'Too late to copy', false],
+  [/above your live cap of/, 'live-cap', 'Live size cap', true],
+  [/under the smallest live copy/, 'live-min', 'Under the smallest live copy', false],
+  [/moving from pump.s curve to PumpSwap/, 'migrating', 'Coin was migrating', false],
+  [/switched to (paper|live) while this copy waited|while this copy waited/, 'changed', 'Follow changed while waiting', false],
+  [/^paper balance too low/, 'paper-balance', 'Paper balance too low', true],
+  [/^not executed — /, 'not-executed', 'Could not execute', false],
+];
+
+/** The rule a skip reason belongs to. */
+export function skipRuleOf(reason: string | null | undefined): { key: string; label: string; limit: boolean } {
+  const r = (reason ?? '').trim();
+  for (const [re, key, label, limit] of SKIP_RULES) if (re.test(r)) return { key, label, limit };
+  return { key: 'other', label: 'Other', limit: false };
 }
 
 /** Win rate, or null when nothing has closed yet. */

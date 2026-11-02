@@ -95,6 +95,22 @@ export function HomePage() {
     return out;
   }, [snap]);
 
+  // One lucky copy can carry a whole book (a user's paper read +54 SOL at a
+  // 38 % win rate). When the best copy is a large share of a positive
+  // total, say so, and what the rest made (2026-11-01).
+  const bestNote = (mode: 'paper' | 'live') => {
+    const best = snap?.bestCopy?.[mode] ?? null;
+    const t = totals[mode];
+    if (!best || t.closed < 2 || !(t.pnl > 0) || !(best.pnlSol > 0) || best.pnlSol < t.pnl * 0.25) return null;
+    const share = Math.round((best.pnlSol / t.pnl) * 100);
+    return (
+      <div className="text-note text-warn" data-testid={`home-${mode}-best`}>
+        {share >= 100 ? 'More than all' : `${share}%`} of it is one copy ({best.symbol || best.mint.slice(0, 6)}, {fmtAmt(best.pnlSol, { signed: true, unit: 'SOL' })}). Without it:{' '}
+        {fmtAmt(t.pnl - best.pnlSol, { signed: true, unit: 'SOL' })}.
+      </div>
+    );
+  };
+
   const series = useMemo(() => {
     const days = snap?.pnlByDay?.[mode] ?? [];
     let run = 0;
@@ -218,7 +234,9 @@ export function HomePage() {
             sub={totals.paper.closed ? `${totals.paper.closed} closed · ${Math.round((totals.paper.wins / totals.paper.closed) * 100)}% won` : 'Nothing closed yet'}
             onClick={() => nav.go('activity')}
             testId="home-paper"
-          />
+          >
+            {bestNote('paper')}
+          </StatTile>
           <StatTile
             label="Live result"
             value={totals.live.closed ? fmtAmt(totals.live.pnl, { signed: true, unit: 'SOL' }) : DASH}
@@ -231,7 +249,9 @@ export function HomePage() {
                   : 'No live follows'
             }
             onClick={() => nav.go('activity')}
-          />
+          >
+            {bestNote('live')}
+          </StatTile>
           <StatTile label="Open copies" value={String(totals.paper.open + totals.live.open)} sub={`${totals.paper.open} paper · ${totals.live.open} live`} onClick={() => nav.go('activity', { activityTab: 'positions' })} />
           <StatTile
             label="Following"

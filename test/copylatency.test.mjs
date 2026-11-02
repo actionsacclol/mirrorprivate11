@@ -124,7 +124,9 @@ const src = (p) => fs.readFileSync(new URL(p, import.meta.url), 'utf8').replace(
   // can be minutes old through no fault of the delivery path, and timing it
   // would make the feed look far worse than it is.
   const ww = src('../electron/engine/walletWatcher.ts');
-  assert.match(ww, /detectMs: recovered \|\| tradeAt === null \? null :/, 'a recovered trade is not timed');
+  // A read held for a second round (the read queue, 2026-11-01) is just as late.
+  assert.match(ww, /const late = recovered \|\| job\.round > 1;/, 'a recovered or re-read trade is late');
+  assert.match(ww, /detectMs: late \|\| tradeAt === null \? null :/, 'a recovered trade is not timed');
   // The read-back is measured from before the FIRST attempt, so the backoff
   // between retries is inside the number rather than hidden between them.
   const readStart = ww.indexOf('const readStart = Date.now()');

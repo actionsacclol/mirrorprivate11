@@ -14,6 +14,7 @@ import os from 'node:os';
 import path from 'node:path';
 import * as copy from './.copytrade.mjs';
 import { crowdNoun, describeConfig, COPY_LATENCY_FLOOR_MS, FOMO_WALLET, MIN_TRIPS_FOR_RANK, SIMPLE_MAX_SOL, SIMPLE_SIZES, TOO_FAST_FLAG_PCT, chainForAddress, cleanBlocklist, copySize, defaultConfig, emptyLeaderStats, isBlocked, leaderTooFast, leaderWinRate, ownExitsOf, rankLeaders, simpleConfig, validateConfig, winRate, followConfig, minLeaderFor, FOLLOW_PCTS, FOLLOW_MAX_SOL, MIN_LIVE_COPY_SOL, activeWindowOf, inActiveWindow, fmtClock, isWatch, localMinuteOfDay } from './.copyshared.mjs';
+import { skipRuleOf, paperExitPnl, buyImpactFactor, sellImpactFactor, paperDepthSol, paperCopyReturnPct } from './.copyshared.mjs';
 
 let passed = 0;
 const cases = [];
@@ -74,6 +75,11 @@ function makeHost(over = {}) {
   // The optional methods exist only when a test asks for them — the module
   // must work against a host that implements none of them.
   if (over.ourCostBasisSol !== undefined) host.ourCostBasisSol = () => over.ourCostBasisSol;
+  // Paper prices impact from the pool's depth in SOL (PAPER_MODEL 3). By
+  // default the test pool is so deep (a near-zero SOL price makes $50k of
+  // liquidity billions of SOL) that impact is nil, so the tests that pin
+  // fees to 1e-9 keep pinning fees; the impact tests pass a real price.
+  host.solUsd = async () => 1e-9;
   if (chain) {
     calls.tokenReads = [];
     host.walletTokens = async (mint) => {
@@ -202,7 +208,7 @@ test('a paper round trip pays BOTH sides of every fee a real one would', async (
   // flattered every paper record (2026-10-22: 7 % of a 0.05 SOL copy).
   assert.ok(Math.abs(closed.pnlSol - -0.038504) < 1e-9, `expected ~-0.0385, got ${closed.pnlSol}`);
   assert.equal(closed.pnlBasis, 'model');
-  assert.equal(closed.paperModel, 2, 'the row says which model priced it');
+  assert.equal(closed.paperModel, 3, 'the row says which model priced it (3: with price impact, 2026-11-01)');
 });
 
 test('paper fixed fees bite hardest on the small copies the simple page defaults to', async () => {
@@ -1308,6 +1314,46 @@ test('a size the chain has moved under is re-planned once, not recorded as a fai
     0,
     'a race is not a refusal — nothing is recorded as a failed exit',
   );
+});
+
+// Two follows, one coin, one wallet (support bundle 2026-11-01): both leaders
+// sold within a second, the two mirrored sells raced on one balance read,
+// and the second asked for a hair more than the first had left — "Overflow
+// (6024). You still hold it." They now go out one at a time.
+test('two follows selling the same coin from one wallet never send at the same time, and both close', async () => {
+  const h = setup({ priceSol: 0.001, chain: { bought: 1_000_000_000n } });
+  const OTHER = 'Wha1e2222222222222222222222222222222222222';
+  save({ mode: 'live', sizing: 'fixed', sizeValue: 1, maxTradeSol: 1, delayMs: 0 });
+  save({ wallet: OTHER, label: 'Other', mode: 'live', sizing: 'fixed', sizeValue: 1, maxTradeSol: 1, delayMs: 0 });
+  copy.onWalletTrade(trade({ isBuy: true, signature: 'buyA' }));
+  copy.onWalletTrade(trade({ wallet: OTHER, isBuy: true, signature: 'buyB' }));
+  await tick();
+  await tick();
+  assert.equal(h.calls.buys.length, 2, 'both follows bought the coin');
+  assert.equal(h.calls.chain.balance, 2_000_000_000n);
+  const real = h.host.sell;
+  let inFlight = 0;
+  let most = 0;
+  h.host.sell = async (...a) => {
+    inFlight += 1;
+    most = Math.max(most, inFlight);
+    await new Promise((r) => setTimeout(r, 20));
+    try {
+      return await real(...a);
+    } finally {
+      inFlight -= 1;
+    }
+  };
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.001, soldFraction: 1, signature: 'sellA' }));
+  copy.onWalletTrade(trade({ wallet: OTHER, isBuy: false, sol: 1, priceSol: 0.001, soldFraction: 1, signature: 'sellB' }));
+  for (let i = 0; i < 8 && h.calls.sells.length < 2; i += 1) await tick();
+  await tick();
+  assert.equal(h.calls.sells.length, 2, 'each follow mirrored its leader');
+  assert.equal(most, 1, 'never two sells of one coin in flight from one wallet');
+  assert.equal(h.calls.chain.balance, 0n, 'the wallet is out');
+  const parents = copy.snapshot().recent.filter((x) => x.kind !== 'exit');
+  assert.equal(parents.length, 2);
+  assert.ok(parents.every((x) => x.state === 'closed'), 'and both copies are closed');
 });
 
 // ── How late is too late (2026-09-15) ─────────────────────────────────
@@ -4020,6 +4066,309 @@ test('AI desk: the setting is validated, and the summary line says what it does'
   assert.match(validateConfig(cfg({ ai: { ...AI_GATE, waitSec: 100 } })).message, /between 3 and 45 seconds/);
   assert.equal(validateConfig(cfg({ ai: { ...AI_GATE, onTimeout: 'maybe' } })).ok, false);
   assert.equal(defaultConfig(WALLET, 'x').ai, null);
+});
+
+// ── Why a copy was skipped, by rule (2026-11-01) ──────────────────────
+// A crowd follow showed "289 blocked" and nothing said which rule did it.
+
+test('every skip reason the copier writes maps to a named rule', () => {
+  const cases = [
+    ['limit: 20 copies today', 'daily-trades', true],
+    ['limit: 5 copies per minute', 'per-minute', true],
+    ['limit: down 0.512 SOL today', 'daily-loss', true],
+    ['limit: 10 copies open across all follows', 'open-cap', true],
+    ['paused — down 1.000 since it was switched on, past its 1 stop', 'paused', true],
+    ['their trade of 0.010 is under your 0.05 minimum', 'their-min', false],
+    ['their trade of 9.000 is over your 5 maximum', 'their-max', false],
+    ['outside your trading hours (09:00–17:00)', 'hours', false],
+    ['already held through Sharky — one position per coin is on', 'one-per-coin', false],
+    ['liquidity unknown — the filter you set could not be checked', 'filter-unknown', false],
+    ['could not read token', 'token-unreadable', false],
+    ['not a pump.fun token', 'pump-only', false],
+    ['liquidity below $10,000', 'liquidity', false],
+    ['market cap above $1,000,000', 'mcap-max', false],
+    ['market cap below $5,000', 'mcap-min', false],
+    ['score 20 below 50', 'score', false],
+    ['token was 3 seconds old — under your 10 s minimum', 'age-min', false],
+    ['token was 2 hours old — over your 600 s maximum', 'age-max', false],
+    ['creator is on your blocklist', 'blocklist', false],
+    ['no price at copy time', 'no-price', false],
+    ['not executed — they had already sold before this buy was sent', 'too-late', false],
+    ['not executed — they bought this 2 minutes ago, too old to copy', 'too-late', false],
+    ['not executed — their buy was 40 seconds old by the time this copy could be sent', 'too-late', false],
+    ['copy of 2 SOL is above your live cap of 1 SOL', 'live-cap', true],
+    ['not executed — 0.001 SOL is under the smallest live copy (0.01 SOL); fees would take over 10% of it', 'live-min', false],
+    ['skipped — the coin is moving from pump’s curve to PumpSwap, and nothing can trade until it lands', 'migrating', false],
+    ['not executed — the follow was switched to paper while this copy waited', 'changed', false],
+    ['not executed — Live trading is switched off', 'not-executed', false],
+  ];
+  for (const [reason, key, limit] of cases) {
+    const r = skipRuleOf(reason);
+    assert.equal(r.key, key, `"${reason}" → ${key} (got ${r.key})`);
+    assert.equal(r.limit, limit, `"${reason}" limit flag`);
+  }
+  assert.equal(skipRuleOf('something new').key, 'other', 'an unknown reason is "other", never a wrong rule');
+});
+
+test('a follow\'s skipped copies are counted by rule, with the newest reason, and survive the row trim', async () => {
+  setup();
+  save({ dailyTradeLimit: 2, sizing: 'fixed', sizeValue: 0.1, maxTradeSol: 1, delayMs: 0 });
+  for (let i = 0; i < 6; i++) {
+    copy.onWalletTrade(trade({ mint: `Rule${i}${'1'.repeat(36)}`, signature: `rule${i}` }));
+    await new Promise((r) => setTimeout(r, 15));
+  }
+  const st = Object.values(copy.snapshot().stats)[0];
+  assert.equal(st.blocked, 4);
+  assert.deepEqual(st.skipRules.map((r) => [r.key, r.count]), [['daily-trades', 4]]);
+  assert.equal(st.skipRules[0].label, 'Daily copy limit');
+  assert.equal(st.skipRules[0].lastReason, 'limit: 2 copies today');
+  // Stopping the follow takes its counts with it.
+  copy.remove(copy.all()[0].id);
+  save({ dailyTradeLimit: 2 });
+  assert.equal(Object.values(copy.snapshot().stats)[0].skipRules.length, 0);
+});
+
+test('a follow out of the day\'s copies says so on its card and once as an alert', async () => {
+  const h = setup();
+  save({ dailyTradeLimit: 1, sizing: 'fixed', sizeValue: 0.1, maxTradeSol: 1, delayMs: 0 });
+  for (let i = 0; i < 4; i++) {
+    copy.onWalletTrade(trade({ mint: `Hold${i}${'1'.repeat(36)}`, signature: `hold${i}` }));
+    await new Promise((r) => setTimeout(r, 15));
+  }
+  const st = Object.values(copy.snapshot().stats)[0];
+  assert.equal(st.hold.kind, 'daily-trades');
+  assert.match(st.hold.message, /Stopped for today — all 1 of today's copies are used/);
+  assert.ok(st.hold.until > Date.now(), 'it lifts at midnight');
+  assert.equal(h.calls.toasts.filter((t) => /stopped for today/.test(t.message)).length, 1, 'said once, not per refused buy');
+});
+
+test('the open-copies ceiling shows on every follow it holds, and is alerted once', async () => {
+  const h = setup({ priceSol: 0.001, host: { maxOpenCopies: () => 1 } });
+  save({ sizing: 'fixed', sizeValue: 0.1, maxTradeSol: 1, delayMs: 0 });
+  save({ wallet: walletN(0), sizing: 'fixed', sizeValue: 0.1, maxTradeSol: 1, delayMs: 0 });
+  copy.onWalletTrade(trade({ isBuy: true, mint: 'Cap11111111111111111111111111111111111111', signature: 'c1' }));
+  await tick();
+  for (let i = 0; i < 3; i++) {
+    copy.onWalletTrade(trade({ wallet: walletN(0), isBuy: true, mint: `Cap${i + 2}${'1'.repeat(37)}`, signature: `c${i + 2}` }));
+    await tick();
+  }
+  const stats = Object.values(copy.snapshot().stats);
+  assert.ok(stats.every((s) => s.hold?.kind === 'open-cap'), 'both follows show the hold');
+  assert.match(stats[0].hold.message, /1 of 1 paper copies are open across all follows/);
+  assert.equal(stats[0].hold.until, null, 'it lifts when a copy closes, not at a time');
+  assert.equal(h.calls.toasts.filter((t) => /New copies are on hold/.test(t.message)).length, 1, 'one alert for the filling, not one per buy');
+});
+
+test('a follow past its daily loss limit shows the stop on its card', async () => {
+  setup({ priceSol: 0.001 });
+  save({ sizing: 'fixed', sizeValue: 1, maxTradeSol: 1, delayMs: 0, dailyLossLimitSol: 0.1 });
+  copy.onWalletTrade(trade({ isBuy: true, signature: 'loss1' }));
+  await tick();
+  copy.onWalletTrade(trade({ isBuy: false, sol: 0.3, priceSol: 0.0003, soldFraction: 1, signature: 'loss2' }));
+  await tick();
+  const st = Object.values(copy.snapshot().stats)[0];
+  assert.ok(st.realizedPnlSol < -0.1, 'the copy lost past the limit');
+  assert.equal(st.hold.kind, 'daily-loss');
+  assert.match(st.hold.message, /past its 0.1 SOL daily loss limit/);
+});
+
+// ── Paper pays price impact (PAPER_MODEL 3, 2026-11-01) ───────────────
+
+test('paper impact: a buy pays over spot, a big bag sells under it, and a thin pool cannot hand paper a fortune', () => {
+  assert.equal(buyImpactFactor(3, 30), 1.1, '3 SOL into 30 pays 10 % over spot');
+  assert.equal(sellImpactFactor(0, 30, 1, 1), 1);
+  // A 0.1 SOL copy that marks up 130x on a pool that started at 30 SOL.
+  const flat = paperExitPnl(0.1, 1, 1, 130, 'solana');
+  const real = paperExitPnl(0.1, 1, 1, 130, 'solana', { copySol: 0.1, depthSol: 30 });
+  assert.ok(real < flat, `impact costs something (${real} < ${flat})`);
+  // A big copy into a thin pool is where it bites hardest.
+  const flatBig = paperExitPnl(5, 1, 1, 20, 'solana');
+  const realBig = paperExitPnl(5, 1, 1, 20, 'solana', { copySol: 5, depthSol: 10 });
+  assert.ok(realBig < flatBig * 0.5, `5 SOL into a 10 SOL pool keeps under half the flat result (${realBig} vs ${flatBig})`);
+  // No depth: the old model exactly.
+  assert.equal(paperExitPnl(1, 1, 1, 2, 'solana', null), paperExitPnl(1, 1, 1, 2, 'solana'));
+  assert.equal(paperDepthSol(60_000, 200), 150, 'half of $60k at $200/SOL');
+  assert.equal(paperDepthSol(null, 200), 30, 'unknown liquidity: the pump curve floor');
+  const pct = paperCopyReturnPct(1, 1, 1, 30);
+  assert.ok(pct < 0, `a flat round trip loses fees and impact (${pct} %)`);
+});
+
+test('a paper copy records the pool depth it was opened into, and its exit pays impact', async () => {
+  // Paper exits at the coin's price when the copy acts, read from the host.
+  let px = 0.001;
+  setup({ facts: { liquidityUsd: 60_000, marketCapUsd: 100_000, kryptScore: 80, isPumpfun: true }, host: { solUsd: async () => 200, priceSol: () => px } });
+  save({ sizing: 'fixed', sizeValue: 1, maxTradeSol: 1, delayMs: 0 });
+  copy.onWalletTrade(trade({ isBuy: true, signature: 'dep1' }));
+  await tick();
+  const row = copy.snapshot().recent.find((t) => t.kind !== 'exit');
+  assert.equal(row.paperDepthSol, 150);
+  assert.equal(row.paperModel, 3);
+  px = 0.002;
+  copy.onWalletTrade(trade({ isBuy: false, sol: 2, priceSol: 0.002, soldFraction: 1, signature: 'dep2' }));
+  await tick();
+  const exit = copy.snapshot().recent.find((t) => t.kind === 'exit');
+  const flat = paperExitPnl(1, 1, 0.001, 0.002, 'solana');
+  assert.ok(exit.pnlSol < flat, `impact is charged (${exit.pnlSol} < ${flat})`);
+  assert.ok(Math.abs(exit.pnlSol - paperExitPnl(1, 1, 0.001, 0.002, 'solana', { copySol: 1, depthSol: 150 })) < 1e-9);
+});
+
+test('the snapshot names the best copy, so one lucky trade cannot pass for a strategy', async () => {
+  const px = new Map();
+  setup({ host: { priceSol: (mint) => px.get(mint) ?? 0.001 } });
+  save({ sizing: 'fixed', sizeValue: 0.1, maxTradeSol: 1, delayMs: 0 });
+  const m = (i) => `Best${i}${'1'.repeat(36)}`;
+  for (let i = 0; i < 3; i++) {
+    copy.onWalletTrade(trade({ isBuy: true, mint: m(i), signature: `bb${i}` }));
+    await tick();
+  }
+  px.set(m(0), 0.02);
+  px.set(m(1), 0.0011);
+  px.set(m(2), 0.0009);
+  copy.onWalletTrade(trade({ isBuy: false, mint: m(0), sol: 1, priceSol: 0.02, soldFraction: 1, signature: 'bs0' }));
+  copy.onWalletTrade(trade({ isBuy: false, mint: m(1), sol: 1, priceSol: 0.0011, soldFraction: 1, signature: 'bs1' }));
+  copy.onWalletTrade(trade({ isBuy: false, mint: m(2), sol: 1, priceSol: 0.0009, soldFraction: 1, signature: 'bs2' }));
+  await tick();
+  const best = copy.snapshot().bestCopy.paper;
+  assert.equal(best.mint, m(0));
+  assert.ok(best.pnlSol > 1, 'the 20x copy');
+  assert.equal(copy.snapshot().bestCopy.live, null);
+});
+
+test('unreadable leader trades alert once per window, then as one count — not a toast each', async () => {
+  const h = await openLiveCopy();
+  for (let i = 0; i < 25; i++) copy.noteUnreadableLeaderTx(WALLET, `unread${i}${'1'.repeat(40)}`);
+  assert.equal(h.calls.toasts.filter((t) => /could not be read/.test(t.message)).length, 1, 'one toast for the burst');
+});
+
+// ── The paper bankroll (2026-11-01) ───────────────────────────────────
+
+// SOL at $100, so $100 is exactly 1 SOL.
+const bankSetup = (over = {}) => setup({ ...over, host: { solUsd: async () => 100, ...(over.host ?? {}) } });
+const bm = (i) => `Bank${i}${'1'.repeat(36)}`;
+
+test('paper bankroll: buys draw it down, a copy it cannot cover is skipped and the follow holds', async () => {
+  bankSetup();
+  save({ sizing: 'fixed', sizeValue: 0.4, maxTradeSol: 0.5, delayMs: 0 });
+  const r = await copy.setPaperBankroll({ enabled: true, usd: 100 });
+  assert.ok(r.ok, r.message);
+  assert.ok(Math.abs(r.bankroll.startSol - 1) < 1e-12, '$100 at $100 a SOL is 1 SOL');
+  assert.match(r.message, /^Paper bankroll started: \$100 = 1\.000 SOL/, 'the message says dollars');
+  for (let i = 0; i < 2; i++) {
+    copy.onWalletTrade(trade({ mint: bm(i), signature: `bk${i}` }));
+    await tick();
+  }
+  let pb = copy.snapshot().paperBankroll;
+  assert.equal(pb.openCopies, 2);
+  assert.ok(Math.abs(pb.cashSol - 0.2) < 1e-9, `0.2 SOL left (${pb.cashSol})`);
+  copy.onWalletTrade(trade({ mint: bm(2), signature: 'bk2' }));
+  await tick();
+  const skipped = copy.snapshot().recent.find((t) => t.mint === bm(2));
+  assert.equal(skipped.state, 'skipped');
+  assert.match(skipped.reason, /^paper balance too low — 0\.200 SOL left, this copy is 0\.400 SOL/);
+  assert.equal(skipRuleOf(skipped.reason).key, 'paper-balance');
+  const id = copy.all()[0].id;
+  assert.equal(copy.snapshot().stats[id].hold?.kind, 'paper-balance', 'the card says why it went quiet');
+});
+
+test('paper bankroll: a sell puts back the cost and its result, fees included', async () => {
+  let px = 0.001;
+  bankSetup({ host: { priceSol: () => px } });
+  save({ sizing: 'fixed', sizeValue: 0.4, maxTradeSol: 0.5, delayMs: 0 });
+  await copy.setPaperBankroll({ enabled: true, usd: 100 });
+  copy.onWalletTrade(trade({ signature: 'bs-in' }));
+  await tick();
+  px = 0.002;
+  copy.onWalletTrade(trade({ isBuy: false, sol: 2, priceSol: 0.002, soldFraction: 1, signature: 'bs-out' }));
+  await tick();
+  const exit = copy.snapshot().recent.find((t) => t.kind === 'exit');
+  assert.ok(exit && exit.pnlSol > 0, 'a priced, winning exit');
+  const pb = copy.snapshot().paperBankroll;
+  assert.equal(pb.openCopies, 0);
+  assert.ok(Math.abs(pb.realizedSol - exit.pnlSol) < 1e-12, 'the run booked the exit');
+  assert.ok(Math.abs(pb.cashSol - (1 + exit.pnlSol)) < 1e-9, `back to 1 SOL plus the result (${pb.cashSol})`);
+  // A loser takes SOL out for good.
+  px = 0.001;
+  copy.onWalletTrade(trade({ mint: bm(5), signature: 'bs-in2' }));
+  await tick();
+  px = 0.0005;
+  copy.onWalletTrade(trade({ isBuy: false, mint: bm(5), sol: 1, priceSol: 0.0005, soldFraction: 1, signature: 'bs-out2' }));
+  await tick();
+  const after = copy.snapshot().paperBankroll;
+  assert.ok(after.cashSol < pb.cashSol - 0.19, 'half the copy, and the fees, are gone');
+});
+
+test('paper bankroll: two buys in one slot cannot spend the same SOL', async () => {
+  bankSetup();
+  save({ sizing: 'fixed', sizeValue: 0.6, maxTradeSol: 1, delayMs: 0 });
+  await copy.setPaperBankroll({ enabled: true, usd: 100 });
+  copy.onWalletTrade(trade({ mint: bm(0), signature: 'slot0' }));
+  copy.onWalletTrade(trade({ mint: bm(1), signature: 'slot1' }));
+  await tick();
+  const rows = copy.snapshot().recent.filter((t) => t.kind !== 'exit');
+  assert.equal(rows.filter((t) => t.state === 'open').length, 1, 'one fits');
+  assert.match(rows.find((t) => t.state === 'skipped')?.reason ?? '', /^paper balance too low/);
+});
+
+test('paper bankroll: off spends freely, live never touches it, and starting over leaves old copies outside', async () => {
+  const h = bankSetup();
+  save({ sizing: 'fixed', sizeValue: 0.6, maxTradeSol: 1, delayMs: 0 });
+  // Off (the default): nothing limits paper.
+  for (let i = 0; i < 3; i++) {
+    copy.onWalletTrade(trade({ mint: bm(i), signature: `off${i}` }));
+    await tick();
+  }
+  assert.equal(copy.snapshot().recent.filter((t) => t.state === 'open').length, 3);
+  assert.equal(copy.snapshot().paperBankroll.cashSol, null);
+  // On: the three open copies were bought before the run, so they are outside it.
+  await copy.setPaperBankroll({ enabled: true, usd: 100 });
+  let pb = copy.snapshot().paperBankroll;
+  assert.equal(pb.openCopies, 0);
+  assert.ok(Math.abs(pb.cashSol - 1) < 1e-12);
+  copy.onWalletTrade(trade({ mint: bm(3), signature: 'on3' }));
+  await tick();
+  assert.equal(copy.snapshot().paperBankroll.openCopies, 1);
+  // A new amount starts a new run: the open copy is outside it now.
+  const r = await copy.setPaperBankroll({ enabled: true, usd: 250 });
+  pb = r.bankroll;
+  assert.ok(Math.abs(pb.startSol - 2.5) < 1e-12);
+  assert.equal(pb.openCopies, 0);
+  assert.equal(pb.realizedSol, 0);
+  // Switching off keeps the run; switching back on with no change carries on.
+  await copy.setPaperBankroll({ enabled: false });
+  const back = await copy.setPaperBankroll({ enabled: true });
+  assert.equal(back.bankroll.startedAt, pb.startedAt, 'not restarted');
+  // Out of range, and no SOL price: refused, nothing changes.
+  assert.equal((await copy.setPaperBankroll({ enabled: true, usd: 0 })).ok, false);
+  // A live follow never draws on it.
+  copy._reset();
+  copy.attach(h.host);
+  await copy.setPaperBankroll({ enabled: true, usd: 1 });
+  save({ mode: 'live', sizing: 'fixed', sizeValue: 0.05, maxTradeSol: 0.1, delayMs: 0 });
+  copy.onWalletTrade(trade({ signature: 'live1' }));
+  await tick();
+  assert.equal(h.calls.buys.length, 1, 'a $1 paper bankroll does not stop a live buy');
+});
+
+test('paper bankroll: refused without a SOL price, and it survives a restart', async () => {
+  setup({ host: { solUsd: async () => null } });
+  const r = await copy.setPaperBankroll({ enabled: true, usd: 100 });
+  assert.equal(r.ok, false);
+  assert.match(r.message, /SOL price/);
+  assert.equal(copy.snapshot().paperBankroll.enabled, false);
+
+  copy._reset();
+  const dir = tempStore();
+  copy.init(dir);
+  copy.attach(makeHost({ host: { solUsd: async () => 100 } }).host);
+  await copy.setPaperBankroll({ enabled: true, usd: 100 });
+  const before = copy.snapshot().paperBankroll;
+  copy.flushSync();
+  copy._reset();
+  copy.init(dir);
+  const after = copy.snapshot().paperBankroll;
+  assert.equal(after.enabled, true);
+  assert.equal(after.startSol, before.startSol);
+  assert.equal(after.startedAt, before.startedAt);
 });
 
 await run();

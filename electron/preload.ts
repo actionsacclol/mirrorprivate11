@@ -259,6 +259,12 @@ const api = {
     remove: (id: string) => ipcRenderer.invoke('copy:remove', id),
     resetStats: (wallet: string) => ipcRenderer.invoke('copy:resetStats', wallet),
     resetPaper: (configId?: string) => ipcRenderer.invoke('copy:resetPaper', configId),
+    /** The paper bankroll (2026-11-01): switch, amount in USD, or start over. */
+    paperBankroll: (input: { enabled?: boolean; usd?: number; restart?: boolean }) => ipcRenderer.invoke('copy:paperBankroll', input),
+    // The copy backtest (2026-11-01): a follow's settings over its wallet's past trades.
+    backtest: (input: { id?: string; config?: Partial<CopyConfig> }, opts?: { week?: boolean }) => ipcRenderer.invoke('copy:backtest', input, opts),
+    backtestStatus: (wallet: string) => ipcRenderer.invoke('copy:backtestStatus', wallet),
+    backtestCancel: (wallet: string) => ipcRenderer.invoke('copy:backtestCancel', wallet),
   },
   portfolio: {
     summary: (opts?: { stale?: boolean }) => ipcRenderer.invoke('portfolio:summary', opts),

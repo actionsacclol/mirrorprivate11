@@ -972,6 +972,8 @@ export class SniperEngine {
       },
       priceSol: (mint, chain) =>
         chain && chain !== 'solana' ? (this.evmCopy?.price(chain, mint) ?? null) : (this.tokens.get(mint)?.row.priceSol ?? this.lastKnownPriceSol.get(mint) ?? null),
+      // The paper model's pool depth is reported in USD (PAPER_MODEL 3).
+      solUsd: () => market.solUsd().catch(() => null),
       tokenFacts: async (mint, chain) => {
         if (chain && chain !== 'solana') {
           return this.evmCopy ? this.evmCopy.facts(chain, mint) : { liquidityUsd: null, marketCapUsd: null, kryptScore: null, isPumpfun: false };

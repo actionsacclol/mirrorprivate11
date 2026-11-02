@@ -61,6 +61,9 @@ export interface ReplayTrip {
   closedAt: number;
   /** SOL they put in, and what they made on it. */
   cost: number;
+  /** Their OPENING buy alone, SOL (2026-11-01): the trade a follow's copy
+   *  is a copy of, sized and filtered by. Absent on a trip built before it. */
+  openSol?: number;
   pnl: number;
   holdMs: number;
   /** The copy's fills, SOL per token; null when not priced. */
@@ -137,7 +140,7 @@ export const REPLAY_NEWEST_CREDITS_MAX = 100 + REPLAY_MAX_TRIPS * REPLAY_TRIP_CR
  * buy on record is not a trip. Oldest first.
  */
 export function buildTrips(swaps: readonly ReplaySwap[]): { trips: ReplayTrip[]; open: number; orphanSells: number } {
-  const pos = new Map<string, { cost: number; tokens: number; spent: number; realised: number; openedAt: number; openSlot: number | null; openTx: string | null; openIndex: number | null; openPayer: string | null }>();
+  const pos = new Map<string, { cost: number; tokens: number; spent: number; realised: number; openSol: number; openedAt: number; openSlot: number | null; openTx: string | null; openIndex: number | null; openPayer: string | null }>();
   const trips: ReplayTrip[] = [];
   let orphanSells = 0;
   // Block times are whole seconds; the slot orders trades inside one.
@@ -155,6 +158,7 @@ export function buildTrips(swaps: readonly ReplaySwap[]): { trips: ReplayTrip[];
           tokens: s.tokens,
           spent: s.sol,
           realised: 0,
+          openSol: s.sol,
           openedAt: s.at,
           openSlot: typeof s.slot === 'number' ? s.slot : null,
           openTx: s.tx ?? null,
@@ -180,6 +184,7 @@ export function buildTrips(swaps: readonly ReplaySwap[]): { trips: ReplayTrip[];
         openedAt: p.openedAt,
         closedAt: s.at,
         cost: p.spent,
+        openSol: p.openSol,
         pnl: p.realised,
         holdMs,
         entryPx: null,
@@ -540,4 +545,8 @@ export interface CopyReplayStatus {
   /** The checks, once run: wash trades and shared payers from the swaps,
    *  snipes and launch bundles from the coins' births. Absent = not asked. */
   checks?: ReplayChecks;
+  /** A copy backtest's result (2026-11-01, shared/copyBacktest.ts), once it
+   *  has run: the follow's own settings over these trips. Absent on a plain
+   *  replay; null while a backtest is still running or found no trips. */
+  backtest?: import('./copyBacktest').BacktestResult | null;
 }

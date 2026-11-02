@@ -63,6 +63,7 @@ import { useNav, type FollowDraft } from '../state/nav';
 import { useAddressBook } from '../state/useAddressBook';
 import { Avatar, DASH, Panel, ScoreRing, Segmented, btn, fmtHold, fmtPctS, short, toneOf } from '../ui/kit';
 import { RowTags } from '../components/copy/WalletTags';
+import { BacktestPanel } from '../components/copy/BacktestPanel';
 import { cls, fmtAgo } from '../utils/format';
 
 /** The fields the page derives from its own controls, never from `over`. */
@@ -167,6 +168,10 @@ export function FollowPage() {
   const [wallets, setWallets] = useState<WalletSummary[]>([]);
   const [evmWallets, setEvmWallets] = useState<Record<'robinhood' | 'bnb', EvmWalletSummary[]>>({ robinhood: [], bnb: [] });
   const [busy, setBusy] = useState(false);
+  // "Backtest these settings" (2026-11-01): the summary's button starts the
+  // panel's run and brings it into view.
+  const [btRun, setBtRun] = useState(0);
+  const btRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     void window.krypt.copy.list().then((r) => r.ok && r.data && setFollowed(r.data.configs.filter((c) => c.id !== start?.id).map((c) => c.wallet.toLowerCase())));
@@ -275,6 +280,13 @@ export function FollowPage() {
   const exits = ownExitsOf(cfg);
   const fr = fomoRuleOf(cfg);
   const ownWallets: Array<{ id: string; label: string }> = chain === 'solana' ? wallets : evmWallets[chain];
+  // A copy of one Solana wallet is what the replay can backtest; reverse and
+  // convergence exit on a price path it does not read, and a watch never trades.
+  const canBacktest = direction === 'copy' && kind === 'solana' && !picking;
+  const backtestNow = (): void => {
+    setBtRun((n) => n + 1);
+    btRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
 
   const save = async (): Promise<void> => {
     if (!validity.ok) return void toast.error(validity.message);
@@ -830,6 +842,13 @@ export function FollowPage() {
                 </div>
               )}
             </section>
+
+            {/* ── Backtest (2026-11-01) ────────────────────────────────── */}
+            {canBacktest && (
+              <div ref={btRef} className="scroll-mt-6">
+                <BacktestPanel config={cfg as Partial<CopyConfig>} wallet={addr.trim()} runSignal={btRun} />
+              </div>
+            )}
           </div>
 
           {/* ── Summary ──────────────────────────────────────────────── */}
@@ -853,6 +872,16 @@ export function FollowPage() {
                   {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : editing ? <Save className="h-4 w-4" /> : <FlaskConical className="h-4 w-4" />}
                   {editing ? 'Save changes' : watch ? 'Start watching' : 'Start on paper'}
                 </button>
+                {canBacktest && (
+                  <button
+                    onClick={backtestNow}
+                    className={btn.secondary}
+                    data-testid="follow-backtest-start"
+                    title="Replays their past trades with these settings — your size, limits, delay and exits — at paper's fees. Saves nothing, trades nothing."
+                  >
+                    <History className="h-4 w-4" /> Backtest these settings
+                  </button>
+                )}
                 <button onClick={() => nav.goBack()} className={btn.ghost}>
                   Cancel
                 </button>

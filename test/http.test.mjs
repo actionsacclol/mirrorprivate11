@@ -291,7 +291,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   console.log('ok  the refusal table matches only quoted shapes');
 }
 
-// ── 11b. swap-api.pump.fun is paced under its Cloudflare burst rule ───────
+// ── 11b. pump's trade tape is paced under swap-api's Cloudflare burst rule ──
 {
   // MEASURED 2026-09-21: the host answers `x-ratelimit-limit: 1000` but a
   // Cloudflare rule (429, `error code: 1015`, Retry-After 34) blocks the IP
@@ -302,10 +302,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   // walletscout.test.mjs); a faster gap here is the "works for two minutes
   // then gets limited" report coming back.
   const ps = providerLimits('pumpswap');
-  assert.equal(ps.host, 'swap-api.pump.fun');
+  // The tape moved to frontend-api-v3 when swap-api's route went 410
+  // (2026-11-01); the measured pace came with it.
+  assert.equal(ps.host, 'frontend-api-v3.pump.fun');
   assert.equal(ps.gapMs, 2_000, 'one request every 2 s — under the measured burst rule with room for the token page');
   assert.equal(ps.window, null, 'the gap alone is the ceiling; a window would only add a queue wait');
-  console.log('ok  swap-api.pump.fun is paced at 2 s, under its measured Cloudflare burst rule');
+  console.log("ok  pump's trade tape is paced at 2 s, under the measured Cloudflare burst rule");
 }
 
 // ── 12. Jupiter's host, gap and window follow the key ────────────────────

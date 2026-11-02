@@ -143,6 +143,8 @@ import * as walletScout from './engine/walletScout';
 import * as scoutScan from './engine/scoutScan';
 import * as walletHistory from './engine/walletHistory';
 import * as copyReplay from './engine/copyReplay';
+import { backtestConfigOf } from '@shared/copyBacktest';
+import { DEFAULT_MAX_OPEN_COPIES } from '@shared/copytrade';
 import * as boardLabeler from './engine/boardLabeler';
 import * as prereg from './engine/prereg';
 import { DEFAULT_BACKTEST_CREDITS } from '@shared/credits';
@@ -2422,6 +2424,45 @@ export function registerIpc(): void {
     return ok(asked ? 'Stopping after the current trade' : 'No replay running', copyReplay.status(address));
   });
 
+  // The copy backtest (2026-11-01): a follow's own settings — a saved one by
+  // id, or the Follow page's unsaved draft — over its wallet's past trades,
+  // at its delay and paper's fees (shared/copyBacktest.ts). The same read,
+  // fast-first pricing and backtest allowance as the replay; polled; stops on
+  // cancel. A page can ask for the week, nothing more.
+  ipcMain.handle('copy:backtest', (_e, input: unknown, opts: unknown) => {
+    const i = input && typeof input === 'object' ? (input as { id?: unknown; config?: unknown }) : {};
+    let raw: unknown = i.config;
+    if (raw === undefined && typeof i.id === 'string' && i.id) {
+      raw = copyTrade.all().find((c) => c.id === i.id);
+      if (!raw) return fail('That follow no longer exists');
+    }
+    const parsed = backtestConfigOf(raw);
+    if (!parsed.ok) return fail(parsed.message);
+    const o = opts && typeof opts === 'object' ? (opts as { week?: unknown }) : {};
+    const r = copyReplay.startBacktest(
+      {
+        config: parsed.config,
+        span: o.week === true ? 'week' : 'newest',
+        // This session's measured slot gap, when live copies have read one.
+        measured: copyTrade.latency(),
+        maxOpenCopies: store.load().execution.maxOpenCopies ?? DEFAULT_MAX_OPEN_COPIES,
+      },
+      bridgeDeps().httpUrl,
+    );
+    return r.ok ? ok(r.message, copyReplay.backtestStatus(parsed.config.wallet)) : fail(r.message);
+  });
+
+  ipcMain.handle('copy:backtestStatus', (_e, wallet: unknown) => {
+    if (!isAddress(wallet)) return fail('Invalid wallet');
+    return ok('ok', copyReplay.backtestStatus(wallet));
+  });
+
+  ipcMain.handle('copy:backtestCancel', (_e, wallet: unknown) => {
+    if (!isAddress(wallet)) return fail('Invalid wallet');
+    const asked = copyReplay.cancelBacktest(wallet);
+    return ok(asked ? 'Stopping after the current trade' : 'No backtest running', copyReplay.backtestStatus(wallet));
+  });
+
   // The Scout's two long jobs log where everything else does (2026-09-21).
   // They ran for minutes and spent hundreds of calls in total silence until a
   // logging audit found it.
@@ -2614,6 +2655,18 @@ export function registerIpc(): void {
     deskDecide: (id, verdict) => aiDesk.decide(id, verdict),
     copyMode: (configId, mint) => copyTrade.configMode(configId, mint),
     sellCopy: (configId, mint, percent, reason) => copyTrade.aiSellCopy(configId, mint, percent, reason),
+    // Follows (2026-11-01): the AI creates and edits them through the same
+    // save the Following page uses — so upsert's own rules (a new live follow
+    // is never born armed, a wallet move with live copies open is refused)
+    // and the watcher sync apply to it unchanged. The narrow-only rules for
+    // live follows are mcpTools' (shared/followEdit.ts).
+    follows: () => copyTrade.all(),
+    liveOpenCopies: (configId) => copyTrade.snapshot().liveOpen?.[configId] ?? 0,
+    saveFollow: (input) => getEngine().upsertCopyConfig(input),
+    followNotice: (title, line) => {
+      logger.info(line);
+      getEngine().pushNotification(title, line);
+    },
     log: (level, line) => (level === 'error' ? logger.error(line) : level === 'warn' ? logger.warn(line) : logger.info(line)),
   });
 
@@ -6241,6 +6294,16 @@ export function registerIpc(): void {
   // which deletes the config, its live history and the leader's record —
   // three things that were only ever bundled because there was no other
   // button (user report, 2026-09-13). Takes effect immediately; no restart.
+  // The paper bankroll (2026-11-01): on/off, its dollar amount, start over.
+  ipcMain.handle('copy:paperBankroll', async (_e, input: unknown) => {
+    const v = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
+    if (v.enabled !== undefined && typeof v.enabled !== 'boolean') return fail('Invalid switch');
+    if (v.usd !== undefined && typeof v.usd !== 'number') return fail('Invalid amount');
+    if (v.restart !== undefined && typeof v.restart !== 'boolean') return fail('Invalid restart');
+    const r = await copyTrade.setPaperBankroll({ enabled: v.enabled as boolean | undefined, usd: v.usd as number | undefined, restart: v.restart as boolean | undefined });
+    return r.ok ? ok(r.message, getEngine().copySnapshot()) : fail(r.message);
+  });
+
   ipcMain.handle('copy:resetPaper', (_e, configId: unknown) => {
     if (configId !== undefined && configId !== null && typeof configId !== 'string') return fail('Invalid id');
     const id = typeof configId === 'string' && configId ? configId : undefined;

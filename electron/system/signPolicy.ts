@@ -23,7 +23,7 @@
 // tip account or the user's own withdrawal address. Everything else is refused.
 
 import { VersionedTransaction, type MessageCompiledInstruction } from '@solana/web3.js';
-import { ALL_TIP_ACCOUNTS } from '../chain/tipAccounts';
+import { ALL_TIP_ACCOUNTS, JITO_DONT_FRONT } from '../chain/tipAccounts';
 import { ataFor, TOKEN_PROGRAM, TOKEN_2022_PROGRAM, ATA_PROGRAM, PUMP_PROGRAM, PUMP_FEES_PROGRAM } from '../chain/addresses';
 
 const SYSTEM_PROGRAM_ID = '11111111111111111111111111111111';
@@ -985,6 +985,13 @@ export function checkOutflow(
     // can spend from) before the swap. Not an outflow, so not counted against
     // the tip cap; the simulation loss guard bounds the SOL either way.
     if (policy.intent === 'trade' && dest === ownWsolAta) continue;
+
+    // Jito's don't-front-run marker (dontFront.ts): every native buy carries a
+    // transfer of NOTHING to it. Before 2026-11-01 this check refused it, so
+    // every pump-curve and PumpSwap buy failed at signing and only Jupiter
+    // routes landed. Zero lamports only — anything more is an outflow and
+    // falls through to the refusal below.
+    if (policy.intent === 'trade' && dest === JITO_DONT_FRONT && lamports === 0n) continue;
 
     // A named fee recipient is accounted separately, against its own ceiling,
     // so the tip cap below keeps meaning exactly what it used to.

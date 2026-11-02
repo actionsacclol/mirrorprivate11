@@ -12,6 +12,7 @@ import { APPEARANCES, setAppearance, useAppearance } from '../state/appearance';
 import { Segmented } from '../ui/kit';
 import { useLocale } from '../state/useLocale';
 import { HeliusOnlyFeedSwitch } from '../components/HeliusOnlyFeedSwitch';
+import { PaperBankrollSection } from '../components/copy/PaperBankroll';
 
 export function SettingsPage() {
   const { t } = useLocale();
@@ -113,6 +114,8 @@ export function SettingsPage() {
 
       {/* Every key in one place (2026-10-25), ahead of the sections that
           spend them. */}
+      <PaperBankrollSection />
+
       <ApiKeysSection settings={settings} updateSettings={updateSettings} />
 
       {/* The walkthrough, on demand. It resets NOTHING - it only clears the
@@ -130,7 +133,7 @@ export function SettingsPage() {
         description="Works out of the box on free public endpoints. A free Helius key (under API keys above) upgrades the calls that decide real trades; the feed itself races multiple free sockets."
       >
         <Card className="space-y-3">
-          <div>
+          <div data-testid="rpc-helius">
             <div className="text-xs font-semibold uppercase tracking-wider text-krypt-muted mb-1.5">Helius feed</div>
             <div className="text-body text-krypt-muted/70 mb-2">
               The key itself, its credit meter and the backtest allowance are under <span className="text-white/80">API keys</span> above
@@ -157,11 +160,17 @@ export function SettingsPage() {
               </div>
             </div>
           </div>
-          <div>
-            <div className="text-xs font-semibold uppercase tracking-wider text-krypt-muted mb-1.5">WebSocket (launch feed)</div>
+          <div data-testid="rpc-wss">
+            <div className="text-xs font-semibold uppercase tracking-wider text-krypt-muted mb-1.5">WebSocket (followed wallets, launch feed)</div>
             <TextInput value={wss} onChange={setWss} placeholder="wss://api.mainnet-beta.solana.com" />
+            {/* The wallet watcher subscribes here when there is no key
+                (engine.ts walletWatcher.attach) — the label used to say
+                "launch feed" only, so nobody knew it carried their copies. */}
+            <div className="text-body text-krypt-muted/70 mt-1">
+              Hears the wallets you follow — with a Helius key, its socket does instead — and carries the launch feed.
+            </div>
           </div>
-          <div>
+          <div data-testid="rpc-extra-wss">
             <div className="text-xs font-semibold uppercase tracking-wider text-krypt-muted mb-1.5">
               Extra WebSocket endpoints (raced in parallel, one per line)
             </div>
@@ -178,19 +187,19 @@ export function SettingsPage() {
               silently loses ~20% of events under load — every extra free endpoint cuts that loss.
             </div>
           </div>
-          <div>
+          <div data-testid="rpc-http">
             <div className="text-xs font-semibold uppercase tracking-wider text-krypt-muted mb-1.5">HTTP (account lookups)</div>
             <TextInput value={http} onChange={setHttp} placeholder="https://api.mainnet-beta.solana.com" />
           </div>
-          <div>
+          <div data-testid="rpc-exec">
             <div className="text-xs font-semibold uppercase tracking-wider text-krypt-muted mb-1.5">
               Execution endpoint <span className="text-krypt-muted/50 normal-case tracking-normal">— optional, any provider</span>
             </div>
             <TextInput value={fastHttp} onChange={setFastHttp} placeholder="https://your-endpoint.example.com/?api-key=…" />
             <div className="text-body text-krypt-muted/70 mt-1">
               The same fast lane a Helius key buys, for a provider of your own — QuickNode, Triton, Shyft, your
-              own validator. Live buys, sells, confirmations, send-time fee estimates and template sampling go
-              here; mint checks, balances and holder reads stay on the HTTP endpoint above, so you are not
+              own validator. Live buys, sells, confirmations, send-time fee estimates, template sampling and the
+              read-back of each trade a followed wallet makes go here; mint checks, balances and holder reads stay on the HTTP endpoint above, so you are not
               paying for the bulk traffic. Set, it wins over the Helius key. Empty, nothing changes.
             </div>
           </div>
@@ -211,7 +220,9 @@ export function SettingsPage() {
                 </button>
               ))}
             </div>
-            <PrimaryButton onClick={saveRpc}>Save RPC settings</PrimaryButton>
+            <span data-testid="rpc-save">
+              <PrimaryButton onClick={saveRpc}>Save RPC settings</PrimaryButton>
+            </span>
           </div>
 
           <EndpointProbe />
@@ -505,7 +516,7 @@ function EndpointProbe() {
   };
 
   return (
-    <div className="rounded-lg border border-white/10 bg-black/20 p-3">
+    <div className="rounded-lg border border-white/10 bg-black/20 p-3" data-testid="rpc-probe">
       <div className="flex items-center justify-between gap-3">
         <div>
           <div className="text-xs font-semibold uppercase tracking-wider text-krypt-muted">Endpoint speed</div>
@@ -519,7 +530,7 @@ function EndpointProbe() {
         </GhostButton>
       </div>
       {rows && rows.length > 0 && (
-        <div className="mt-3 space-y-2">
+        <div className="mt-3 space-y-2" data-testid="rpc-probe-rows">
           {rows.map((r) => (
             <div key={`${r.label}:${r.host}`} className="font-mono text-body">
               <div className="flex items-baseline justify-between gap-3">

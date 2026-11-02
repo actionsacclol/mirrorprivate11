@@ -1393,3 +1393,29 @@ const bridgeIx = (program, accounts = 2) =>
   refused('USDC to home under a SWEEP', tx([checked(mine, USDC, homeAta)]), SWEEP(0));
   console.log('ok  USDC can be withdrawn ONLY to the stored withdrawal address, in one checked transfer, with nothing riding along');
 }
+
+// ── Jito's don't-front-run marker (2026-11-01) ───────────────────────────
+// Every native pump/PumpSwap buy carries a ZERO-lamport transfer to
+// jitodontfront111… (dontFront.ts). Until 2026-11-01 this policy refused it,
+// so every native buy failed at signing ("Transaction sends SOL to jitodont…")
+// and only Jupiter-routed copies landed. The exact shape the builders emit
+// must pass; one lamport to the marker, or the marker on a sweep, must not.
+{
+  const DONT_FRONT = 'jitodontfront111111111111111111111111111111';
+  const src = fs.readFileSync(new URL('../electron/chain/tipAccounts.ts', import.meta.url), 'utf8');
+  assert.ok(src.includes(`'${DONT_FRONT}'`), 'the address tested here is the one the builders use');
+  const buy = (markerLamports) => tx([
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 120_000 }),
+    new TransactionInstruction({ programId: PUMP_PROGRAM, keys: [], data: Buffer.from([1, 2, 3]) }),
+    transfer(DONT_FRONT, markerLamports),
+    transfer(JITO_TIP, 100_000),
+  ]);
+  const ok = check(buy(0), MY_PUB, HOME, TRADE(10_000_000));
+  assert.equal(ok.ok, true, ok.message);
+  const one = check(buy(1), MY_PUB, HOME, TRADE(10_000_000));
+  assert.equal(one.ok, false, 'one lamport to the marker is an outflow');
+  assert.match(one.message, /neither your withdrawal address nor a known tip account/);
+  const sweep = check(tx([transfer(DONT_FRONT, 0), transfer(HOME, 1_000)]), MY_PUB, HOME, SWEEP(1_000));
+  assert.equal(sweep.ok, false, 'the marker has no place in a sweep');
+  console.log('ok  a buy carrying the zero-lamport jitodontfront marker is allowed; one lamport to it, or a sweep naming it, is refused');
+}

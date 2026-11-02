@@ -21,6 +21,7 @@ import { ProfileBadge } from '../components/terminal/ProfilesPanel';
 import { fmtNative } from '../utils/evm';
 import { cls, shortAddr } from '../utils/format';
 import { useNav, type RouteId } from '../state/nav';
+import { PaperBalanceChip } from '../components/copy/PaperBankroll';
 
 const ITEMS: Array<{ id: RouteId; label: string; icon: typeof Home }> = [
   { id: 'home', label: 'Home', icon: Home },
@@ -320,11 +321,13 @@ function AppearanceToggle() {
 
 export function TopNav({ current }: { current: RouteId }) {
   const nav = useNav();
+  const { chain } = useTerminal();
+  const { status } = useAppState();
   return (
     <header className="relative z-20 flex h-14 shrink-0 items-center gap-6 border-b border-white/8 bg-card px-5">
       <button onClick={() => nav.go('home')} className="flex items-center gap-2.5" title="Home">
         <img src="./krypt.png" alt="" className="h-7 w-7 rounded-lg" />
-        <span className="text-[15px] font-semibold tracking-display text-white">Krypto Mirror</span>
+        <span className="whitespace-nowrap text-[15px] font-semibold tracking-display text-white">Krypto Mirror</span>
       </button>
 
       <nav className="flex items-center gap-1" aria-label="Main">
@@ -350,6 +353,7 @@ export function TopNav({ current }: { current: RouteId }) {
         <ProfileBadge />
         <ChainPicker />
         <ModeSwitch />
+        {chain === 'solana' && !status.liveActive && <PaperBalanceChip onOpen={() => nav.go('settings')} />}
         <Balance onOpen={() => nav.go('wallet')} />
         <AppearanceToggle />
         {/* The Guides (tutorial videos) live under Settings; this is their own door. */}

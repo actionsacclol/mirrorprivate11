@@ -22,6 +22,11 @@ let access = 'live';
 let budget = { maxBuySol: 0.1, hourlyCapSol: 0.5, maxTradesPerMinute: 4 };
 let calls;
 let answers;
+// Follows (2026-11-01): an in-memory book the follow tools edit.
+let follows = [];
+let liveOpen = {};
+let notices = [];
+let saves = [];
 
 function setup(over = {}) {
   tools._reset();
@@ -97,8 +102,30 @@ function setup(over = {}) {
       calls.desk.push({ name: 'sellCopy', configId, mint, percent, reason });
       return { ok: true, message: 'Selling.' };
     },
+    // The fake saves what it is given, and does NOT disarm a live follow
+    // itself — so a test that sees one saved off proves mcpTools did it,
+    // not copyTrade.upsert's second wall.
+    follows: () => follows.map((c) => ({ ...c })),
+    liveOpenCopies: (id) => liveOpen[id] ?? 0,
+    saveFollow: (input) => {
+      saves.push({ ...input });
+      if (input.id) {
+        const c = follows.find((x) => x.id === input.id);
+        if (!c) return { ok: false, message: 'Config not found' };
+        Object.assign(c, input);
+        return { ok: true, message: 'Saved' };
+      }
+      if (follows.some((c) => c.wallet === input.wallet && (c.chain ?? 'solana') === (input.chain ?? 'solana'))) return { ok: false, message: 'You are already following that wallet on that chain' };
+      follows.push({ ...input, id: `cp_${follows.length + 1}`, createdAt: 1 });
+      return { ok: true, message: 'Following' };
+    },
+    followNotice: (title, line) => notices.push({ title, line }),
     log: () => {},
   });
+  follows = over.follows ?? [];
+  liveOpen = over.liveOpen ?? {};
+  notices = [];
+  saves = [];
 }
 
 // ── arguments are refused, never coerced ─────────────────────────────────
@@ -507,4 +534,256 @@ function setup(over = {}) {
   ok('the desk: the feed is a read; decide_trade and sell_copy are trades, checked and refused in words; a live follow needs a live connection');
 }
 
-console.log(`\nmcptools: ${passed}/13 passed`);
+// ── follows (2026-11-01): create and edit, narrow-only on live ──────────
+const LEAD_A = 'LeadA111111111111111111111111111111111111';
+const LEAD_B = 'LeadB111111111111111111111111111111111111';
+const LEAD_C = 'LeadC111111111111111111111111111111111111';
+{
+  // A read-only connection changes nothing.
+  setup();
+  access = 'read';
+  assert.match((await tools.call('create_follow', { wallet: LEAD_A })).text, /read only/);
+  assert.match((await tools.call('pause_follow', { configId: 'cp_1' })).text, /read only/);
+  assert.equal(saves.length, 0);
+
+  // Paper: born switched on, from the Follow page's defaults plus what was sent.
+  setup();
+  access = 'paper';
+  let r = await tools.call('create_follow', { wallet: LEAD_A, label: 'Alpha', sizeValue: 0.2, exitStopLossPct: 30 });
+  assert.equal(r.ok, true, r.text);
+  assert.match(r.text, /Created a paper follow of LeadA1… \(Alpha\), switched on/);
+  assert.equal(r.data.configId, 'cp_1');
+  const a = follows[0];
+  assert.equal(a.mode, 'paper');
+  assert.equal(a.enabled, true, 'a paper follow may be created switched on');
+  assert.equal(a.sizeValue, 0.2);
+  assert.equal(a.maxTradeSol, 0.2, 'the cap is derived from the size, as the Follow page derives it');
+  assert.equal(a.exitStopLossPct, 30);
+  assert.equal(a.walletId, null, 'the AI never picks the wallet copies sign with');
+  assert.deepEqual(notices.at(-1), { title: 'AI created a follow', line: 'AI created a paper follow of LeadA1… (Alpha) on Solana, switched on' });
+  // enabled:false is honoured on paper.
+  r = await tools.call('create_follow', { wallet: LEAD_B, enabled: false });
+  assert.equal(r.ok, true);
+  assert.equal(follows[1].enabled, false);
+  // The same wallet twice is the save path's refusal, passed through.
+  assert.match((await tools.call('create_follow', { wallet: LEAD_A })).text, /already following/);
+
+  // A paper connection does not set up live follows, even disarmed ones.
+  const before = saves.length;
+  assert.match((await tools.call('create_follow', { wallet: LEAD_C, mode: 'live' })).text, /needs a live connection/);
+  // validateConfig's own words come back, and nothing is saved.
+  assert.match((await tools.call('create_follow', { wallet: LEAD_C, maxTradeSol: 30 })).text, /Max per trade must be between 0 and 25 SOL/);
+  assert.match((await tools.call('create_follow', { wallet: LEAD_C, direction: 'watch', mode: 'live' })).text, /needs a live connection/);
+  assert.match((await tools.call('create_follow', { wallet: 'nope' })).text, /not a wallet address on Solana/);
+  assert.match((await tools.call('create_follow', { wallet: LEAD_C, sizeValue: '0.1' })).text, /sizeValue must be a number/);
+  assert.match((await tools.call('create_follow', { wallet: LEAD_C, dailyLossLimitSol: null })).text, /cannot be switched off/);
+  // Fields the AI never sets are refused with the reason, not as typos.
+  r = await tools.call('create_follow', { wallet: LEAD_C, walletId: 'w2' });
+  assert.match(r.text, /cannot set walletId — the wallet copies sign with is for the user to change, in the app/);
+  assert.match((await tools.call('create_follow', { wallet: LEAD_C, ai: { entries: true } })).text, /whether the AI decides its trades/);
+  assert.match((await tools.call('create_follow', { wallet: LEAD_C, fomoSource: 'top' })).text, /the convergence crowd/);
+  assert.equal(saves.length, before, 'not one of the refusals reached the save');
+  ok('create_follow: a paper follow is born switched on from the Follow page defaults; bad settings, signing wallet, AI gate and live-from-paper are refused before any save');
+}
+
+{
+  // LIVE: always saved switched off, whatever was asked, and said so.
+  setup();
+  access = 'live';
+  const r = await tools.call('create_follow', { wallet: LEAD_A, label: 'Alpha', mode: 'live', enabled: true, sizeValue: 0.2 });
+  assert.equal(r.ok, true, r.text);
+  assert.equal(saves[0].enabled, false, 'saved disarmed by mcpTools itself — not left to copyTrade.upsert');
+  assert.equal(follows[0].mode, 'live');
+  assert.equal(follows[0].enabled, false);
+  assert.match(r.text, /LIVE follow .* saved switched OFF \(disarmed\)/);
+  assert.match(r.text, /You asked for it switched on; a live follow the AI creates is always saved off/);
+  assert.match(r.text, /until the user switches it on themselves in the app’s Following page/);
+  assert.match(notices.at(-1).line, /AI created a live follow of LeadA1… \(Alpha\) on Solana, saved switched OFF — the user must switch it on in Following/);
+  // Resuming it is the user's.
+  const res = await tools.call('resume_follow', { configId: 'cp_1' });
+  assert.equal(res.ok, false);
+  assert.match(res.text, /LIVE follow.*only the user can do that, in the app/);
+  assert.match((await tools.call('update_follow', { configId: 'cp_1', enabled: true })).text, /switching it back on \(only the user arms a live follow\)/);
+  assert.equal(follows[0].enabled, false);
+  assert.equal(saves.length, 1);
+  ok('create_follow live: saved switched off even when asked on, the answer says the user must arm it, and neither resume_follow nor update_follow can arm it');
+}
+
+{
+  // An armed live follow (the user switched it on) the AI may only narrow.
+  setup();
+  access = 'live';
+  await tools.call('create_follow', {
+    wallet: LEAD_A,
+    label: 'Alpha',
+    mode: 'live',
+    sizeValue: 0.2,
+    maxTradeSol: 0.3,
+    walletLossStopSol: 0.8,
+    exitStopLossPct: 25,
+    blockedMints: [MINT],
+    activeFromMin: 480,
+    activeToMin: 1320,
+  });
+  follows[0].enabled = true; // the user armed it in the app
+  const id = follows[0].id;
+  const base = { ...follows[0] };
+  const widen = [
+    [{ sizeValue: 0.25 }, /sizeValue 0\.2 → 0\.25 \(higher\)/],
+    [{ maxTradeSol: 0.5 }, /maxTradeSol 0\.3 → 0\.5 \(higher\)/],
+    [{ dailyLossLimitSol: 5 }, /dailyLossLimitSol .* \(higher\)/],
+    [{ dailyTradeLimit: 400 }, /dailyTradeLimit 20 → 400 \(higher\)/],
+    [{ maxCopiesPerMinute: 30 }, /maxCopiesPerMinute 10 → 30 \(higher\)/],
+    [{ walletLossStopSol: 2 }, /walletLossStopSol 0\.8 → 2 \(higher\)/],
+    [{ walletLossStopSol: null }, /walletLossStopSol 0\.8 → off \(removed\)/],
+    [{ exitStopLossPct: null }, /exitStopLossPct 25 → off \(removed\)/],
+    [{ exitStopLossPct: 40 }, /exitStopLossPct 25 → 40 \(looser\)/],
+    [{ maxSlippagePct: 20 }, /maxSlippagePct 8 → 20 \(higher\)/],
+    [{ minLiquidityUsd: null }, /minLiquidityUsd 5000 → off \(removed\)/],
+    [{ minLiquidityUsd: 1000 }, /minLiquidityUsd 5000 → 1000 \(lower\)/],
+    [{ minLeaderSellPct: 80 }, /minLeaderSellPct 50 → 80 \(fewer of their sells followed\)/],
+    [{ exitMaxHoldMin: null }, /exitMaxHoldMin 30 → off \(removed\)/],
+    [{ copySells: false }, /copySells on → off/],
+    [{ blockedMints: null }, /blockedMints: 1 entry removed/],
+    [{ activeFromMin: 0, activeToMin: 1439 }, /trading hours 08:00–22:00 → 00:00–23:59 \(longer\)/],
+    [{ activeFromMin: null, activeToMin: null }, /trading hours 08:00–22:00 → all day \(longer\)/],
+    [{ direction: 'reverse' }, /direction copy → reverse \(fixed on a live follow\)/],
+    [{ sizing: 'proportional' }, /sizing fixed → proportional \(fixed on a live follow\)/],
+    [{ delayMs: 500 }, /delayMs 0 → 500 \(fixed on a live follow\)/],
+    [{ enabled: false, maxTradeSol: 1 }, /maxTradeSol 0\.3 → 1 \(higher\)/], // one widening edit refuses the whole call
+  ];
+  for (const [patch, re] of widen) {
+    const r = await tools.call('update_follow', { configId: id, ...patch });
+    assert.equal(r.ok, false, `${JSON.stringify(patch)} should be refused on a live follow`);
+    assert.match(r.text, re, r.text);
+    assert.match(r.text, /LIVE follow, so the AI may only make it safer\. Refused, and nothing was changed/);
+    assert.match(r.text, /the user can make (that change|those changes) in the app, on the Following page/i);
+  }
+  assert.equal(saves.filter((s) => s.id).length, 0, 'no widening edit reached the save');
+  assert.deepEqual(follows[0], base, 'and the follow is exactly as it was');
+  // The followed wallet, the chain, paper/live and the signing wallet are the user's.
+  for (const [patch, re] of [
+    [{ wallet: LEAD_B }, /cannot set wallet — the followed wallet is for the user to change/],
+    [{ mode: 'paper' }, /cannot set mode — paper or live is for the user/],
+    [{ walletId: 'w2' }, /the wallet copies sign with/],
+    [{ chain: 'bnb' }, /cannot set chain/],
+  ]) {
+    assert.match((await tools.call('update_follow', { configId: id, ...patch })).text, re);
+  }
+  assert.equal(saves.filter((s) => s.id).length, 0);
+  ok('update_follow on a live follow: every widening edit (sizes, limits, stops removed or loosened, filters off, hours longer, direction, sizing, delay, re-arming) is refused whole with the reason; wallet, chain, mode and signing wallet are user-only');
+
+  // Narrowing is allowed, in one call, and the user is told.
+  const r = await tools.call('update_follow', {
+    configId: id,
+    label: 'Alpha tight',
+    sizeValue: 0.15,
+    maxTradeSol: 0.2,
+    dailyLossLimitSol: 0.3,
+    dailyTradeLimit: 5,
+    maxCopiesPerMinute: 3,
+    walletLossStopSol: 0.4,
+    maxSlippagePct: 5,
+    exitStopLossPct: 15,
+    exitTrailingPct: 20,
+    exitTakeProfitPct: 60,
+    minLeaderSellPct: null,
+    minLiquidityUsd: 20000,
+    maxMarketCapUsd: 2000000,
+    minTokenAgeSec: 60,
+    maxBuysPerToken: 1,
+    blockedMints: [MINT, LEAD_C],
+    onlyPumpfun: true,
+    onePositionPerCoin: true,
+    exitOnMigration: true,
+    copyOtherExits: true,
+    exitOnCreatorSellPct: 20,
+    activeFromMin: 540,
+    activeToMin: 1020,
+  });
+  assert.equal(r.ok, true, r.text);
+  const f = follows[0];
+  assert.equal(f.enabled, true, 'narrowing leaves it armed — it did not arm anything');
+  assert.equal(f.sizeValue, 0.15);
+  assert.equal(f.maxTradeSol, 0.2);
+  assert.equal(f.walletLossStopSol, 0.4, 'a smaller per-wallet stop is the safer one');
+  assert.equal(f.exitStopLossPct, 15, 'a tighter stop-loss is the safer one');
+  assert.equal(f.exitTrailingPct, 20, 'adding a trailing stop is allowed');
+  assert.equal(f.minLeaderSellPct, null, 'following every sell out is allowed');
+  assert.deepEqual(f.blockedMints, [MINT, LEAD_C]);
+  assert.equal(f.label, 'Alpha tight');
+  assert.match(r.text, /^Changed the LIVE follow of LeadA1…/);
+  assert.equal(notices.at(-1).title, 'AI changed a follow');
+  assert.match(notices.at(-1).line, /^AI changed the live follow of LeadA1… \(Alpha\): .*maxTradeSol 0\.3 → 0\.2/);
+  // Nothing sent that changes nothing is said, not saved.
+  const savesNow = saves.length;
+  assert.match((await tools.call('update_follow', { configId: id, maxTradeSol: 0.2 })).text, /Nothing to change/);
+  assert.match((await tools.call('update_follow', { configId: id })).text, /send at least one setting/);
+  assert.equal(saves.length, savesNow);
+  // Narrowing below the live floor is validateConfig's refusal, in its words.
+  assert.match((await tools.call('update_follow', { configId: id, sizeValue: 0.001, maxTradeSol: 0.001 })).text, /smallest live copy/);
+  ok('update_follow on a live follow: lower sizes and limits, a smaller stop, tighter or added exits, stricter filters and shorter hours are applied together, the follow stays as armed as it was, and the user is told');
+
+  // Pausing is always allowed; resuming it is not.
+  const p = await tools.call('pause_follow', { configId: id, reason: 'leader went quiet' });
+  assert.equal(p.ok, true, p.text);
+  assert.equal(follows[0].enabled, false);
+  assert.match(notices.at(-1).line, /^AI paused the live follow of LeadA1… \(Alpha tight\): paused — leader went quiet$/);
+  assert.match((await tools.call('pause_follow', { configId: id })).text, /already switched off/);
+  assert.equal((await tools.call('resume_follow', { configId: id })).ok, false);
+  assert.equal(follows[0].enabled, false, 'a live follow stays off until the user switches it on');
+  assert.match((await tools.call('pause_follow', { configId: 'cp_99' })).text, /No follow cp_99/);
+  // A paper connection may pause a live follow too: it only makes it safer.
+  follows[0].enabled = true;
+  access = 'paper';
+  assert.equal((await tools.call('pause_follow', { configId: id })).ok, true);
+  assert.equal(follows[0].enabled, false);
+  ok('pause_follow pauses a live follow from any trading connection and says so; resume_follow refuses a live one');
+}
+
+{
+  // A paper follow may change freely — unless it still holds live copies.
+  setup();
+  access = 'paper';
+  await tools.call('create_follow', { wallet: LEAD_A, sizeValue: 0.1, walletLossStopSol: 0.4, enabled: false });
+  const id = follows[0].id;
+  let r = await tools.call('update_follow', { configId: id, sizeValue: 1, maxTradeSol: 2, walletLossStopSol: null, exitStopLossPct: null, direction: 'reverse', delayMs: 2000, enabled: true });
+  assert.equal(r.ok, true, r.text);
+  assert.equal(follows[0].maxTradeSol, 2);
+  assert.equal(follows[0].enabled, true, 'a paper follow may be switched back on');
+  assert.equal(follows[0].direction, 'reverse');
+  assert.match(notices.at(-1).line, /^AI changed the paper follow of LeadA1…: switched on, direction copy → reverse/);
+  // Still checked like the form.
+  assert.match((await tools.call('update_follow', { configId: id, sizeValue: 3 })).text, /Fixed size is above your own max per trade/);
+  // Pause and resume a paper follow.
+  assert.equal((await tools.call('pause_follow', { configId: id })).ok, true);
+  r = await tools.call('resume_follow', { configId: id, reason: 'back to testing' });
+  assert.equal(r.ok, true, r.text);
+  assert.equal(follows[0].enabled, true);
+  assert.match(notices.at(-1).line, /^AI resumed the paper follow of LeadA1…: switched on — back to testing$/);
+
+  // A follow switched back to paper with live copies open: those copies'
+  // exits run on its settings, so it is judged as live.
+  setup({ liveOpen: { cp_1: 2 } });
+  access = 'paper';
+  await tools.call('create_follow', { wallet: LEAD_A, sizeValue: 0.2, exitStopLossPct: 20 });
+  r = await tools.call('update_follow', { configId: 'cp_1', exitStopLossPct: null });
+  assert.equal(r.ok, false);
+  assert.match(r.text, /a paper follow with 2 live copies still open, so the AI may only make it safer/);
+  assert.equal(follows[0].exitStopLossPct, 20);
+  assert.equal((await tools.call('update_follow', { configId: 'cp_1', exitStopLossPct: 10 })).ok, true, 'tightening it is fine');
+  assert.equal((await tools.call('pause_follow', { configId: 'cp_1' })).ok, true);
+  assert.equal((await tools.call('resume_follow', { configId: 'cp_1' })).ok, true, 'and its new copies are paper, so it may be switched back on');
+  assert.equal(follows[0].enabled, true);
+
+  // A reverse follow's empty exit is its default, not "off": loosening the
+  // default 20 % stop is still loosening.
+  setup();
+  access = 'live';
+  await tools.call('create_follow', { wallet: LEAD_B, mode: 'live', direction: 'reverse', sizeValue: 0.2 });
+  assert.match((await tools.call('update_follow', { configId: 'cp_1', exitStopLossPct: 30 })).text, /exitStopLossPct 20 → 30 \(looser\)/);
+  assert.equal((await tools.call('update_follow', { configId: 'cp_1', exitStopLossPct: 10 })).ok, true);
+  ok('update_follow on paper: any valid setting, switching it on, pause and resume; a paper follow holding live copies is judged as live; a reverse follow’s default exits count');
+}
+
+console.log(`\nmcptools: ${passed}/19 passed`);

@@ -430,6 +430,12 @@ declare global {
         /** Clear PAPER results — one config, or all when omitted. Settings,
          *  live history, leader records and real holdings are untouched. */
         resetPaper: (configId?: string) => Promise<IpcResult<CopySnapshot>>;
+        paperBankroll: (input: { enabled?: boolean; usd?: number; restart?: boolean }) => Promise<IpcResult<CopySnapshot>>;
+        /** Backtest a follow's settings (2026-11-01): a saved one by id, or
+         *  an unsaved draft, over its wallet's newest trades or its week. */
+        backtest: (input: { id?: string; config?: Partial<CopyConfig> }, opts?: { week?: boolean }) => Promise<IpcResult<import('@shared/copyReplay').CopyReplayStatus>>;
+        backtestStatus: (wallet: string) => Promise<IpcResult<import('@shared/copyReplay').CopyReplayStatus>>;
+        backtestCancel: (wallet: string) => Promise<IpcResult<import('@shared/copyReplay').CopyReplayStatus>>;
       };
       automation: {
         list: () => Promise<IpcResult<import('@shared/automation').ScriptSnapshot>>;

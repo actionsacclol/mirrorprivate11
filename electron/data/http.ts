@@ -65,7 +65,11 @@ const HOSTS: Record<HttpProviderId, string> = {
   dexscreener: 'api.dexscreener.com',
   pumpfun: 'frontend-api-v3.pump.fun',
   geckoterminal: 'api.geckoterminal.com',
-  pumpswap: 'swap-api.pump.fun',
+  // pump.fun's coin trade tape and candles. Was swap-api.pump.fun until its
+  // trade route answered 410 (2026-11-01); the same data now lives here, on
+  // the routes pump.fun's own site calls (providers/pumpswap.ts). A provider
+  // of its own beside `pumpfun`, so a park on the tape never stops coin reads.
+  pumpswap: 'frontend-api-v3.pump.fun',
   birdeye: 'public-api.birdeye.so',
   helius: 'mainnet.helius-rpc.com',
   rugcheck: 'api.rugcheck.xyz',
@@ -293,7 +297,9 @@ const MIN_GAP_MS: Record<HttpProviderId, number> = {
   dexscreener: 250,
   pumpfun: 260,
   geckoterminal: 2_100, // 30/min with headroom
-  // swap-api.pump.fun — MEASURED 2026-09-21, because the Wallet Scout's scan
+  // The trade tape. Kept at the pace MEASURED on swap-api.pump.fun 2026-09-21
+  // (the host it used to live on — not yet re-measured on frontend-api-v3).
+  // It was measured because the Wallet Scout's scan
   // "worked for two minutes and then got limited". The `x-ratelimit-limit:
   // 1000` it answers is not the limit that bites: a Cloudflare rule (HTTP
   // 429, body `error code: 1015`, `Retry-After: 34`) blocks the IP for ~35 s
@@ -1146,13 +1152,17 @@ export async function getJson<T>(id: HttpProviderId, path: string, opts: FetchOp
       status = res.status;
       if (!res.ok) {
         // A 4xx body usually names the reason (Jupiter: "Could not find any
-        // route", "not tradable"); a bare status sent people hunting.
+        // route", "not tradable"); a bare status sent people hunting. So does
+        // a 5xx (2026-11-01: pump's tape answered 503 and the log said only
+        // that — its body names the lane that is down).
         let detail = '';
-        if (res.status !== 429 && res.status >= 400 && res.status < 500) {
+        if (res.status !== 429 && res.status >= 400) {
           try {
             const text = (await readCapped(res, 2_048)).trim();
             const parsed = text.startsWith('{') ? (JSON.parse(text) as { error?: string; message?: string }) : null;
-            detail = (parsed?.error ?? parsed?.message ?? text).replace(/\s+/g, ' ').slice(0, 160);
+            const title = !parsed && text.startsWith('<') ? /<title>([^<]*)<\/title>/i.exec(text)?.[1] : undefined;
+            const raw = parsed?.error ?? parsed?.message ?? title ?? text;
+            detail = (typeof raw === 'string' ? raw : JSON.stringify(raw)).replace(/\s+/g, ' ').slice(0, 160);
           } catch {
             /* body unreadable — the status still tells enough */
           }

@@ -216,7 +216,11 @@ const ok = (label) => {
   // session tools are the two reads, trader_act and Krypto Mode's pair.
   const sessionTools = MCP_TOOLS.filter((t) => /trader|session|krypto/.test(t.name)).map((t) => t.name).sort();
   assert.deepEqual(sessionTools, ['get_krypto_sessions', 'get_trader_session', 'get_trader_sessions', 'krypto_mode_trade', 'trader_act']);
+  // The follow tools (2026-11-01) create and resume FOLLOWS, not sessions,
+  // under their own rules (pinned in the follows block below).
+  const FOLLOW_TOOLS = ['create_follow', 'update_follow', 'pause_follow', 'resume_follow'];
   for (const t of MCP_TOOLS) {
+    if (FOLLOW_TOOLS.includes(t.name)) continue;
     assert.ok(!/create|start|fund|resume|configure|open_session|go_live|set_limits|set_envelope/.test(t.name), `${t.name} does not create, fund, start, resume or configure anything`);
   }
   for (const k of ['budget', 'budgetSol', 'mint', 'wallet', 'walletId', 'driver', 'limits', 'live', 'mode', 'preset', 'goal']) {
@@ -225,6 +229,33 @@ const ok = (label) => {
   assert.equal(toolAllowed('trader_act', 'read').ok, false, 'a read-only connection cannot act');
   assert.equal(toolAllowed('get_trader_session', 'read').ok, true);
   ok('Krypto Trader: two read tools and trader_act (intent + expected_seq); no tool creates, funds, starts, resumes or configures a session');
+}
+
+// ── follows (2026-11-01): create and edit, never arm, never delete ───────
+{
+  const byName = Object.fromEntries(MCP_TOOLS.map((t) => [t.name, t]));
+  for (const n of ['create_follow', 'update_follow', 'pause_follow', 'resume_follow']) {
+    assert.equal(byName[n]?.tier, 'trade', `${n} needs a trading connection`);
+    assert.equal(toolAllowed(n, 'read').ok, false, `${n}: a read-only connection cannot change follows`);
+    assert.equal(toolAllowed(n, 'paper').ok, true);
+  }
+  assert.ok(!MCP_TOOLS.some((t) => /delete|remove/.test(t.name) && /follow|copy/.test(t.name)), 'no tool deletes a follow');
+  // What the AI never sets: the wallet copies sign with and the AI gate,
+  // anywhere; after creation also the followed wallet, chain and mode.
+  for (const n of ['create_follow', 'update_follow']) {
+    for (const k of ['walletId', 'ai', 'lossStopFrom', 'pausedReason', 'pausedAt', 'fomoSource', 'fomoWallets']) assert.ok(!(k in byName[n].inputSchema.properties), `${n} cannot set ${k}`);
+  }
+  for (const k of ['wallet', 'chain', 'mode']) assert.ok(!(k in byName.update_follow.inputSchema.properties), `update_follow cannot change ${k}`);
+  assert.deepEqual(byName.create_follow.inputSchema.required, ['wallet']);
+  // The limits are in the words the AI reads.
+  assert.match(byName.create_follow.description, /ALWAYS saved switched OFF/);
+  assert.match(byName.create_follow.description, /cannot arm it/);
+  assert.match(byName.update_follow.description, /only make it SAFER/);
+  assert.match(byName.update_follow.description, /refused whole/);
+  assert.match(byName.resume_follow.description, /Refused on a LIVE follow/);
+  assert.match(MCP_INSTRUCTIONS, /A LIVE follow you create is always saved switched OFF/);
+  assert.match(MCP_INSTRUCTIONS, /cannot delete a follow/);
+  ok('follow tools: trade tier, no delete, never the signing wallet / AI gate / wallet / mode, and the limits are stated in the descriptions');
 }
 
 // ── one connect snippet per client (2026-09-27, "Astra couldn't connect") ─
@@ -306,4 +337,4 @@ const ok = (label) => {
   ok('every client gets its own verified shape: per-profile name and port, loopback only, token copied but never shown, and what cannot connect is named');
 }
 
-console.log(`\nmcp: ${passed}/7 passed`);
+console.log(`\nmcp: ${passed}/8 passed`);

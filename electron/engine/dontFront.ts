@@ -14,9 +14,11 @@
 // sandwiches per 10,000 swaps at 10–20 % slippage against 8 at 1–3 %).
 
 import { PublicKey, SystemProgram, type TransactionInstruction } from '@solana/web3.js';
+import { JITO_DONT_FRONT } from '../chain/tipAccounts';
 
-/** A valid 32-byte address that starts with the marker. */
-export const JITO_DONT_FRONT = 'jitodontfront111111111111111111111111111111';
+/** A valid 32-byte address that starts with the marker (kept beside the tip
+ * accounts so the signer can allow its zero-lamport transfer). */
+export { JITO_DONT_FRONT };
 
 /** The marker as an instruction: a transfer of nothing from `owner`. */
 export function dontFrontIx(owner: string): TransactionInstruction {

@@ -188,7 +188,10 @@ const FETCH_BACKOFF_MS = [120, 300, 800, 2_000, 5_000];
 /** How long a read-back may queue for the primary's budget before it goes to
  *  the fallback endpoint instead (a read is ~60–120 ms when it is served). */
 const READ_QUEUE_TOLERANCE_MS = 300;
-const SEEN_CAP = 2_000;
+/** Signatures already handled. Was 2,000: one bot-like leader sends that
+ *  many in minutes, and an evicted signature is one the catch-up re-chases
+ *  (support bundle 2026-11-01). Strings of ~88 bytes — 20,000 is ~2 MB. */
+const SEEN_CAP = 20_000;
 
 // ── Catch-up ──────────────────────────────────────────────────────────
 //
@@ -695,11 +698,242 @@ function subscribe(wallet: string): void {
   }
 }
 
-/** Signatures given a second round of reads after every endpoint refused
- *  the first (2026-10-28). One more round each, never a loop. */
-const reread = new Set<string>();
-/** How long the second round waits, so a short outage can pass. */
-const REREAD_DELAY_MS = 30_000;
+// ── The read queue (2026-11-01) ────────────────────────────────────────
+//
+// A support bundle held 34,653 "could not read … timeout" lines in a few
+// hours, 30,066 of them for ONE leader, and 448 trades not copied. The
+// user's connection dropped; what followed was ours:
+//
+//   • every notification started its own read loop — six tries, each with
+//     an 8 s timeout — so thousands ran at once and kept the endpoint
+//     saturated after it came back, starving every other leader;
+//   • a refused read got "one more round in 30 s", remembered in a set
+//     capped at 2,000 that evicted oldest-first. With ~7,000 signatures
+//     waiting, a signature was evicted before its second round failed, so
+//     the failure counted as a first one and scheduled ANOTHER round — the
+//     same batch re-chased every ~3 minutes, forever.
+//
+// Now every read goes through one queue: a few at a time, round-robin
+// across leaders (a busy leader fills only its own queue, which is capped),
+// the round carried ON the job so a second round is final by construction,
+// a pause with a probe while the endpoints refuse everything, and one
+// summary line per leader instead of one per signature.
+
+type ReadJob = {
+  wallet: string;
+  signature: string;
+  feed: LeaderFeedMethod;
+  recovered: boolean;
+  /** 1, then 2 after the endpoints refused it. Never a third. */
+  round: 1 | 2;
+  /** When we first heard of it; the give-up clock runs from here. */
+  firstAt: number;
+  /** Not before this (the pause before a second round). */
+  notBefore: number;
+  /** When the notification arrived, for the delivery timing. */
+  detectedAt: number;
+};
+
+/** Reads in flight across every leader. */
+const MAX_READS_IN_FLIGHT = 6;
+/** Per leader, so one cannot take every slot; a catch-up read runs alone. */
+const MAX_READS_PER_WALLET = 2;
+/** Waiting reads per leader. Past it the OLDEST is given up: on a copy
+ *  path the newest trade is the one still worth acting on. */
+const WALLET_QUEUE_CAP = 150;
+/** A read still not done this long after we heard of it is given up. */
+const READ_GIVE_UP_MS = 10 * 60_000;
+/** Refusals in a row inside one job before it waits for its second round. */
+const JOB_REFUSALS = 3;
+/** Refusals in a row across all reads that mean the endpoints are down. */
+const OUTAGE_REFUSALS = 12;
+/** In an outage, one probe read this often; the rest wait. */
+let OUTAGE_PROBE_MS = 5_000;
+/** The pause before a refused read's second round, so an outage can pass. */
+let REREAD_DELAY_MS = 30_000;
+/** One summary line per leader at most this often. */
+let READ_SUMMARY_MS = 30_000;
+
+/** Test seam: shorten the queue clocks so a test need not wait minutes. */
+export function _setReadClocks(o: { rereadMs?: number; probeMs?: number; summaryMs?: number }): void {
+  if (o.rereadMs !== undefined) REREAD_DELAY_MS = o.rereadMs;
+  if (o.probeMs !== undefined) OUTAGE_PROBE_MS = o.probeMs;
+  if (o.summaryMs !== undefined) READ_SUMMARY_MS = o.summaryMs;
+}
+
+const readQueues = new Map<string, ReadJob[]>();
+const inFlightBy = new Map<string, number>();
+let readsInFlight = 0;
+let refusedStreak = 0;
+let outageSince = 0;
+let lastProbeAt = 0;
+let pumpTimer: NodeJS.Timeout | null = null;
+/** Round-robin cursor: the leader served last. */
+let lastServed = '';
+
+type ReadTally = { retry: number; gaveUp: number; reasons: Map<string, number>; lastSig: string };
+const tallies = new Map<string, ReadTally>();
+let summaryTimer: NodeJS.Timeout | null = null;
+
+function tally(wallet: string): ReadTally {
+  let t = tallies.get(wallet);
+  if (!t) {
+    t = { retry: 0, gaveUp: 0, reasons: new Map(), lastSig: '' };
+    tallies.set(wallet, t);
+  }
+  if (!summaryTimer) {
+    summaryTimer = setTimeout(flushReadSummary, READ_SUMMARY_MS);
+    summaryTimer.unref?.();
+  }
+  return t;
+}
+
+/** Reasons are kept short and countable: the endpoint's words, no ids. */
+function reasonKey(why: string): string {
+  return why.replace(/\s+/g, ' ').slice(0, 80);
+}
+
+/** Write the waiting summary lines now (also the test seam). */
+export function flushReadSummary(): void {
+  if (summaryTimer) clearTimeout(summaryTimer);
+  summaryTimer = null;
+  const h = host;
+  for (const [wallet, t] of tallies) {
+    const n = t.retry + t.gaveUp;
+    if (!n || !h) continue;
+    const why = [...t.reasons].map(([r, k]) => (k > 1 ? `${r} ×${k}` : r)).join('; ');
+    const who = `${wallet.slice(0, 6)}…`;
+    const what = n === 1 ? `transaction ${t.lastSig.slice(0, 8)}…` : `${n} transactions`;
+    const parts: string[] = [];
+    if (t.retry) parts.push(`${t.retry} will be tried once more in ${REREAD_DELAY_MS / 1_000} s`);
+    if (t.gaveUp) parts.push(`${t.gaveUp} given up — ${t.gaveUp === 1 ? 'that trade was' : 'those trades were'} not copied`);
+    h.log('warn', `wallet watcher: could not read ${what} from ${who} (${why}). ${parts.join('; ')}.`);
+  }
+  tallies.clear();
+}
+
+/** What the read queue holds right now (status line and tests). */
+export function readQueueState(): { waiting: number; inFlight: number; outage: boolean } {
+  let waiting = 0;
+  for (const q of readQueues.values()) waiting += q.length;
+  return { waiting, inFlight: readsInFlight, outage: outageSince > 0 };
+}
+
+function enqueueRead(job: ReadJob): void {
+  let q = readQueues.get(job.wallet);
+  if (!q) {
+    q = [];
+    readQueues.set(job.wallet, q);
+  }
+  q.push(job);
+  while (q.length > WALLET_QUEUE_CAP) {
+    const dropped = q.shift();
+    if (dropped) giveUp(dropped, 'too many waiting from this wallet');
+  }
+  pump();
+}
+
+/** The next job to run, round-robin across leaders, or null. */
+function nextJob(now: number): ReadJob | null {
+  const wallets = [...readQueues.keys()];
+  if (!wallets.length) return null;
+  const start = Math.max(0, wallets.indexOf(lastServed) + 1);
+  for (let i = 0; i < wallets.length; i++) {
+    const wallet = wallets[(start + i) % wallets.length];
+    const q = readQueues.get(wallet);
+    if (!q) continue;
+    // Expired first, wherever they sit.
+    for (let k = q.length - 1; k >= 0; k--) {
+      if (now - q[k].firstAt > READ_GIVE_UP_MS) giveUp(q.splice(k, 1)[0], 'still unreadable after 10 minutes');
+    }
+    if (!q.length) {
+      readQueues.delete(wallet);
+      continue;
+    }
+    const busy = inFlightBy.get(wallet) ?? 0;
+    if (busy >= MAX_READS_PER_WALLET) continue;
+    const idx = q.findIndex((j) => j.notBefore <= now);
+    if (idx < 0) continue;
+    // A catch-up read runs alone for its leader, oldest first, so a
+    // recovered buy and the sell after it arrive in that order.
+    if (q[idx].recovered && busy > 0) continue;
+    lastServed = wallet;
+    const job = q.splice(idx, 1)[0];
+    if (!q.length) readQueues.delete(wallet);
+    return job;
+  }
+  return null;
+}
+
+function pump(): void {
+  if (pumpTimer) {
+    clearTimeout(pumpTimer);
+    pumpTimer = null;
+  }
+  const now = Date.now();
+  const outage = outageSince > 0;
+  const limit = outage ? 1 : MAX_READS_IN_FLIGHT;
+  while (readsInFlight < limit) {
+    if (outage && now - lastProbeAt < OUTAGE_PROBE_MS) break;
+    const job = nextJob(now);
+    if (!job) break;
+    if (outage) lastProbeAt = now;
+    readsInFlight += 1;
+    inFlightBy.set(job.wallet, (inFlightBy.get(job.wallet) ?? 0) + 1);
+    void runRead(job).finally(() => {
+      readsInFlight -= 1;
+      const n = (inFlightBy.get(job.wallet) ?? 1) - 1;
+      if (n > 0) inFlightBy.set(job.wallet, n);
+      else inFlightBy.delete(job.wallet);
+      pump();
+    });
+  }
+  // Something is waiting on a clock (a second round, an outage probe):
+  // come back for it rather than relying on the next notification.
+  if (!readQueues.size) return;
+  let wake = Infinity;
+  // Ready jobs need no timer: a finishing read pumps again.
+  for (const q of readQueues.values()) for (const j of q) if (j.notBefore > now) wake = Math.min(wake, j.notBefore);
+  if (outageSince > 0) wake = Math.min(wake, lastProbeAt + OUTAGE_PROBE_MS);
+  if (wake < Infinity) {
+    pumpTimer = setTimeout(pump, Math.max(50, wake - Date.now()));
+    pumpTimer.unref?.();
+  }
+}
+
+function noteRefused(): void {
+  refusedStreak += 1;
+  if (refusedStreak >= OUTAGE_REFUSALS && outageSince === 0) {
+    outageSince = Date.now();
+    lastProbeAt = Date.now();
+    host?.log(
+      'warn',
+      `wallet watcher: the RPC refused the last ${refusedStreak} reads (timeouts or rate limits) — pausing reads and trying one every ${OUTAGE_PROBE_MS / 1_000} s until it answers. Waiting trades are kept for up to ${READ_GIVE_UP_MS / 60_000} minutes.`,
+    );
+  }
+}
+
+function noteServed(): void {
+  refusedStreak = 0;
+  if (outageSince > 0) {
+    const secs = Math.round((Date.now() - outageSince) / 1_000);
+    outageSince = 0;
+    host?.log('info', `wallet watcher: the RPC is answering again after ${secs} s — reading the waiting trades`);
+    pump();
+  }
+}
+
+function giveUp(job: ReadJob, why: string): void {
+  const h = host;
+  if (!h) return;
+  statsFor(job.wallet).unreadable += 1;
+  const t = tally(job.wallet);
+  t.gaveUp += 1;
+  t.lastSig = job.signature;
+  const k = reasonKey(why);
+  t.reasons.set(k, (t.reasons.get(k) ?? 0) + 1);
+  h.onUnreadable?.(job.wallet, job.signature);
+}
 
 function remember(signature: string): boolean {
   if (seen.has(signature)) return false;
@@ -803,6 +1037,16 @@ async function onNotification(wallet: string, signature: string, err: unknown, r
   }
   if (err) return;
   if (!remember(signature)) return;
+  enqueueRead({ wallet, signature, feed, recovered, round: 1, firstAt: detectedAt, notBefore: 0, detectedAt });
+}
+
+/** One queued read: the attempts, the decode, and what happens on failure. */
+async function runRead(job: ReadJob): Promise<void> {
+  const h = host;
+  if (!h) return;
+  const { wallet, signature, feed, recovered, detectedAt } = job;
+  if (!wanted.has(wallet)) return;
+  const s = statsFor(wallet);
   // A just-confirmed transaction can take a beat to be readable, and a
   // rate-limited host can take a great deal longer than a beat.
   let why = 'not readable';
@@ -814,12 +1058,16 @@ async function onNotification(wallet: string, signature: string, err: unknown, r
   // seconds; start on the second endpoint instead.
   const fb0 = h.readFallbackUrl?.() ?? '';
   let onFallback = !!fb0 && fb0 !== h.httpUrl() && budgetWaitMs(h.httpUrl(), 'getTransaction') > READ_QUEUE_TOLERANCE_MS;
-  let refused = false;
+  let refusedInARow = 0;
+  // Started as the outage probe: its failure says the endpoint is still
+  // down, not that this trade is unreadable.
+  const probe = outageSince > 0;
   for (let attempt = 0; attempt < FETCH_ATTEMPTS; attempt++) {
     if (!wanted.has(wallet)) return;
     const fallback = h.readFallbackUrl?.() ?? '';
     const url = onFallback && fallback ? fallback : h.httpUrl();
     const res = await getTransaction(url, signature);
+    if (res.ok) noteServed();
     if (res.ok && res.data) {
       // The read-back INCLUDING every retry and the sleeps between them —
       // which is the number worth seeing, because a second attempt costs
@@ -839,6 +1087,7 @@ async function onNotification(wallet: string, signature: string, err: unknown, r
       // be many minutes old, and the copier decides what to do about that.
       const blockTime = res.data.blockTime;
       const tradeAt = typeof blockTime === 'number' && blockTime > 0 ? blockTime * 1_000 : null;
+      const late = recovered || job.round > 1;
       h.onSwap({
         wallet,
         swap,
@@ -847,11 +1096,12 @@ async function onNotification(wallet: string, signature: string, err: unknown, r
         tradeAt,
         timing: {
           feed,
-          // A RECOVERED transaction can be minutes old through no fault of
-          // the delivery path, so it is not timed at all — averaging those
-          // in would make the feed look far worse than it is.
-          detectMs: recovered || tradeAt === null ? null : Math.max(0, detectedAt - tradeAt),
-          readMs,
+          // A RECOVERED transaction — or one held for a second round — can
+          // be minutes old through no fault of the delivery path, so it is
+          // not timed; averaging those in would make the feed look far
+          // worse than it is.
+          detectMs: late || tradeAt === null ? null : Math.max(0, detectedAt - tradeAt),
+          readMs: job.round > 1 ? null : readMs,
           readTries: attempt + 1,
           decodeMs,
           detectedAt,
@@ -861,40 +1111,44 @@ async function onNotification(wallet: string, signature: string, err: unknown, r
       return;
     }
     why = res.ok ? 'the node does not have it yet' : res.message;
-    refused = !res.ok;
-    if (!res.ok && fallback && fallback !== h.httpUrl()) onFallback = !onFallback;
+    if (res.ok) {
+      refusedInARow = 0;
+    } else {
+      refusedInARow += 1;
+      noteRefused();
+      if (fallback && fallback !== h.httpUrl()) onFallback = !onFallback;
+      // Refused on both endpoints, or the endpoints are down for everyone:
+      // stop spending attempts here and let the queue decide when to retry.
+      if (refusedInARow >= JOB_REFUSALS || outageSince > 0) break;
+    }
     // Short at the front, patient at the tail — see FETCH_BACKOFF_MS. A
     // parked host is not helped by fast retries either way, because
     // `rpcClient` waits out its own park inside the call above.
     const gap = FETCH_BACKOFF_MS[attempt] ?? FETCH_BACKOFF_MS[FETCH_BACKOFF_MS.length - 1];
     await new Promise((r) => setTimeout(r, gap));
   }
-  // Silence here was the bug: a leader trade that is KNOWN to have happened
-  // and could not be read is a copy that will not fire, and the user had no
-  // way to know it. It stays in `seen`, so a later catch-up will not re-chase
-  // a transaction this endpoint cannot serve. Counted too, so the wallet's
-  // status line shows "N unreadable" instead of a swap count that quietly
-  // stopped moving (the v1 outage was found from this line in the Console).
-  // The endpoints REFUSED it (429s, 5xx, timeouts) rather than not having
-  // it: an outage, which passes. One more round after a pause, so a leader's
-  // sell during a short outage is not lost for good (2026-10-28).
-  if (refused && !reread.has(signature)) {
-    reread.add(signature);
-    if (reread.size > SEEN_CAP) {
-      const oldest = reread.values().next().value;
-      if (oldest !== undefined) reread.delete(oldest);
-    }
-    seen.delete(signature);
-    h.log('warn', `wallet watcher: could not read ${wallet.slice(0, 6)}…'s transaction ${signature.slice(0, 8)}… — ${why}. Trying again in ${REREAD_DELAY_MS / 1_000} s.`);
-    const t = setTimeout(() => {
-      if (wanted.has(wallet)) void onNotification(wallet, signature, null, true, feed);
-    }, REREAD_DELAY_MS);
-    t.unref?.();
+  // Silence here was the bug before 2026-09-15: a leader trade that is KNOWN
+  // to have happened and could not be read is a copy that will not fire. It
+  // stays in `seen` — the round is on the job, so nothing here can loop —
+  // and the leader's summary line says how many were retried or given up.
+  if (refusedInARow > 0 && probe && outageSince > 0) {
+    // Back to the front of its leader's queue, round unspent; the 10-minute
+    // limit still bounds how long anything waits.
+    const q = readQueues.get(wallet) ?? [];
+    q.unshift(job);
+    readQueues.set(wallet, q);
     return;
   }
-  s.unreadable += 1;
-  h.log('warn', `wallet watcher: could not read ${wallet.slice(0, 6)}…'s transaction ${signature.slice(0, 8)}… — ${why}. That trade was not copied.`);
-  h.onUnreadable?.(wallet, signature);
+  if (refusedInARow > 0 && job.round === 1) {
+    const t = tally(wallet);
+    t.retry += 1;
+    t.lastSig = signature;
+    const k = reasonKey(why);
+    t.reasons.set(k, (t.reasons.get(k) ?? 0) + 1);
+    enqueueRead({ ...job, round: 2, notBefore: Date.now() + REREAD_DELAY_MS });
+    return;
+  }
+  giveUp(job, why);
 }
 
 /**
@@ -978,6 +1232,21 @@ export function _reset(): void {
   wanted.clear();
   stats.clear();
   seen.clear();
+  readQueues.clear();
+  inFlightBy.clear();
+  readsInFlight = 0;
+  refusedStreak = 0;
+  outageSince = 0;
+  lastProbeAt = 0;
+  lastServed = '';
+  if (pumpTimer) clearTimeout(pumpTimer);
+  pumpTimer = null;
+  tallies.clear();
+  if (summaryTimer) clearTimeout(summaryTimer);
+  summaryTimer = null;
+  REREAD_DELAY_MS = 30_000;
+  OUTAGE_PROBE_MS = 5_000;
+  READ_SUMMARY_MS = 30_000;
   attempts = 0;
   currentUrl = '';
   capNotedAt = 0;

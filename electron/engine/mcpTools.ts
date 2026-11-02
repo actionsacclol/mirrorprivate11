@@ -29,6 +29,8 @@
 // taking a `chain` it cannot honour.
 
 import { canSpend, canTrade, checkMcpTrade, toolByName, type McpAccess, type McpBudget, type McpTradeAttempt } from '@shared/mcp';
+import { chainOf, validateConfig, type CopyConfig } from '@shared/copytrade';
+import { buildFollow, describeFollowChanges, liveEditRefusals, readFollowPatch, type FollowPatch } from '@shared/followEdit';
 import type { McpToolOutcome } from '../system/mcpServer';
 
 const BASE58 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -106,6 +108,17 @@ export interface McpToolsHost {
    *  it is still open (a follow switched back to paper keeps its live rows). */
   copyMode(configId: string, mint?: string): 'paper' | 'live' | null;
   sellCopy(configId: string, mint: string, percent: number, reason: string): { ok: boolean; message: string };
+  // ── Follows (2026-11-01): create_follow / update_follow / pause / resume ──
+  /** Every follow, as copies (copyTrade.all()). */
+  follows(): CopyConfig[];
+  /** Live copies a follow still has open. A paper follow with any is judged
+   *  as live: its exits run on the settings being edited. */
+  liveOpenCopies(configId: string): number;
+  /** Save through the Following page's own path (engine.upsertCopyConfig),
+   *  which re-checks the config and never arms a new live follow. */
+  saveFollow(input: Omit<CopyConfig, 'id' | 'createdAt'> & { id?: string }): { ok: boolean; message: string };
+  /** Tell the user what the AI did to a follow: logged and a desktop notice. */
+  followNotice(title: string, line: string): void;
   log(level: 'info' | 'warn' | 'error', line: string): void;
 }
 
@@ -226,7 +239,79 @@ function unexpected(name: string, args: Record<string, unknown>): string | null 
   const known = Object.keys(spec.inputSchema.properties);
   const extra = Object.keys(args).filter((k) => !known.includes(k));
   if (!extra.length) return null;
+  // A follow field the AI may never set gets the reason, not just "unknown".
+  if (FOLLOW_TOOLS.has(name)) {
+    const theirs = extra.filter((k) => USER_ONLY[k] || k.startsWith('fomo'));
+    if (theirs.length) {
+      const what = [...new Set(theirs.map((k) => USER_ONLY[k] ?? 'the convergence crowd'))].join(', ');
+      return `${name} cannot set ${theirs.join(', ')} — ${what} ${theirs.length === 1 ? 'is' : 'are'} for the user to change, in the app on the Following page. To follow a different wallet, create a new follow.`;
+    }
+  }
   return `${name} does not take ${extra.join(', ')}. It takes: ${known.join(', ') || 'no arguments'}.`;
+}
+
+// ── Follows (2026-11-01) ──────────────────────────────────────────────
+
+const FOLLOW_TOOLS: ReadonlySet<string> = new Set(['create_follow', 'update_follow', 'pause_follow', 'resume_follow']);
+
+/** CopyConfig fields an AI never sets, with what they are, for the refusal. */
+const USER_ONLY: Record<string, string> = {
+  wallet: 'the followed wallet',
+  chain: 'the chain',
+  mode: 'paper or live',
+  walletId: 'the wallet copies sign with',
+  ai: 'whether the AI decides its trades',
+  lossStopFrom: 'the app’s own bookkeeping',
+  pausedReason: 'the app’s own bookkeeping',
+  pausedAt: 'the app’s own bookkeeping',
+};
+
+const followWho = (c: Pick<CopyConfig, 'wallet' | 'label'>): string => `${c.wallet.slice(0, 6)}…${c.label ? ` (${c.label})` : ''}`;
+
+function findFollow(h: McpToolsHost, raw: unknown): CopyConfig | null {
+  const id = typeof raw === 'string' ? raw.trim() : '';
+  return id ? (h.follows().find((c) => c.id === id) ?? null) : null;
+}
+
+function readReason(args: Record<string, unknown>): { ok: true; reason: string } | { ok: false; why: string } {
+  const v = args.reason;
+  if (v === undefined || v === null) return { ok: true, reason: '' };
+  if (typeof v !== 'string') return { ok: false, why: 'reason must be text' };
+  if (v.length > 200) return { ok: false, why: 'reason must be at most 200 characters' };
+  return { ok: true, reason: v.trim() };
+}
+
+/**
+ * Apply an AI's edit to one follow, all or nothing.
+ *
+ * Synchronous from the read to the save, so nothing can change the follow in
+ * between: the rules are judged against the config that is then written.
+ */
+function editFollow(h: McpToolsHost, cur: CopyConfig, patch: FollowPatch, verb: string, reason: string): McpToolOutcome {
+  const next: CopyConfig = { ...cur, ...patch };
+  const liveOpen = h.liveOpenCopies(cur.id);
+  const refused: string[] = [];
+  // Arming is the user's. A paper follow holding live copies may be switched
+  // on — the copies it opens from here are paper.
+  if (cur.mode === 'live' && !cur.enabled && next.enabled) refused.push('switching it back on (only the user arms a live follow)');
+  if (cur.mode === 'live' || liveOpen > 0) refused.push(...liveEditRefusals(cur, next));
+  if (refused.length) {
+    const what = cur.mode === 'live' ? 'a LIVE follow' : `a paper follow with ${liveOpen} live cop${liveOpen === 1 ? 'y' : 'ies'} still open`;
+    return fail(
+      `${followWho(cur)} is ${what}, so the AI may only make it safer. Refused, and nothing was changed: ${refused.join('; ')}. The user can make ${refused.length === 1 ? 'that change' : 'those changes'} in the app, on the Following page.`,
+    );
+  }
+  const changes = describeFollowChanges(cur, next);
+  if (!changes.length) return done(`Nothing to change — ${followWho(cur)} already has those settings.`, { configId: cur.id, follow: cur });
+  const { id: _id, createdAt: _at, ...rest } = next;
+  const v = validateConfig(rest);
+  if (!v.ok) return fail(v.message);
+  const r = h.saveFollow({ ...rest, id: cur.id });
+  if (!r.ok) return fail(r.message);
+  const after = h.follows().find((c) => c.id === cur.id) ?? next;
+  const why = reason ? ` — ${reason}` : '';
+  h.followNotice(`AI ${verb} a follow`, `AI ${verb} the ${cur.mode} follow of ${followWho(cur)}: ${changes.join(', ')}${why}`);
+  return done(`${verb[0].toUpperCase()}${verb.slice(1)} the ${cur.mode === 'live' ? 'LIVE' : 'paper'} follow of ${followWho(cur)}: ${changes.join(', ')}.`, { configId: cur.id, follow: after });
 }
 
 // ── The tools ─────────────────────────────────────────────────────────
@@ -475,6 +560,73 @@ export async function call(name: string, args: Record<string, unknown>): Promise
       const r = h.sellCopy(configId, m.mint, pct.value, reason);
       h.log(r.ok ? 'info' : 'warn', `AI desk sell_copy ${configId} ${pct.value}% of ${m.mint.slice(0, 8)}…: ${r.message}`);
       return r.ok ? done(r.message) : fail(r.message);
+    }
+
+    // ── Follows (2026-11-01): narrow-only on live, never armed by the AI ──
+    case 'create_follow': {
+      if (!canTrade(access)) return fail('This connection is read only.');
+      const raw = typeof args.wallet === 'string' ? args.wallet.trim() : '';
+      if (!raw) return fail('wallet is required');
+      if (!(chain === 'solana' ? BASE58.test(raw) : EVM.test(raw))) return fail(`"${raw.slice(0, 12)}…" is not a wallet address on ${chainLabel(chain)}`);
+      const wallet = chain === 'solana' ? raw : raw.toLowerCase();
+      const mode = readEnum(args, 'mode', ['paper', 'live'] as const, 'paper');
+      if (!mode.ok) return fail(mode.why);
+      const live = mode.value === 'live';
+      // A paper connection stays paper all the way: it does not set up live
+      // follows, even disarmed ones.
+      if (live && !canSpend(access)) return fail('A live follow needs a live connection, and this one is in PAPER mode. Create it on paper, or the user can change the connection’s mode on the AI page.');
+      if (args.enabled !== undefined && args.enabled !== null && typeof args.enabled !== 'boolean') return fail('enabled must be true or false');
+      const p = readFollowPatch(args);
+      if (!p.ok) return fail(p.why);
+      const cfg = buildFollow(wallet, chain, mode.value, args.enabled !== false, p.patch);
+      const v = validateConfig(cfg);
+      if (!v.ok) return fail(v.message);
+      const r = h.saveFollow(cfg);
+      if (!r.ok) return fail(r.message);
+      const made = h.follows().find((c) => c.wallet === wallet && chainOf(c) === chain) ?? null;
+      const who = followWho(cfg);
+      const state = live ? 'saved switched OFF — the user must switch it on in Following to arm it' : cfg.enabled ? 'switched on' : 'switched off';
+      h.followNotice('AI created a follow', `AI created a ${mode.value} follow of ${who} on ${chainLabel(chain)}, ${state}`);
+      const asked = live && args.enabled === true ? ' You asked for it switched on; a live follow the AI creates is always saved off.' : '';
+      return done(
+        live
+          ? `Created a LIVE follow of ${who}, saved switched OFF (disarmed).${asked} It copies nothing until the user switches it on themselves in the app’s Following page — the AI cannot arm it.`
+          : `Created a paper follow of ${who}, ${cfg.enabled ? 'switched on' : 'switched off'}. Paper copies are simulated and spend nothing.`,
+        { configId: made?.id ?? null, follow: made },
+      );
+    }
+    case 'update_follow': {
+      if (!canTrade(access)) return fail('This connection is read only.');
+      const cur = findFollow(h, args.configId);
+      if (!cur) return fail(`No follow ${typeof args.configId === 'string' && args.configId ? args.configId : '(none given)'}. get_copy_configs lists them.`);
+      if (args.enabled !== undefined && args.enabled !== null && typeof args.enabled !== 'boolean') return fail('enabled must be true or false');
+      const p = readFollowPatch(args);
+      if (!p.ok) return fail(p.why);
+      const patch: FollowPatch = { ...p.patch };
+      if (typeof args.enabled === 'boolean') patch.enabled = args.enabled;
+      if (!Object.keys(patch).length) return fail('Nothing to change: send at least one setting.');
+      return editFollow(h, cur, patch, 'changed', '');
+    }
+    case 'pause_follow': {
+      if (!canTrade(access)) return fail('This connection is read only.');
+      const cur = findFollow(h, args.configId);
+      if (!cur) return fail(`No follow ${typeof args.configId === 'string' && args.configId ? args.configId : '(none given)'}. get_copy_configs lists them.`);
+      const reason = readReason(args);
+      if (!reason.ok) return fail(reason.why);
+      if (!cur.enabled) return done(`${followWho(cur)} is already switched off.`, { configId: cur.id, follow: cur });
+      return editFollow(h, cur, { enabled: false }, 'paused', reason.reason);
+    }
+    case 'resume_follow': {
+      if (!canTrade(access)) return fail('This connection is read only.');
+      const cur = findFollow(h, args.configId);
+      if (!cur) return fail(`No follow ${typeof args.configId === 'string' && args.configId ? args.configId : '(none given)'}. get_copy_configs lists them.`);
+      const reason = readReason(args);
+      if (!reason.ok) return fail(reason.why);
+      if (cur.mode === 'live') {
+        return fail(`${followWho(cur)} is a LIVE follow. Switching it on starts unattended spending, so only the user can do that, in the app on the Following page.`);
+      }
+      if (cur.enabled) return done(`${followWho(cur)} is already switched on.`, { configId: cur.id, follow: cur });
+      return editFollow(h, cur, { enabled: true }, 'resumed', reason.reason);
     }
     case 'place_order': {
       if (!canTrade(access)) return fail('This connection is read only.');

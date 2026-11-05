@@ -4,7 +4,7 @@
 // times the profile's own saved (public) endpoints. Nothing is saved; no
 // switch is flipped.
 
-import { go, opt } from './_app.mjs';
+import { closeAdvanced, go, openAdvanced, opt } from './_app.mjs';
 
 const EXEC_INPUT = '[data-testid=rpc-exec] input';
 const FAKE_EXEC = 'https://your-provider.example.com/?api-key=your-key';
@@ -20,6 +20,9 @@ export default {
       line: 0,
       do: async (ui) => {
         await ui.click({ testid: 'nav-settings' });
+        await ui.waitFor({ testid: 'settings-advanced' }, 10_000);
+        await ui.point({ testid: 'settings-advanced' }, { hold: 1400, glow: 1400 });
+        await openAdvanced(ui);
         await ui.waitFor({ text: '^Solana RPC$', sel: 'h2' }, 10_000);
         await ui.pause(600);
         await ui.point({ text: '^Solana RPC$', sel: 'h2' }, { hold: 2600, glow: 2600 });
@@ -84,6 +87,7 @@ export default {
       const v = await ui.evaluate(`document.querySelector(${JSON.stringify(EXEC_INPUT)})?.value || ''`);
       if (v.includes('example.com')) await clearExec(ui);
     }
+    await closeAdvanced(ui).catch(() => {});
   },
 };
 

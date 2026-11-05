@@ -22,9 +22,9 @@ export default {
       do: async (ui) => {
         await go(ui, 'wallet', /Wallet/);
         await opt(ui.click({ testid: 'tab-solana' }));
-        if (await ui.exists(btn('Generate wallet'))) {
-          await ui.point(heading('Generate a dedicated hot wallet'), { hold: 1200 });
-          await ui.click(btn('Generate wallet'));
+        if (await ui.exists(btn('Create wallet'))) {
+          await ui.point(heading('Make a new wallet for this app'), { hold: 1200 });
+          await ui.click(btn('Create wallet'));
           await ui.waitFor({ text: 'Deposit address', sel: 'h2, h3, div, span' }, 15_000);
           await ui.pause(800);
         }
@@ -42,15 +42,18 @@ export default {
     {
       line: 3,
       do: async (ui) => {
-        // The chip opens the switcher once it knows a wallet exists.
-        await ui.waitFor({ expr: `/switch wallets/.test(document.querySelector('[data-testid=nav-balance]')?.title || '')` }, 10_000);
+        // The chip opens the wallet card once it knows a wallet exists; the
+        // switcher is a click further in.
+        await ui.waitFor({ expr: `/wallet card/.test(document.querySelector('[data-testid=nav-balance]')?.title || '')` }, 10_000);
         await ui.point({ testid: 'nav-balance' }, { hold: 900, glow: 1200 });
         await ui.click({ testid: 'nav-balance' });
+        await ui.waitFor({ testid: 'wallet-card' }, 5000);
+        await ui.click({ testid: 'wallet-card-wallets' });
         await ui.waitFor({ testid: 'nav-wallets' }, 5000);
         await ui.point({ testid: 'nav-wallet-row' }, { hold: 2600, glow: 2800 });
         await opt(ui.hover({ text: 'Active wallet', sel: 'p', within: '[data-testid=nav-wallets]' }, { hold: 3200 }));
         await opt(ui.hover({ testid: 'nav-wallets-pump' }, { hold: 1200 }));
-        await ui.click({ testid: 'nav-balance' });
+        await ui.click({ testid: 'wallet-card-close' });
         await ui.pause(400);
       },
     },

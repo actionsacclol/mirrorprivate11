@@ -52,6 +52,9 @@ import {
   type CopyDirection,
   type FomoSource,
   type SizingMode,
+  SIMPLE_LOSS_MULTIPLE,
+  SUGGESTED_DAILY_COPIES,
+  SIMPLE_WALLET_STOP_MULTIPLE,
 } from '@shared/copytrade';
 import { SCOUT_SORTS, SCOUT_SORT_LABEL, shortlistVerdict, type ScoutChain, type ScoutRow, type ScoutSort, type ScoutWallet, type ShortlistVerdict } from '@shared/walletScout';
 import { parsePumpHandle, type PumpUser } from '@shared/pumpLookup';
@@ -270,7 +273,7 @@ export function FollowPage() {
         ? 'That is not a wallet address or a pump.fun username.'
         : null
       : kind === 'evm' && !evmOn
-        ? 'That is an EVM wallet. Switch on Robinhood Chain or BNB under Settings › Other chains to follow one.'
+        ? 'That is an EVM wallet. Switch on Robinhood Chain or BNB in Settings, under Advanced, EVM chains, to follow one.'
         : already
           ? 'You already follow this wallet — it is on Following.'
           : null;
@@ -596,7 +599,11 @@ export function FollowPage() {
             {!watch && (
             <Panel
               title="Limits"
-              subtitle={`Suggested from the most one copy spends (${most} ${sym}). Change any of them.`}
+              subtitle={
+                cfg.dailyLossLimitSol > 0 || cfg.dailyTradeLimit > 0 || (cfg.walletLossStopSol !== null && cfg.walletLossStopSol !== undefined)
+                  ? 'These are yours to set. Each one that is on stops this follow when it is reached.'
+                  : 'None of these are on unless you switch them on, so nothing stops this follow for losing money or copying a lot.'
+              }
               action={
                 Object.keys(over).some((k) => k === 'dailyLossLimitSol' || k === 'walletLossStopSol' || k === 'dailyTradeLimit') && !editing ? (
                   <button
@@ -611,23 +618,32 @@ export function FollowPage() {
                       })
                     }
                   >
-                    Use suggested
+                    Back to defaults
                   </button>
                 ) : undefined
               }
             >
-              <Opt title="Stop for the day after losing" body="Every follow together counts toward the app-wide limits too; this one is this follow's own.">
+              <Opt
+                title="Stop for the day after losing"
+                body="Starts again at midnight. Every follow together counts toward the app-wide limits too; this one is this follow's own."
+                on={cfg.dailyLossLimitSol > 0}
+                onToggle={(on) => setO({ dailyLossLimitSol: on ? round(most * SIMPLE_LOSS_MULTIPLE) : 0 })}
+              >
                 <Num value={cfg.dailyLossLimitSol} onChange={(n) => n !== null && setO({ dailyLossLimitSol: n })} suffix={sym} testId="follow-daily-loss" />
               </Opt>
               <Opt
                 title="Pause this wallet after losing"
                 body="Counted from when the follow was last switched on. Open copies are still followed out."
                 on={cfg.walletLossStopSol !== null && cfg.walletLossStopSol !== undefined}
-                onToggle={(on) => setO({ walletLossStopSol: on ? round(most * 4) : null })}
+                onToggle={(on) => setO({ walletLossStopSol: on ? round(most * SIMPLE_WALLET_STOP_MULTIPLE) : null })}
               >
                 <Num value={cfg.walletLossStopSol ?? null} onChange={(n) => setO({ walletLossStopSol: n })} suffix={sym} />
               </Opt>
-              <Opt title="At most this many copies a day">
+              <Opt
+                title="At most this many copies a day"
+                on={cfg.dailyTradeLimit > 0}
+                onToggle={(on) => setO({ dailyTradeLimit: on ? SUGGESTED_DAILY_COPIES : 0 })}
+              >
                 <Num value={cfg.dailyTradeLimit} onChange={(n) => n !== null && setO({ dailyTradeLimit: n })} suffix="copies" />
               </Opt>
             </Panel>
@@ -819,7 +835,12 @@ export function FollowPage() {
                     <Opt title="Maximum slippage">
                       <Num value={cfg.maxSlippagePct} onChange={(n) => n !== null && setO({ maxSlippagePct: n })} suffix="%" />
                     </Opt>
-                    <Opt title="At most this many copies a minute" body="A burst wall: a leader firing eight swaps in one slot cannot out-run the daily limit.">
+                    <Opt
+                      title="At most this many copies a minute"
+                      body="A burst wall, for a leader firing many swaps in one slot."
+                      on={cfg.maxCopiesPerMinute !== 0}
+                      onToggle={(on) => setO({ maxCopiesPerMinute: on ? DEFAULT_COPIES_PER_MINUTE : 0 })}
+                    >
                       <Num value={cfg.maxCopiesPerMinute ?? null} onChange={(n) => setO({ maxCopiesPerMinute: n })} suffix="a minute" placeholder={String(DEFAULT_COPIES_PER_MINUTE)} width="w-36" />
                     </Opt>
                     <Opt title="Copy with" body="Which of your wallets signs the copies. Give each leader its own to keep them apart.">
@@ -938,7 +959,11 @@ function summaryLines(c: CopyConfig, sym: string, editing: boolean): string[] {
   const filters = [c.minLiquidityUsd, c.minMarketCapUsd, c.maxMarketCapUsd, c.minTokenAgeSec, c.maxTokenAgeSec, c.minKryptScore, c.maxBuysPerToken].filter((v) => v !== null && v !== undefined).length + (c.onlyPumpfun ? 1 : 0) + (c.blockedMints?.length || c.blockedCreators?.length ? 1 : 0);
   if (filters) out.push(`${filters} coin filter${filters === 1 ? '' : 's'} on.`);
   if (c.delayMs > 0) out.push(`Waits ${c.delayMs} ms after their trade.`);
-  out.push(`Stops for the day after losing ${c.dailyLossLimitSol} ${sym}${c.walletLossStopSol ? `, and pauses after losing ${c.walletLossStopSol} ${sym} in all` : ''}.`);
+  if (c.dailyLossLimitSol > 0) out.push(`Stops for the day after losing ${c.dailyLossLimitSol} ${sym}.`);
+  if (c.walletLossStopSol) out.push(`Pauses after losing ${c.walletLossStopSol} ${sym} in all.`);
+  if (c.dailyTradeLimit > 0) out.push(`Copies at most ${c.dailyTradeLimit} times a day.`);
+  if (!(c.dailyLossLimitSol > 0) && !c.walletLossStopSol) out.push('No loss limit: losing money does not stop it.');
+  if (!(c.dailyTradeLimit > 0)) out.push('No limit on copies a day.');
   if (!editing) out.push('Live is a separate switch on its card on Following, and it asks before it arms.');
   return out;
 }
@@ -1137,7 +1162,10 @@ function Group({ title, note, children }: { title: string; note?: string; childr
 /** One setting: a title, what it does, an on/off switch when it can be off,
  *  and its inputs while it is on. */
 function Opt({ title, body, on, onToggle, children }: { title: string; body?: string; on?: boolean; onToggle?: (on: boolean) => void; children?: ReactNode }) {
-  const shown = on === undefined || on;
+  // Typing "0.15" passes through 0, which reads as off. The box stays while it
+  // has focus; leaving it at 0 is what switches the limit off.
+  const [typing, setTyping] = useState(false);
+  const shown = on === undefined || on || typing;
   return (
     <div className="border-b border-white/[0.05] py-3 last:border-b-0">
       <div className="flex items-start justify-between gap-4">
@@ -1147,7 +1175,11 @@ function Opt({ title, body, on, onToggle, children }: { title: string; body?: st
         </div>
         {onToggle && on !== undefined && <Toggle on={on} onChange={onToggle} label={title} />}
       </div>
-      {shown && children && <div className="mt-2.5 flex flex-wrap items-center gap-2">{children}</div>}
+      {shown && children && (
+        <div className="mt-2.5 flex flex-wrap items-center gap-2" onFocusCapture={() => setTyping(true)} onBlurCapture={() => setTyping(false)}>
+          {children}
+        </div>
+      )}
     </div>
   );
 }

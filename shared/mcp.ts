@@ -101,7 +101,7 @@ export const MCP_SERVER_NAME = 'krypto-mirror';
 export const MCP_INSTRUCTIONS = [
   'This is Krypto Mirror, a desktop copy-trading app for memecoins, running on the user’s own machine with their own wallet.',
   '',
-  'Read tools report what the app has recorded. Trade tools place orders through the app’s own pipeline — the same one its buttons use, with the same fees, limits and safety breakers. You cannot sign, build or modify a transaction here, and you cannot change any app setting.',
+  'Read tools report what the app has recorded. Trade tools place orders through the app’s own pipeline — the same one its buttons use, with the same fees, limits and safety breakers. You cannot sign, build or modify a transaction here, and you cannot change an app setting, except the few a Full control connection may.',
   '',
   'Follows: create_follow, update_follow, pause_follow, resume_follow and delete_follow set up and tune copy-trading follows. A paper follow can be created switched on and edited freely. Below Full control, a LIVE follow you create is saved switched OFF and only the user can arm it, and on a live follow you may only make it safer (smaller sizes and limits, tighter stops and exits, stricter filters, pausing). With Full control you may also switch live follows on and widen them, as long as each stays inside the follow ceiling the user set (get_settings shows it).',
   '',
@@ -212,9 +212,9 @@ export const FOLLOW_FIELDS = [
   },
   { key: 'sizeValue', kind: 'number', about: 'fixed: SOL (or ETH / BNB) per copy. proportional: percent of their trade, up to 500. Live: may only go down.' },
   { key: 'maxTradeSol', kind: 'number', about: 'The most one copy may spend, in the chain’s coin, up to 25. Live: may only go down.' },
-  { key: 'dailyLossLimitSol', kind: 'number', about: 'Stop copying for the day after losing this much. Required, never off. Live: may only go down.' },
-  { key: 'dailyTradeLimit', kind: 'number', about: 'At most this many copies a day, 1–500. Live: may only go down.' },
-  { key: 'maxCopiesPerMinute', kind: 'numberOrOff', about: 'At most this many copies in any minute, 1–120; null = the default 10. Live: may only go down.' },
+  { key: 'dailyLossLimitSol', kind: 'numberOrOff', about: 'Stop copying for the day after losing this much; null = none, the default. Live: may only go down or be added. A live follow the AI switches on needs one under Full control’s ceiling.' },
+  { key: 'dailyTradeLimit', kind: 'numberOrOff', about: 'At most this many copies a day, 1–500; null = none, the default. Live: may only go down or be added.' },
+  { key: 'maxCopiesPerMinute', kind: 'numberOrOff', about: 'At most this many copies in any minute, 1–120; null = none, the default. A follow reading null from an older build runs at 10 until it is saved. Live: may only go down or be added.' },
   { key: 'walletLossStopSol', kind: 'numberOrOff', about: 'Pause this follow once its copies have lost this much since it was switched on; null = off. Live: may only go down or be added, never removed.' },
   { key: 'maxSlippagePct', kind: 'number', about: 'The most slippage a copy accepts, percent, up to 50. Live: may only go down.' },
   { key: 'delayMs', kind: 'number', about: 'Wait this long after their trade before copying, milliseconds, 0–60000. Fixed on a live follow.' },
@@ -550,7 +550,7 @@ const ALL_TOOLS: McpToolSpec[] = [
     name: 'create_follow',
     title: 'Create a follow',
     description:
-      'Follow a wallet: create a copy-trading follow from its address plus any of the settings below; the rest get the Follow page’s defaults, with the limits derived from sizeValue / maxTradeSol. Checked like the app’s own form — a bad setting is refused with the reason. PAPER (the default): copies are simulated and spend nothing, and it starts switched on unless you send enabled:false. LIVE: below Full control it is ALWAYS saved switched OFF (disarmed), whatever enabled says — it copies nothing until the user switches it on themselves in the app’s Following page; you cannot arm it. With Full control, enabled:true creates it switched on, if its maxTradeSol and dailyLossLimitSol are inside the follow ceiling (get_settings). Creating a live follow needs a live connection. Convergence (crowd) follows, the wallet copies sign with and the AI gate are set in the app. A wallet already followed on that chain is refused. Returns the new configId.',
+      'Follow a wallet: create a copy-trading follow from its address plus any of the settings below; the rest get the Follow page’s defaults, which set no loss limit, loss stop or limit on copies: send them if the user wants them. Checked like the app’s own form — a bad setting is refused with the reason. PAPER (the default): copies are simulated and spend nothing, and it starts switched on unless you send enabled:false. LIVE: below Full control it is ALWAYS saved switched OFF (disarmed), whatever enabled says — it copies nothing until the user switches it on themselves in the app’s Following page; you cannot arm it. With Full control, enabled:true creates it switched on, if its maxTradeSol and dailyLossLimitSol are inside the follow ceiling (get_settings). Creating a live follow needs a live connection. Convergence (crowd) follows, the wallet copies sign with and the AI gate are set in the app. A wallet already followed on that chain is refused. Returns the new configId.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -590,7 +590,7 @@ const ALL_TOOLS: McpToolSpec[] = [
     name: 'pause_follow',
     title: 'Pause a follow',
     description:
-      'Switch one follow off, paper or live: it opens no new copies. Copies it already holds keep being managed and exit by its rules as usual. Always allowed — it only makes the follow safer. Switching a live follow back on is the user’s, in the app.',
+      'Switch one follow off, paper or live: it opens no new copies. Copies it already holds keep being managed and exit by its rules as usual. Always allowed — it only makes the follow safer. Switching a live follow back on is the user’s, in the app, unless they gave this connection Full control.',
     inputSchema: {
       type: 'object',
       properties: { configId: CONFIG_ID, reason: str('One line on why. Shown to the user.', { maxLength: 200 }) },
@@ -1114,7 +1114,7 @@ const ALL_TOOLS: McpToolSpec[] = [
     name: 'set_trading_mode',
     title: 'Switch the app between Paper and Live',
     description:
-      'The app’s own Paper/Live switch, for everything the app does — manual trades, orders, scripts and follows set to live. live arms real trading (it needs a wallet and passes the same checks as the top-bar switch); paper stops it. Full control only.',
+      'The app’s own Paper/Live switch, for everything the app does — manual trades, orders, scripts and follows set to live. live arms real trading (it needs a wallet and passes the same checks as the top-bar switch), on Solana; BNB and Robinhood are armed by hand. Paper stops it on every chain. Refused while a stop the user must clear themselves is in force: a live loss limit, the kill switch, a debugger, a pump.fun upgrade or data format change. Full control only.',
     inputSchema: {
       type: 'object',
       properties: { mode: str('paper or live.', { enum: ['paper', 'live'] }), reason: str('One line on why. Shown to the user.', { maxLength: 200 }) },
@@ -1163,7 +1163,7 @@ const ALL_TOOLS: McpToolSpec[] = [
         mevMode: str('off (public RPC), fast (every lane, tipped) or private (buys on the Jito lane only).', { enum: ['off', 'fast', 'private'] }),
         feeLane: str('How manual trades are priced: fast or lean.', { enum: ['fast', 'lean'] }),
         liveSlippagePct: num('Slippage for manual live trades, percent, 0–50.', { minimum: 0, maximum: 50 }),
-        maxOpenCopies: num('Open copies across every follow, per mode; 0 = no ceiling, at most 500.', { minimum: 0, maximum: 500 }),
+        maxOpenCopies: num('Open copies across every follow, per mode; at most 100. A limit the user saved may only go lower, never be raised or removed.', { minimum: 0, maximum: 100 }),
         autoSellOnExit: { type: 'boolean', description: 'Sell every held token when the app stops.' },
       },
       additionalProperties: false,
@@ -1277,6 +1277,7 @@ export const MCP_IPC_CHANNELS: readonly string[] = [
   'live:setLive',
   'live:sellAll',
   'live:sellDust',
+  'evm:disarm',
   'wallet:select',
   // Only ever with a patch built from MCP_SETTINGS_AI_MAY_SET, below.
   'settings:update',
@@ -1297,6 +1298,16 @@ export const MCP_IPC_CHANNELS: readonly string[] = [
  * nothing to act with.
  */
 export const MCP_NEVER_CHANNELS: readonly string[] = [
+  'vault:status',
+  'vault:unlock',
+  'vault:turnOn',
+  'vault:turnOff',
+  'vault:change',
+  'vault:stopAndLock',
+  'vault:setAutoTrade',
+  'prompt:init',
+  'prompt:submit',
+  'prompt:link',
   'wallet:export',
   'wallet:backup',
   'wallet:import',
@@ -1389,8 +1400,11 @@ export interface McpBudget {
    * (maxTradeSol) …
    */
   followMaxCopySol: number;
-  /** … and stop for the day at a loss no bigger than this (dailyLossLimitSol). */
+  /** … stop for the day at a loss no bigger than this (dailyLossLimitSol) … */
   followDailyLossSol: number;
+  /** … and copy at most this many times a day (dailyTradeLimit). A loss counts
+   *  only once a copy closes, so this is what bounds the money out. */
+  followDailyCopies: number;
 }
 
 export interface McpSettings {
@@ -1405,7 +1419,8 @@ export interface McpSettings {
   budget: McpBudget;
 }
 
-export const DEFAULT_MCP_BUDGET: McpBudget = { maxBuySol: 0.1, hourlyCapSol: 0.5, maxTradesPerMinute: 4, followMaxCopySol: 0.1, followDailyLossSol: 0.5 };
+export const DEFAULT_FOLLOW_DAILY_COPIES = 20;
+export const DEFAULT_MCP_BUDGET: McpBudget = { maxBuySol: 0.1, hourlyCapSol: 0.5, maxTradesPerMinute: 4, followMaxCopySol: 0.1, followDailyLossSol: 0.5, followDailyCopies: DEFAULT_FOLLOW_DAILY_COPIES };
 
 /** Off, read-only, no token. Everything about this feature is opt-in. */
 export const DEFAULT_MCP_SETTINGS: McpSettings = {

@@ -41,7 +41,8 @@ import {
   type McpTradeAttempt,
 } from '@shared/mcp';
 import { chainOf, validateConfig, type CopyConfig, type CopyTrade } from '@shared/copytrade';
-import { buildFollow, describeFollowChanges, followCeilingRefusals, liveEditRefusals, readFollowPatch, type FollowPatch } from '@shared/followEdit';
+import { EVM_CHAINS } from '@shared/evm';
+import { buildFollow, describeFollowChanges, followCeilingRefusals, liveEditRefusals, sellTriggerEdits, readFollowPatch, type FollowPatch } from '@shared/followEdit';
 import type { McpToolOutcome } from '../system/mcpServer';
 
 const BASE58 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -54,8 +55,9 @@ const INTERVALS = ['1s', '15s', '1m', '5m', '15m', '1h'] as const;
 const ORDER_KINDS = ['stop_loss', 'take_profit', 'trailing_stop', 'limit_buy', 'limit_sell'] as const;
 const TRIGGER_BASES = ['pct', 'price_sol', 'mcap_usd'] as const;
 
-/** Attempts kept for the rolling caps. An hour of trading, bounded. */
-const ATTEMPT_CAP = 500;
+/** Attempts kept for the rolling caps: the hour they look back over. By age,
+ *  never by count, or a burst of sells forgets the buys the cap must still see. */
+const ATTEMPT_WINDOW_MS = 3_600_000;
 
 export interface McpOrderRequest {
   mint: string;
@@ -106,6 +108,10 @@ export interface McpToolsHost {
   traderSession(id: string): Promise<unknown | null>;
   /** What trader_act checks a session against, or null when there is no such id. */
   traderGate(id: string): { driver: 'strategy' | 'ai' | 'mcp'; status: 'running' | 'paused' | 'stopped'; mode: 'paper' | 'live'; seq: number } | null;
+  /** A follow waiting to come back on by itself stays off instead. */
+  keepFollowOff?(id: string): void;
+  /** Why Live is off right now, or null when it is on. */
+  liveStoppedBy?(): string | null;
   /** Run the intent under the session's lock through its own guard (kryptoTrader.submit, by 'mcp'). */
   traderAct(id: string, intent: TraderActIntent, expectedSeq: number): Promise<{ ok: boolean; message: string; seq?: number }>;
   /** The chain the Scout tools default to when a call names none. */
@@ -179,7 +185,7 @@ export function recentAttempts(): readonly McpTradeAttempt[] {
 
 function note(kind: 'buy' | 'sell', sol: number, now: number): void {
   attempts.push({ at: now, kind, sol });
-  if (attempts.length > ATTEMPT_CAP) attempts = attempts.slice(-ATTEMPT_CAP);
+  attempts = attempts.filter((a) => now - a.at < ATTEMPT_WINDOW_MS);
 }
 
 const fail = (text: string): McpToolOutcome => ({ ok: false, text });
@@ -317,15 +323,25 @@ function editFollow(h: McpToolsHost, cur: CopyConfig, patch: FollowPatch, verb: 
   const refused: string[] = [];
   const arming = cur.mode === 'live' && !cur.enabled && next.enabled === true;
   const widening = cur.mode === 'live' || liveOpen > 0 ? liveEditRefusals(cur, next) : [];
+  // Its own loss stop paused it: that is the user's, or the comeback switch's.
+  if (arming && cur.pausedBy === 'stop') {
+    return fail(`${followWho(cur)} was paused by its own loss stop, so it stays off until the user switches it on. Nothing was changed.`);
+  }
+  // A connection that may not spend may not make live copies sell either.
+  if (!canSpend(h.access()) && (cur.mode === 'live' || liveOpen > 0)) {
+    refused.push(...sellTriggerEdits(cur, next).map((w) => `${w} (could sell live copies)`));
+  }
   // Full control (2026-11-02): an AI may arm and widen a live follow, but
   // only to a config inside the ceiling the user set for it. The check is on
   // the RESULT, so a follow the user armed above the ceiling can still be
   // narrowed or relabelled — only arming and widening are judged.
   if (canControl(h.access()) && (arming || widening.length)) {
     const over = cur.mode === 'live' ? followCeilingRefusals(next, h.budget()) : [];
+    // The user's own stop on this follow is not the AI's to loosen, at any level.
+    refused.push(...widening.filter((w) => w.startsWith('walletLossStopSol')));
     if (over.length) {
       return fail(
-        `${followWho(cur)} is a LIVE follow. With Full control the AI may switch it on or widen it only inside the follow ceiling set on the app’s AI page: ${over.join('; ')}. Nothing was changed — lower those first, or the user can raise the ceiling.`,
+        `${followWho(cur)} is a LIVE follow. With Full control the AI may switch it on or widen it only inside the follow ceiling set on the app’s AI page: ${over.join('; ')}. Nothing was changed — bring those inside it first, or the user can raise the ceiling.`,
       );
     }
   } else {
@@ -662,6 +678,12 @@ export async function call(name: string, args: Record<string, unknown>): Promise
       const patch: FollowPatch = { ...p.patch };
       if (typeof args.enabled === 'boolean') patch.enabled = args.enabled;
       if (!Object.keys(patch).length) return fail('Nothing to change: send at least one setting.');
+      // Off, but maybe waiting to come back: asking for off means it stays off.
+      if (patch.enabled === false && !cur.enabled) {
+        h.keepFollowOff?.(cur.id);
+        delete patch.enabled;
+        if (!Object.keys(patch).length) return done(`${followWho(cur)} is already switched off, and will stay off until it is switched on.`, { configId: cur.id, follow: cur });
+      }
       return editFollow(h, cur, patch, 'changed', '');
     }
     case 'pause_follow': {
@@ -670,7 +692,11 @@ export async function call(name: string, args: Record<string, unknown>): Promise
       if (!cur) return fail(`No follow ${typeof args.configId === 'string' && args.configId ? args.configId : '(none given)'}. get_copy_configs lists them.`);
       const reason = readReason(args);
       if (!reason.ok) return fail(reason.why);
-      if (!cur.enabled) return done(`${followWho(cur)} is already switched off.`, { configId: cur.id, follow: cur });
+      if (!cur.enabled) {
+        // Off, but maybe waiting to come back: pausing it means it stays off.
+        h.keepFollowOff?.(cur.id);
+        return done(`${followWho(cur)} is already switched off, and will stay off until it is switched on.`, { configId: cur.id, follow: cur });
+      }
       return editFollow(h, cur, { enabled: false }, 'paused', reason.reason);
     }
     case 'resume_follow': {
@@ -1091,7 +1117,22 @@ async function moreTools(h: McpToolsHost, name: string, args: Record<string, unk
       if (!mode.ok) return fail(mode.why);
       const reason = readReason(args);
       if (!reason.ok) return fail(reason.why);
+      if (mode.value === 'live') {
+        // arm() rebaselines the loss limit, so switching on past a stop would
+        // undo it. These are a person's to clear, or the comeback switch's.
+        const stoppedBy = h.liveStoppedBy?.() ?? null;
+        const words: Record<string, string> = {
+          loss_limit: 'a live loss limit stopped it',
+          kill_switch: 'the kill switch stopped it',
+          debugger: 'a debugger attached to the app',
+          program_upgrade: 'pump.fun upgraded its program and the app is re-checking it',
+          decoder_drift: 'pump.fun’s data format changed',
+        };
+        if (stoppedBy && words[stoppedBy]) return fail(`Live stays off: ${words[stoppedBy]}. Only the user can switch it back on, in the app.`);
+      }
       const r = await ask(h, 'live:setLive', mode.value === 'live');
+      // Paper means nothing is broadcast, and each EVM chain has its own switch.
+      if (mode.value === 'paper') for (const c of EVM_CHAINS) await ask(h, 'evm:disarm', c);
       h.log(r.ok ? 'warn' : 'warn', `MCP set_trading_mode ${mode.value}: ${r.message}`);
       if (!r.ok) return fail(r.message);
       h.followNotice(`AI switched the app to ${mode.value === 'live' ? 'LIVE' : 'Paper'}`, `AI switched the app to ${mode.value === 'live' ? 'LIVE' : 'Paper'} trading${reason.reason ? ` — ${reason.reason}` : ''}`);
@@ -1142,9 +1183,12 @@ async function moreTools(h: McpToolsHost, name: string, args: Record<string, unk
         if (!n.ok) return fail(n.why);
       }
       if ('maxOpenCopies' in patch) {
-        const n = readNumber(patch, 'maxOpenCopies', { min: 0, max: 500 });
+        const n = readNumber(patch, 'maxOpenCopies', { min: 0, max: 100 });
         if (!n.ok) return fail(n.why);
         if (!Number.isInteger(n.value)) return fail('maxOpenCopies must be a whole number');
+        // A limit the user saved binds follows the AI armed: it may only go lower.
+        const saved = Number(h.execution().maxOpenCopies) || 0;
+        if (saved > 0 && (n.value === 0 || n.value > saved)) return fail(`maxOpenCopies is the user’s limit of ${saved}. The AI may lower it, not raise or remove it.`);
       }
       const before = h.execution();
       const r = await ask(h, 'settings:update', { execution: { ...before, ...patch } });

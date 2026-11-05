@@ -24,6 +24,7 @@ import { ataFor, TOKEN_2022_PROGRAM } from '../chain/addresses';
 import { parseMintExtensions, mintWarning } from './mintExtensions';
 import { checkMint, hasHardReject } from './risk';
 import { planTips, injectTransfersFit, broadcastAndConfirm, MAX_TX_BYTES, type PlannedTransfer, type TipPlan, type TipExecSettings } from './broadcast';
+import { revertIsSlippage } from '@shared/copytrade';
 import { FEE_BPS, splitFee, activeTreasury, treasuryIntegrity, feesEnabled, looksLikeSolAddress, revertedAtFee, type FeeSplit } from '@shared/fees';
 import { explainFeeFailure } from '@shared/exitBudget';
 import * as jitoTips from './jitoTips';
@@ -1037,7 +1038,7 @@ async function runPipeline(
     return {
       ok: false,
       stage: 'simulate',
-      message: feeProblem ?? `Simulation reverted: ${reason ? `${reason} ` : ''}${raw.slice(0, 160)}${acctNote}`,
+      message: feeProblem ?? `Simulation reverted: ${reason ? `${reason} ` : revertIsSlippage(sim.data.err, source) ? 'price moved past your slippage ' : ''}${raw.slice(0, 160)}${acctNote}`,
       logs: sim.data.logs,
       // Sells only: executeTrade re-sends without the fee. A buy that cannot
       // afford its fee cannot afford the buy either, and stays refused.
@@ -1178,7 +1179,7 @@ async function runPipeline(
   timing.processed = cast.processedMs;
   timing.total = (timing.build ?? 0) + (Date.now() - pipelineStart);
   if (cast.chainErr) {
-    return { ok: false, stage: 'confirm', message: `Landed but reverted on-chain ${signature.slice(0, 12)}… [${source} tx${tipNote}${feeNote}]${timingNote()}`, signature, simulatedLossSol: lossSol, timing };
+    return { ok: false, stage: 'confirm', message: `Landed but reverted on-chain ${signature.slice(0, 12)}…${cast.chainError ? ` ${JSON.stringify(cast.chainError).slice(0, 120)}` : ''}${revertIsSlippage(cast.chainError, source) ? ' — price moved past your slippage' : ''} [${source} tx${tipNote}${feeNote}]${timingNote()}`, signature, simulatedLossSol: lossSol, timing };
   }
   // Not landed and not provably dead: the tx is PENDING, not failed. The
   // signature goes back to the caller so the ledger can keep watching it.

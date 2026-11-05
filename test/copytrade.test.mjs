@@ -13,7 +13,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import * as copy from './.copytrade.mjs';
-import { crowdNoun, describeConfig, COPY_LATENCY_FLOOR_MS, FOMO_WALLET, MIN_TRIPS_FOR_RANK, SIMPLE_MAX_SOL, SIMPLE_SIZES, TOO_FAST_FLAG_PCT, chainForAddress, cleanBlocklist, copySize, defaultConfig, emptyLeaderStats, isBlocked, leaderTooFast, leaderWinRate, ownExitsOf, rankLeaders, simpleConfig, validateConfig, winRate, followConfig, minLeaderFor, FOLLOW_PCTS, FOLLOW_MAX_SOL, MIN_LIVE_COPY_SOL, activeWindowOf, inActiveWindow, fmtClock, isWatch, localMinuteOfDay } from './.copyshared.mjs';
+import { failPauseReason, revertIsSlippage, crowdNoun, describeConfig, COPY_LATENCY_FLOOR_MS, FOMO_WALLET, MIN_TRIPS_FOR_RANK, SIMPLE_MAX_SOL, SIMPLE_SIZES, TOO_FAST_FLAG_PCT, chainForAddress, cleanBlocklist, copySize, defaultConfig, emptyLeaderStats, isBlocked, leaderTooFast, leaderWinRate, ownExitsOf, rankLeaders, simpleConfig, validateConfig, winRate, followConfig, minLeaderFor, FOLLOW_PCTS, FOLLOW_MAX_SOL, MIN_LIVE_COPY_SOL, activeWindowOf, inActiveWindow, fmtClock, isWatch, localMinuteOfDay } from './.copyshared.mjs';
 import { skipRuleOf, paperExitPnl, buyImpactFactor, sellImpactFactor, paperDepthSol, paperCopyReturnPct } from './.copyshared.mjs';
 
 let passed = 0;
@@ -164,7 +164,12 @@ test('validation rejects configs that cannot work', () => {
   assert.equal(validateConfig(cfg({ maxTradeSol: 100 })).ok, false);
   assert.equal(validateConfig(cfg({ sizing: 'fixed', sizeValue: 1, maxTradeSol: 0.1 })).ok, false);
   assert.equal(validateConfig(cfg({ delayMs: 120_000 })).ok, false);
-  assert.equal(validateConfig(cfg({ dailyLossLimitSol: 0 })).ok, false);
+  assert.equal(validateConfig(cfg({ dailyLossLimitSol: 0 })).ok, true, '0 is no limit, the default');
+  assert.equal(validateConfig(cfg({ dailyLossLimitSol: -1 })).ok, false);
+  assert.equal(validateConfig(cfg({ dailyTradeLimit: 0, maxCopiesPerMinute: 0 })).ok, true, 'the same for copies');
+  assert.equal(validateConfig(cfg({ dailyTradeLimit: -1 })).ok, false);
+  assert.equal(validateConfig(cfg({ maxCopiesPerMinute: -1 })).ok, false);
+  assert.equal(validateConfig(cfg({ dailyLossLimitSol: Number.NaN })).ok, false);
   assert.equal(validateConfig(cfg()).ok, true);
 });
 
@@ -692,6 +697,405 @@ test('LIVE: a sell that fails leaves the copy open and records why — never a p
   assert.ok(h.calls.toasts.some((t) => t.level === 'error' && /Copy sell failed/.test(t.message)));
 });
 
+test('failPauseReason: plain words, and the route notes do not read as the cause', () => {
+  const said = failPauseReason(3, 'Unconfirmed after waiting — may still land 5abc… [pump tx] lanes: jito 400 bad bundle, rpc ok');
+  assert.match(said, /^3 copies in a row failed, so it paused to stop paying fees/);
+  assert.match(said, /The last error: Unconfirmed after waiting/);
+  assert.doesNotMatch(said, /lanes:|bad bundle/);
+  assert.match(said, /A Jito error alone is usually not the cause/);
+  assert.doesNotMatch(failPauseReason(3, 'Simulation reverted: Overflow (6024)'), /Jito/);
+  assert.match(failPauseReason(3, 'Simulation reverted: Overflow (6024)'), /Overflow \(6024\)/);
+});
+
+const sellFails = (over = {}) => {
+  const state = { failing: true, sold: 0, result: { ok: false, message: 'Simulation reverted: Overflow (6024)' } };
+  return { state, host: { sell: async () => { state.sold += 1; return state.failing ? state.result : { ok: true, message: 'sold', signature: `retry${state.sold}` }; }, ...over } };
+};
+
+test('a failed sell is tried again by itself and lands; the failure row goes away', async () => {
+  const notes = [];
+  const { state, host } = sellFails({ notify: (title, body) => notes.push({ title, body }) });
+  await openLiveCopy({ host });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  assert.equal(state.sold, 1, 'tried once at the moment');
+  const parent = () => copy.snapshot().recent.find((t) => t.kind !== 'exit');
+  assert.equal(parent().state, 'open');
+  assert.match(copy.snapshot().recent.find((t) => t.kind === 'exit').reason, /Overflow.*trying again at/);
+  assert.ok(notes.some((n) => /tries again by itself/.test(n.body)));
+  const t0 = Date.now();
+  copy.checkMaxHolds(t0 + 10_000);
+  await tick();
+  assert.equal(state.sold, 1, 'not before its wait');
+  copy.checkMaxHolds(t0 + 31_000);
+  await tick();
+  assert.equal(state.sold, 2, 'the first retry');
+  assert.match(copy.snapshot().recent.find((t) => t.kind === 'exit').reason, /tried 2 times/);
+  copy.checkMaxHolds(t0 + 40_000);
+  await tick();
+  assert.equal(state.sold, 2, 'and the wait doubled');
+  state.failing = false;
+  copy.checkMaxHolds(t0 + 92_000);
+  await tick();
+  assert.equal(state.sold, 3);
+  assert.equal(parent().state, 'closed', 'sold');
+  assert.ok(!copy.snapshot().recent.some((t) => /trying again|tried \d/.test(t.reason ?? '')), 'the failure row is gone');
+  assert.ok(notes.some((n) => /went through/.test(n.title)));
+  copy.checkMaxHolds(t0 + 3_600_000);
+  await tick();
+  assert.equal(state.sold, 3, 'and nothing more is sold');
+});
+
+test('a failed sell keeps trying past a day, until it sells', async () => {
+  const notes = [];
+  const { state, host } = sellFails();
+  await openLiveCopy({ host: { ...host, notify: (title, body) => notes.push({ title, body }) } });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  const t0 = Date.now();
+  let at = t0;
+  for (let i = 0; i < 30; i += 1) {
+    at += 3_600_000;
+    copy.checkMaxHolds(at);
+    await tick();
+  }
+  assert.ok(state.sold >= 30, `still trying after thirty hours: ${state.sold}`);
+  assert.ok(!notes.some((n) => /gave up/.test(n.title)));
+  assert.match(copy.snapshot().recent.find((t) => t.kind === 'exit').reason, /next at/);
+  assert.equal(copy.all()[0].enabled, true, 'and the follow keeps running');
+  state.failing = false;
+  copy.checkMaxHolds(at + 3_600_000);
+  await tick();
+  assert.equal(copy.snapshot().recent.find((t) => t.kind !== 'exit').state, 'closed', 'it sold');
+  const n = state.sold;
+  copy.checkMaxHolds(at + 3 * 3_600_000);
+  await tick();
+  assert.equal(state.sold, n, 'and stops');
+});
+
+test('your own stop ends a retry; the sell is not sent', async () => {
+  const notes = [];
+  let blocked = null;
+  const { state, host } = sellFails({ notify: (title, body) => notes.push({ title, body }), exitBlockedReason: () => blocked });
+  await openLiveCopy({ host });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  blocked = 'the app is on Paper';
+  copy.checkMaxHolds(Date.now() + 60_000);
+  await tick();
+  assert.equal(state.sold, 1);
+  assert.match(copy.snapshot().recent.find((t) => t.kind === 'exit').reason, /not retried — the app is on Paper/);
+  blocked = null;
+  copy.checkMaxHolds(Date.now() + 3_600_000);
+  await tick();
+  assert.equal(state.sold, 1, 'coming back does not revive it');
+});
+
+test('sent but unconfirmed: a share nobody can read is left to the person; the whole bag waits, then sizes from the wallet', async () => {
+  const partial = sellFails();
+  partial.state.result = { ok: false, pending: true, message: 'broadcast but not confirmed in time', signature: 'maybe' };
+  await openLiveCopy({ host: partial.host });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 0.4, signature: 'sell1' }));
+  await tick();
+  assert.equal(partial.state.sold, 1);
+  assert.match(copy.snapshot().recent.find((t) => t.kind === 'exit').reason, /whether it landed/);
+  copy.checkMaxHolds(Date.now() + 3 * 60_000);
+  await tick();
+  assert.match(copy.snapshot().recent.find((t) => t.kind === 'exit').reason, /cannot be read/);
+  copy.checkMaxHolds(Date.now() + 3_600_000);
+  await tick();
+  assert.equal(partial.state.sold, 1, 'never sent again');
+  assert.equal(copy.snapshot().recent.find((t) => t.kind !== 'exit').handedBack, true, 'its numbers may be wrong, so the copy is the person\'s');
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 0.5, signature: 'sell2' }));
+  await tick();
+  assert.equal(partial.state.sold, 1, 'and the next leader sell does not sell that share twice');
+
+  const whole = sellFails();
+  whole.state.result = { ok: false, pending: true, message: 'broadcast but not confirmed in time', signature: 'maybe' };
+  await openLiveCopy({ host: whole.host });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  const t0 = Date.now();
+  copy.checkMaxHolds(t0 + 60_000);
+  await tick();
+  assert.equal(whole.state.sold, 1, 'it gets two minutes to land first');
+  whole.state.result = { ok: false, message: 'nothing to sell (zero token balance)' };
+  copy.checkMaxHolds(t0 + 3 * 60_000);
+  await tick();
+  assert.equal(whole.state.sold, 2);
+  assert.equal(copy.snapshot().recent.find((t) => t.kind !== 'exit').state, 'closed', 'an empty wallet closes the row');
+});
+
+test('an unconfirmed share the chain says did not land goes again; one that landed is booked', async () => {
+  let answer = false;
+  const h = await openLiveCopy({ chain: { bought: 1_000_000_000n }, host: { sendLanded: () => answer } });
+  const real = h.host.sell;
+  h.host.sell = async () => ({ ok: false, message: 'not confirmed', pending: true, signature: 'dead' });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 0.4, priceSol: 0.002, soldFraction: 0.4, signature: 'sell1' }));
+  await tick();
+  h.host.sell = real;
+  const t0 = Date.now();
+  copy.checkMaxHolds(t0 + 3 * 60_000);
+  await tick();
+  assert.equal(h.calls.chain.balance, 600_000_000n, 'it did not land, so the share went again, once');
+  copy.checkMaxHolds(t0 + 2 * 3_600_000);
+  await tick();
+  assert.equal(h.calls.chain.balance, 600_000_000n);
+
+  const b = await openLiveCopy({ chain: { bought: 1_000_000_000n }, host: { sendLanded: () => true } });
+  const realB = b.host.sell;
+  b.host.sell = async () => {
+    b.calls.chain.balance -= 400_000_000n;
+    return { ok: false, message: 'not confirmed', pending: true, signature: 'landed' };
+  };
+  copy.onWalletTrade(trade({ isBuy: false, sol: 0.4, priceSol: 0.002, soldFraction: 0.4, signature: 'sell1b' }));
+  await tick();
+  b.host.sell = realB;
+  const t1 = Date.now();
+  copy.checkMaxHolds(t1 + 3 * 60_000);
+  await tick();
+  assert.equal(b.calls.chain.balance, 600_000_000n, 'it landed: nothing more goes');
+  const row = copy.snapshot().recent.find((t) => t.kind !== 'exit');
+  assert.equal(row.state, 'open', 'and the rest of the copy is still held');
+  assert.equal(row.tokensLeftRaw, '600000000', 'booked at what is left');
+});
+
+test('a stop with the last send unread does not leave the next exit to take someone else\'s', async () => {
+  for (const [what, end] of [
+    ['kill', (h) => { h.host.liveBlockedReason = () => 'kill'; h.host.exitBlockedReason = () => 'kill'; }],
+    ['paper', () => { copy.upsert({ ...copy.all().find((c) => !c.wallet.startsWith('Xther')), mode: 'paper' }); }],
+  ]) {
+    const h = setup({ priceSol: 0.001, chain: { balance: 0n, bought: 1_000_000_000n, decimals: 6 } });
+    const base = { mode: 'live', sizing: 'fixed', sizeValue: 1, maxTradeSol: 1, delayMs: 0, copySells: true };
+    save(base);
+    save({ ...cfg(), ...base, wallet: 'Xther11111111111111111111111111111111111111', label: 'Other' });
+    copy.onWalletTrade(trade({ isBuy: true, signature: 'b1' }));
+    await tick();
+    copy.onWalletTrade(trade({ wallet: 'Xther11111111111111111111111111111111111111', isBuy: true, signature: 'b2' }));
+    await tick();
+    const real = h.host.sell;
+    h.host.sell = async (m, p, o) => {
+      h.calls.chain.balance -= BigInt(o.tokensRaw);
+      return { ok: false, message: 'nc', pending: true, signature: 'x' };
+    };
+    copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 's1' }));
+    await tick();
+    h.host.sell = real;
+    assert.equal(h.calls.chain.balance, 1_000_000_000n, 'the whole of this copy went, unread');
+    end(h);
+    copy.checkMaxHolds(Date.now() + 30_000);
+    await tick();
+    const row = copy.snapshot().recent.find((t) => t.kind !== 'exit' && t.state === 'open' && t.handedBack);
+    assert.ok(row, `${what}: the copy is left to the person`);
+    assert.match(copy.snapshot().recent.find((t) => t.kind === 'exit').reason, /may have landed/);
+    assert.doesNotMatch(copy.snapshot().recent.find((t) => t.kind === 'exit').reason, /You still hold it/);
+    h.host.liveBlockedReason = () => null;
+    h.host.exitBlockedReason = () => null;
+    copy.upsert({ ...copy.all().find((c) => c.id === row.configId), mode: 'live' });
+    copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 's2' }));
+    await tick();
+    assert.equal(h.calls.chain.balance, 1_000_000_000n, 'the other follow keeps what it holds');
+  }
+});
+
+test('a try that comes back after it was given up on does not start another', async () => {
+  const notes = [];
+  const h = await openLiveCopy({ host: { notify: (title, body) => notes.push({ title, body }) } });
+  const real = h.host.sell;
+  h.host.sell = async () => ({ ok: false, message: 'bh' });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  let answer;
+  h.host.sell = () => new Promise((r) => { answer = r; });
+  const t0 = Date.now();
+  copy.checkMaxHolds(t0 + 3_600_000);
+  await tick();
+  assert.ok(answer, 'the try is out');
+  copy.checkMaxHolds(t0 + 2 * 3_600_000 + 1_000);
+  await tick();
+  assert.match(copy.snapshot().recent.find((t) => t.kind === 'exit').reason, /never came back/);
+  answer({ ok: false, message: 'bh' });
+  await tick();
+  const sent = h.calls.sells.length;
+  h.host.sell = real;
+  copy.checkMaxHolds(t0 + 5 * 3_600_000);
+  await tick();
+  assert.equal(h.calls.sells.length, sent, 'it stays the person\'s, as they were told');
+});
+
+test('a rule firing every tick on a held coin does not keep asking the AI, or stack its answers', async () => {
+  let asks = 0;
+  const sends = [];
+  const h = setup({ priceSol: 0.001, chain: { balance: 0n, bought: 1_000_000_000n, decimals: 6 }, host: { aiNewId: () => `a${asks}`, aiSettled: () => {} } });
+  h.host.aiAsk = async () => {
+    asks += 1;
+    return { by: 'ai', verdict: { verdict: 'sell', percent: 10, reason: 'trim' }, ms: 1 };
+  };
+  save({ mode: 'live', sizing: 'fixed', sizeValue: 1, maxTradeSol: 1, delayMs: 0, exitMaxHoldMin: 1, ai: { entries: false, exits: true, waitSec: 30, onTimeout: 'copy', protectiveWait: false } });
+  copy.onWalletTrade(trade({ isBuy: true, signature: 'b1' }));
+  await tick();
+  h.host.sell = async (m, p, o) => {
+    sends.push(o.tokensRaw);
+    return { ok: false, message: 'bh' };
+  };
+  const t0 = Date.now() + 3_600_000;
+  for (let i = 0; i < 8; i += 1) {
+    copy.checkMaxHolds(t0 + i * 5_000);
+    await tick();
+    await tick();
+  }
+  assert.equal(asks, 2, 'asked when it first fired, and once during the hold; not every tick');
+  assert.ok(sends.every((x) => BigInt(x) <= 190_000_000n), `two answers of 10%, and no more: ${sends}`);
+});
+
+test('a one-time exit on a held coin still gets its one AI answer, and joins', async () => {
+  let asks = 0;
+  const h = setup({ priceSol: 0.001, chain: { balance: 0n, bought: 1_000_000_000n, decimals: 6 }, host: { aiNewId: () => `a${asks}`, aiSettled: () => {} } });
+  h.host.aiAsk = async () => {
+    asks += 1;
+    return { by: 'ai', verdict: { verdict: 'sell', reason: 'go' }, ms: 1 };
+  };
+  save({ mode: 'live', sizing: 'fixed', sizeValue: 1, maxTradeSol: 1, delayMs: 0, exitOnMigration: true, ai: { entries: false, exits: true, waitSec: 30, onTimeout: 'copy', protectiveWait: false } });
+  copy.onWalletTrade(trade({ isBuy: true, signature: 'b1' }));
+  await tick();
+  const real = h.host.sell;
+  h.host.sell = async () => ({ ok: false, message: 'bh' });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 0.3, priceSol: 0.002, soldFraction: 0.3, signature: 's1' }));
+  await tick();
+  const asked = asks;
+  copy.noteMigration(MINT);
+  await tick();
+  assert.equal(asks, asked + 1, 'it is asked');
+  h.host.sell = real;
+  copy.checkMaxHolds(Date.now() + 3_600_000);
+  await tick();
+  await tick();
+  assert.equal(h.calls.chain.balance, 0n, 'and the whole of it goes, not only the 30%');
+});
+
+test('a hold does not go on selling a copy that was handed to the person', async () => {
+  const h = await openLiveCopy({ chain: { bought: 1_000_000_000n } });
+  const real = h.host.sell;
+  h.host.sell = async () => ({ ok: false, message: 'bh' });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 0.3, priceSol: 0.002, soldFraction: 0.3, signature: 's1' }));
+  await tick();
+  h.host.sell = async (m, p, o) => {
+    h.calls.chain.balance -= BigInt(o.tokensRaw);
+    return { ok: false, message: 'nc', pending: true, signature: 'x' };
+  };
+  // The hold's own failed try would otherwise leave it open: a further sell goes out unread.
+  const w = copy.snapshot().recent.find((t) => t.kind !== 'exit');
+  assert.equal(w.state, 'open');
+  copy.onWalletTrade(trade({ isBuy: false, sol: 0.2, priceSol: 0.002, soldFraction: 0.2, signature: 's2' }));
+  await tick();
+  const after = h.calls.chain.balance;
+  h.host.sell = real;
+  const row = copy.snapshot().recent.find((t) => t.kind !== 'exit');
+  assert.equal(row.handedBack, true);
+  copy.checkMaxHolds(Date.now() + 3_600_000);
+  await tick();
+  await tick();
+  assert.equal(h.calls.chain.balance, after, 'nothing more goes out for it');
+  assert.ok(copy.snapshot().recent.some((t) => t.kind === 'exit' && /handed to you/.test(t.reason)), 'and the row says so');
+});
+
+test('a copy that joined after an unread send is still sold when that send cannot be read', async () => {
+  const h = await openLiveCopy({ chain: { bought: 1_000_000_000n } });
+  copy.upsert({ ...copy.all()[0], oncePerMint: false });
+  const real = h.host.sell;
+  h.host.sell = async (m, p, o) => {
+    h.calls.chain.balance -= BigInt(o.tokensRaw) / 2n;
+    return { ok: false, message: 'nc', pending: true, signature: 'x' };
+  };
+  copy.onWalletTrade(trade({ isBuy: false, sol: 0.5, priceSol: 0.002, soldFraction: 0.5, signature: 's1' }));
+  await tick();
+  h.host.sell = real;
+  copy.onWalletTrade(trade({ isBuy: true, signature: 'b2' }));
+  await tick();
+  const held = h.calls.chain.balance;
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 's2' }));
+  await tick();
+  assert.equal(h.calls.chain.balance, held, 'it joins: the last send is unread');
+  copy.checkMaxHolds(Date.now() + 3 * 60_000);
+  await tick();
+  await tick();
+  assert.ok(h.calls.chain.balance < held, 'the later copy is sold');
+  assert.ok(h.calls.chain.balance >= 500_000_000n, 'and never what the unread copy may still hold');
+  const open = copy.snapshot().recent.filter((t) => t.kind !== 'exit' && t.state === 'open');
+  assert.ok(open.some((t) => t.handedBack), 'the first copy is the person\'s');
+});
+
+test('a sell that skips a handed-back copy still comes back for a buy in flight', async () => {
+  const h = await openLiveCopy({ chain: { bought: 1_000_000_000n } });
+  copy.upsert({ ...copy.all()[0], oncePerMint: false });
+  const real = h.host.sell;
+  h.host.sell = async () => ({ ok: false, message: 'nc', pending: true, signature: 'x' });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 0.5, priceSol: 0.002, soldFraction: 0.5, signature: 's1' }));
+  await tick();
+  h.host.sell = real;
+  copy.checkMaxHolds(Date.now() + 3 * 60_000);
+  await tick();
+  assert.equal(copy.snapshot().recent.find((t) => t.kind !== 'exit').handedBack, true);
+  const buy = h.host.buy;
+  let release;
+  h.host.buy = async (...a) => {
+    await new Promise((r) => { release = r; });
+    return buy(...a);
+  };
+  copy.onWalletTrade(trade({ isBuy: true, signature: 'b2' }));
+  await tick();
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 's2' }));
+  await tick();
+  release();
+  await tick();
+  await tick();
+  assert.equal(h.calls.chain.balance, 1_000_000_000n, 'the new copy sold; the handed-back one stays');
+});
+
+test('a share that joined an unconfirmed one is still owed after that one lands', async () => {
+  const h = await openLiveCopy({ chain: { bought: 1_000_000_000n }, host: { sendLanded: () => true } });
+  const real = h.host.sell;
+  h.host.sell = async () => {
+    h.calls.chain.balance -= 500_000_000n;
+    return { ok: false, message: 'not confirmed', pending: true, signature: 'landed' };
+  };
+  copy.onWalletTrade(trade({ isBuy: false, sol: 0.5, priceSol: 0.002, soldFraction: 0.5, signature: 'sell1' }));
+  await tick();
+  h.host.sell = real;
+  // The leader sells half again while the first is unknown: it joins, and nothing goes.
+  copy.onWalletTrade(trade({ isBuy: false, sol: 0.25, priceSol: 0.002, soldFraction: 0.5, signature: 'sell2' }));
+  await tick();
+  assert.equal(h.calls.chain.balance, 500_000_000n);
+  const t0 = Date.now();
+  copy.checkMaxHolds(t0 + 3 * 60_000);
+  await tick();
+  assert.equal(h.calls.chain.balance, 500_000_000n, 'the first is booked');
+  copy.checkMaxHolds(t0 + 4 * 60_000);
+  await tick();
+  assert.equal(h.calls.chain.balance, 250_000_000n, 'half of what was left then goes, once');
+  copy.checkMaxHolds(t0 + 3 * 3_600_000);
+  await tick();
+  assert.equal(h.calls.chain.balance, 250_000_000n);
+});
+
+test('a second failed sell joins the first: one retry, both shares', async () => {
+  const { state, host } = sellFails();
+  await openLiveCopy({ host });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 0.5, signature: 'sell1' }));
+  await tick();
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 0.5, signature: 'sell2' }));
+  await tick();
+  assert.equal(state.sold, 2);
+  assert.equal(copy.snapshot().recent.filter((t) => t.kind === 'exit').length, 1, 'one row on the record');
+  state.failing = false;
+  copy.checkMaxHolds(Date.now() + 31_000);
+  await tick();
+  assert.equal(state.sold, 3, 'one more send, not two');
+  copy.checkMaxHolds(Date.now() + 3_600_000);
+  await tick();
+  assert.equal(state.sold, 3);
+});
+
 test('LIVE: a sell while live is blocked is recorded as not executed, and does not call the host', async () => {
   const h = await openLiveCopy();
   h.host.liveBlockedReason = () => 'the engine is not armed';
@@ -852,6 +1256,16 @@ test('activeWallets lists only enabled configs', () => {
   assert.equal(active.size, 1);
 });
 
+test('keepsRunning: a follow that is on or coming back holds the computer awake; a stopped one does not', () => {
+  setup();
+  assert.equal(copy.keepsRunning(), false, 'nothing followed');
+  save({ enabled: false });
+  assert.equal(copy.keepsRunning(), false, 'switched off and staying off');
+  setup();
+  save({ enabled: true });
+  assert.equal(copy.keepsRunning(), true);
+});
+
 test('following the same wallet twice is refused', () => {
   setup();
   assert.equal(save().ok, true);
@@ -981,8 +1395,9 @@ test('a full exit that only half-fills leaves the copy OPEN for the remainder �
   assert.equal(parent.tokensLeftRaw, '36864000000');
   assert.equal(h.calls.chain.balance, 36_864_000_000n, 'and the book agrees with the wallet');
 
-  const exits = snap.recent.filter((t) => t.kind === 'exit');
+  const exits = snap.recent.filter((t) => t.kind === 'exit' && t.signature);
   assert.equal(exits.length, 2, 'one slice per sell that landed');
+  assert.ok(snap.recent.some((t) => t.kind === 'exit' && !t.signature && /came back short/.test(t.reason ?? '')), 'and a row for the rest being retried');
   const first = exits[exits.length - 1];
   assert.equal(first.soldPct, 52, 'the slice records what WE sold');
   assert.equal(first.leaderPct, 100, 'and what they sold, because the two differ');
@@ -1823,7 +2238,7 @@ test('the per-minute wall refuses a burst even when the day has room', async () 
 test('validation accepts a config with no per-minute field, and rejects a silly one', () => {
   const { maxCopiesPerMinute, ...without } = cfg();
   assert.equal(validateConfig(without).ok, true, 'an older saved config still loads');
-  assert.equal(validateConfig(cfg({ maxCopiesPerMinute: 0 })).ok, false);
+  assert.equal(validateConfig(cfg({ maxCopiesPerMinute: 0 })).ok, true, '0 is no limit');
   assert.equal(validateConfig(cfg({ maxCopiesPerMinute: 500 })).ok, false);
   assert.equal(validateConfig(cfg({ maxCopiesPerMinute: 5 })).ok, true);
 });
@@ -2887,6 +3302,441 @@ test('per-wallet stop: a follow that has lost past its stop pauses itself, says 
   assert.equal(h.calls.buys.length, 0, 'paper all the way');
 });
 
+// ── Auto re-arm (shared/rearm.ts) ─────────────────────────────────────────
+const REARM = { failedTrades: true, lossLimits: false, followStops: false, restart: false, failsInARow: 3, firstWaitMin: 5, maxInARow: 24 };
+const failThree = async (tag) => {
+  for (let i = 0; i < 3; i++) {
+    copy.onWalletTrade(trade({ isBuy: true, mint: `${tag}${i + 2}${'1'.repeat(44 - tag.length - 1)}`, signature: `${tag}${i}` }));
+    await tick();
+  }
+};
+const failingLive = (rearm, over = {}) => {
+  const notes = [];
+  const h = setup({
+    priceSol: 0.001,
+    buyResult: { ok: false, message: 'Simulation failed: blockhash not found' },
+    host: { rearm: () => rearm, notify: (title, body) => notes.push({ title, body }), ...over },
+  });
+  save({ mode: 'live', sizing: 'fixed', sizeValue: 1, maxTradeSol: 1, delayMs: 0 });
+  return { h, notes };
+};
+
+test('auto re-arm: failed copies pause a follow, and it comes back on by itself', async () => {
+  const { h, notes } = failingLive(REARM);
+  const t0 = Date.now();
+  await failThree('Rea');
+  let c = copy.all()[0];
+  assert.equal(c.enabled, false, 'paused');
+  assert.equal(c.pausedBy, 'fails');
+  assert.ok(c.rearmAt >= t0 + 5 * 60_000 && c.rearmAt <= Date.now() + 5 * 60_000, 'for the first wait');
+  assert.equal(copy.keepsRunning(), true, 'waiting to come back still holds the computer awake');
+  assert.match(notes[0].body, /comes back on by itself at/);
+  assert.equal(copy.pendingRearms().length, 1, 'the Settings list shows it');
+  copy.checkMaxHolds(c.rearmAt - 1);
+  assert.equal(copy.all()[0].enabled, false, 'not a moment before');
+  copy.checkMaxHolds(c.rearmAt);
+  c = copy.all()[0];
+  assert.equal(c.enabled, true, 'back on');
+  assert.equal(c.pausedReason, null);
+  assert.equal(c.rearmAt, null);
+  assert.equal(c.rearmTries, 1);
+  assert.match(notes.at(-1).body, /spend real money/, 'and says so');
+  assert.equal(h.calls.sells.length, 0);
+  // Failing again waits longer.
+  const t1 = Date.now();
+  await failThree('Reb');
+  c = copy.all()[0];
+  assert.equal(c.enabled, false);
+  assert.ok(c.rearmAt >= t1 + 10 * 60_000, 'the wait doubled');
+});
+
+test('auto re-arm: a follow that comes back is watched again, and says so to the watcher', async () => {
+  // It was on and deaf: nothing re-pointed the wallet watcher, and the app said
+  // "back on, will spend real money" over a follow that heard nothing.
+  let syncs = 0;
+  let heard = false;
+  failingLive(REARM, { syncWatch: () => { syncs += 1; heard = copy.activeWallets().has(WALLET); } });
+  await failThree('Rwa');
+  assert.equal(copy.activeWallets().has(WALLET), false, 'paused with nothing open: not watched');
+  copy.checkMaxHolds(copy.all()[0].rearmAt);
+  assert.equal(copy.all()[0].enabled, true);
+  assert.equal(syncs, 1, 'the watcher is told');
+  assert.equal(heard, true, 'and by then the follow is one to watch');
+
+  // The same after a restart.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rearm-watch-'));
+  try {
+    copy._reset();
+    copy.init(dir);
+    let restored = 0;
+    let heardRestart = false;
+    copy.attach(makeHost({ host: { rearm: () => REARM } }).host);
+    save({ mode: 'live', sizing: 'fixed', sizeValue: 1, maxTradeSol: 1, delayMs: 0 });
+    await new Promise((r) => setTimeout(r, 400));
+    copy._reset();
+    copy.init(dir);
+    assert.equal(copy.activeWallets().has(WALLET), false, 'a restart stops watching it');
+    copy.attach(makeHost({ host: { rearm: () => ({ ...REARM, restart: true }), syncWatch: () => { restored += 1; heardRestart = copy.activeWallets().has(WALLET); } } }).host);
+    assert.equal(copy.restoreAfterRestart(), 1);
+    assert.equal(restored, 1);
+    assert.equal(heardRestart, true);
+  } finally {
+    await new Promise((r) => setTimeout(r, 100));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('auto re-arm: choosing Paper or locking ends a wait; a breaker does not', async () => {
+  failingLive(REARM);
+  await failThree('Rpa');
+  const at = copy.all()[0].rearmAt;
+  copy.cancelLiveRearms('solana');
+  assert.equal(copy.all()[0].rearmAt, null, 'Paper on its chain');
+  copy.checkMaxHolds(at + 1);
+  assert.equal(copy.all()[0].enabled, false, 'going Live later does not switch it on');
+
+  failingLive(REARM);
+  await failThree('Rpb');
+  copy.cancelLiveRearms('bnb');
+  assert.notEqual(copy.all()[0].rearmAt, null, 'another chain going to Paper leaves it alone');
+  copy.cancelLiveRearms();
+  assert.equal(copy.all()[0].rearmAt, null, 'locking ends every chain');
+});
+
+test('auto re-arm: an unconfirmed send does not start the count again', async () => {
+  const { h } = failingLive(REARM);
+  await failThree('Rua');
+  copy.checkMaxHolds(copy.all()[0].rearmAt);
+  h.host.buy = async () => ({ ok: false, pending: true, message: 'sent, not confirmed', signature: 'sigp' });
+  copy.onWalletTrade(trade({ isBuy: true, mint: `Rub2${'1'.repeat(40)}`, signature: 'p1' }));
+  await tick();
+  assert.equal(copy.all()[0].rearmTries, 1, 'only a copy that landed resets it');
+});
+
+test('auto re-arm: a route that only times out pauses too, and a late landing clears it', async () => {
+  const { h } = failingLive(REARM);
+  h.host.buy = async () => ({ ok: false, pending: true, message: 'sent, not confirmed', signature: 'sigt' });
+  for (let i = 0; i < 5; i++) {
+    copy.onWalletTrade(trade({ isBuy: true, mint: `Tot${i}${'1'.repeat(40)}`, signature: `to${i}` }));
+    await tick();
+    assert.equal(copy.all()[0].enabled, true, `still on after ${i + 1}`);
+  }
+  copy.onWalletTrade(trade({ isBuy: true, mint: `Tot6${'1'.repeat(40)}`, signature: 'to6' }));
+  await tick();
+  const c = copy.all()[0];
+  assert.equal(c.enabled, false, 'six in a row at three fails a row');
+  assert.match(c.pausedReason, /never confirmed/);
+  assert.equal(c.pausedBy, 'fails');
+  assert.ok(c.rearmAt, 'and the comeback count runs');
+});
+
+test('auto re-arm: tokens arriving late reset the count, as Settings says', async () => {
+  const { h } = failingLive(REARM);
+  await failThree('Lat');
+  copy.checkMaxHolds(copy.all()[0].rearmAt);
+  assert.equal(copy.all()[0].rearmTries, 1);
+  h.host.buy = async () => ({ ok: false, pending: true, message: 'sent, not confirmed', signature: 'sigl' });
+  h.host.fillTokens = async () => ({ raw: '1000', decimals: 6, sol: -0.1, slot: 5 });
+  copy.onWalletTrade(trade({ isBuy: true, mint: `Lat2${'1'.repeat(40)}`, signature: 'lt1' }));
+  await tick();
+  await tick();
+  assert.equal(copy.all()[0].rearmTries, 0);
+});
+
+test('auto re-arm: a failed read does not count as landing', async () => {
+  const { h } = failingLive(REARM);
+  await failThree('Lau');
+  copy.checkMaxHolds(copy.all()[0].rearmAt);
+  h.host.buy = async () => ({ ok: false, pending: true, message: 'sent, not confirmed', signature: 'sigu' });
+  h.host.fillTokens = async () => ({ raw: '0', decimals: 6, sol: -0.0001, slot: 5 });
+  copy.onWalletTrade(trade({ isBuy: true, mint: `Lau2${'1'.repeat(40)}`, signature: 'lu1' }));
+  await tick();
+  await tick();
+  assert.equal(copy.all()[0].rearmTries, 1, 'a reverted send pays a fee and gets no tokens');
+});
+
+test('auto re-arm: back on and stays off get past the six-an-hour budget', async () => {
+  const notes = [];
+  const { h } = failingLive({ ...REARM, maxInARow: 1 }, { notify: (title, body) => notes.push({ title, body }) });
+  void h;
+  for (let round = 0; round < 3; round++) {
+    await failThree(`Nb${round}`);
+    const c = copy.all()[0];
+    if (c.rearmAt) copy.checkMaxHolds(c.rearmAt);
+  }
+  assert.ok(notes.some((n) => /is back on/.test(n.title)), 'heard it come back');
+  assert.ok(notes.some((n) => /paused/.test(n.title) && !/by itself at/.test(n.body)), 'heard it stay off');
+});
+
+test('EVM: a queued buy is asked again at the head of the queue', async () => {
+  const EVM_WALLET = `0x${'a'.repeat(40)}`;
+  const token = (i) => `0x${String(i).repeat(40)}`;
+  let live = true;
+  const h = setup({
+    priceSol: 0.001,
+    host: { liveBlockedReason: (chain) => (chain === 'bnb' && !live ? 'BNB is in Paper' : null) },
+  });
+  let sent = 0;
+  let atHead = [];
+  h.host.buy = async (_m, _s, o) => {
+    assert.equal(typeof o.atHead, 'function', 'an EVM buy carries the question');
+    const why = o.atHead();
+    atHead.push(why);
+    if (why) return { ok: false, message: why };
+    sent += 1;
+    return { ok: true, message: 'ok', signature: `0xs${sent}`, fillPriceSol: 0.001, spentSol: 1 };
+  };
+  save({ wallet: EVM_WALLET, chain: 'bnb', mode: 'live', sizing: 'fixed', sizeValue: 1, maxTradeSol: 1, delayMs: 0 });
+  copy.onWalletTrade(trade({ chain: 'bnb', wallet: EVM_WALLET, mint: token(1), signature: 'e1' }));
+  await tick();
+  assert.equal(sent, 1, 'on: it goes');
+  // The kill switch lands while the next one waits.
+  live = false;
+  h.host.buy = async (_m, _s, o) => {
+    const why = o.atHead();
+    atHead.push(why);
+    return why ? { ok: false, message: why } : { ok: true, message: 'ok', signature: '0xnever', spentSol: 1 };
+  };
+  h.host.liveBlockedReason = (chain) => (chain === 'bnb' && live === false && atHead.length >= 1 ? 'BNB is in Paper' : null);
+  for (let i = 2; i < 7; i++) {
+    copy.onWalletTrade(trade({ chain: 'bnb', wallet: EVM_WALLET, mint: token(i), signature: `e${i}` }));
+    await tick();
+  }
+  assert.equal(copy.all()[0].enabled, true, 'stopped at the head is a decision, not a failed send: no pause');
+});
+
+test('one coin, two buys at once: a sell closes what is open and comes back for the second', async () => {
+  const h = setup({ priceSol: 0.001 });
+  const c = save({ mode: 'live', sizing: 'fixed', sizeValue: 1, maxTradeSol: 1, delayMs: 0 });
+  void c;
+  const gates = [];
+  let n = 0;
+  h.host.buy = () =>
+    new Promise((resolve) => {
+      const i = ++n;
+      gates.push(() => resolve({ ok: true, message: 'ok', signature: `b${i}`, fillPriceSol: 0.001, spentSol: 1 }));
+    });
+  const sold = [];
+  h.host.sell = async (mint, pct) => {
+    sold.push({ mint, pct });
+    return { ok: true, message: 'ok', signature: `s${sold.length}`, soldTokensRaw: '1' };
+  };
+  copy.onWalletTrade(trade({ signature: 'bb1' }));
+  await tick();
+  copy.onWalletTrade(trade({ signature: 'bb2' }));
+  await tick();
+  assert.equal(gates.length, 2, 'both buys are out');
+  gates[0]();
+  await tick();
+  const open = () => copy.snapshot().recent.filter((r) => r.state === 'open' && r.kind !== 'exit');
+  assert.equal(open().length, 1, 'the first has opened');
+  copy.onWalletTrade(sell({ signature: 'ss1', soldFraction: 1 }));
+  await tick();
+  await tick();
+  assert.equal(open().length, 0, 'the sell closed it, with the second still going');
+  gates[1]();
+  await tick();
+  await tick();
+  await tick();
+  assert.equal(open().length, 0, 'the second opened and followed them out, instead of being left holding');
+  assert.equal(sold.length, 2, 'one sell each');
+});
+
+test('auto re-arm: a copy that lands starts the count again', async () => {
+  const { h } = failingLive(REARM);
+  await failThree('Rec');
+  copy.checkMaxHolds(copy.all()[0].rearmAt);
+  assert.equal(copy.all()[0].rearmTries, 1);
+  h.host.buy = async () => ({ ok: true, message: 'ok', signature: 'sig1', fillPriceSol: 0.001, spentSol: 1 });
+  copy.onWalletTrade(trade({ isBuy: true, mint: `Red2${'1'.repeat(40)}`, signature: 'ok1' }));
+  await tick();
+  assert.equal(copy.all()[0].rearmTries, 0);
+});
+
+test('auto re-arm: it stays off once its switch is off, or at the comeback limit', async () => {
+  const off = failingLive({ ...REARM, failedTrades: false });
+  await failThree('Ree');
+  assert.equal(copy.all()[0].enabled, false);
+  assert.equal(copy.all()[0].rearmAt, null, 'switch off: no comeback, the old behaviour');
+  assert.match(off.notes[0].body, /Switch it back on in Following/);
+
+  const policy = { ...REARM };
+  failingLive(policy, { rearm: () => policy });
+  await failThree('Rff');
+  const at = copy.all()[0].rearmAt;
+  policy.failedTrades = false; // turned off during the wait
+  copy.checkMaxHolds(at + 1);
+  assert.equal(copy.all()[0].enabled, false, 'turning the switch off during a wait keeps it off');
+  assert.equal(copy.all()[0].rearmAt, null);
+
+  failingLive({ ...REARM, maxInARow: 1 });
+  await failThree('Rgg');
+  copy.checkMaxHolds(copy.all()[0].rearmAt);
+  assert.equal(copy.all()[0].enabled, true, 'its one comeback');
+  await failThree('Rhh');
+  assert.equal(copy.all()[0].enabled, false);
+  assert.equal(copy.all()[0].rearmAt, null, 'and then it stays off');
+});
+
+test('auto re-arm: a choice by the user always beats a planned comeback', async () => {
+  // Keep it off.
+  failingLive(REARM);
+  await failThree('Rii');
+  const at = copy.all()[0].rearmAt;
+  copy.cancelRearm(copy.all()[0].id);
+  copy.checkMaxHolds(at + 1);
+  assert.equal(copy.all()[0].enabled, false, 'Keep it off keeps it off');
+
+  // The kill switch, with no id, keeps every follow off.
+  failingLive(REARM);
+  await failThree('Rjj');
+  const at2 = copy.all()[0].rearmAt;
+  copy.cancelRearm();
+  copy.checkMaxHolds(at2 + 1);
+  assert.equal(copy.all()[0].enabled, false);
+
+  // Switched on by hand: the pause and the count are over.
+  failingLive(REARM);
+  await failThree('Rkk');
+  copy.upsert({ ...copy.all()[0], enabled: true });
+  assert.equal(copy.all()[0].rearmAt, null);
+  assert.equal(copy.all()[0].rearmTries, 0);
+
+  // Moved to paper during the wait, then to live: moving to live is disarmed,
+  // and a comeback planned earlier must not arm it.
+  failingLive(REARM);
+  await failThree('Rll');
+  const at3 = copy.all()[0].rearmAt;
+  copy.upsert({ ...copy.all()[0], mode: 'paper' });
+  assert.equal(copy.all()[0].rearmAt, null, 'a new mode ends the plan');
+  copy.upsert({ ...copy.all()[0], mode: 'live' });
+  copy.checkMaxHolds(at3 + 1);
+  assert.equal(copy.all()[0].enabled, false, 'never armed by an old plan');
+});
+
+test('auto re-arm: a live follow waits while live cannot run, and spends no comeback', async () => {
+  let blocked = null;
+  failingLive(REARM, { liveBlockedReason: () => blocked });
+  await failThree('Rmm');
+  const c = copy.all()[0];
+  const at = c.rearmAt;
+  blocked = 'Paper mode';
+  copy.checkMaxHolds(at + 1);
+  assert.equal(copy.all()[0].enabled, false, 'stays paused');
+  assert.equal(copy.all()[0].rearmAt, at, 'still waiting');
+  assert.equal(copy.all()[0].rearmTries, 1);
+  blocked = null;
+  copy.checkMaxHolds(at + 2);
+  assert.equal(copy.all()[0].enabled, true);
+});
+
+test("auto re-arm: a follow's loss stop stays off unless asked, and comes back with the count at zero", async () => {
+  const run = async (policy) => {
+    setup({ priceSol: 0.001, host: { rearm: () => policy } });
+    save({ sizing: 'fixed', sizeValue: 1, maxTradeSol: 1, delayMs: 0, dailyLossLimitSol: 10, walletLossStopSol: 0.5 });
+    copy.onWalletTrade(trade({ isBuy: true, signature: 'b1' }));
+    await tick();
+    copy.onWalletTrade(trade({ isBuy: false, priceSol: 0.00025, soldFraction: 1, signature: 's1' }));
+    await tick();
+    copy.checkMaxHolds();
+    return copy.all()[0];
+  };
+  let c = await run(REARM);
+  assert.equal(c.enabled, false);
+  assert.equal(c.rearmAt, null, 'by default it stays off');
+  c = await run({ ...REARM, followStops: true });
+  assert.equal(c.enabled, false);
+  assert.equal(c.pausedBy, 'stop');
+  assert.ok(c.rearmAt >= Date.now() + 59 * 60_000, 'after the full hour');
+  assert.equal(c.stopTries, 1);
+  copy.checkMaxHolds(c.rearmAt);
+  c = copy.all()[0];
+  assert.equal(c.enabled, true);
+  assert.equal(c.stopTries, 1, 'only switching it on by hand ends this count');
+  assert.equal(c.lossStopFrom >= c.createdAt, true);
+  copy.checkMaxHolds(c.lossStopFrom + 1);
+  assert.equal(copy.all()[0].enabled, true, 'the losses that tripped it are not counted again');
+});
+
+test("auto re-arm: copies landing do not lift the comeback limit on a follow's loss stop", async () => {
+  // Only landing copies can lose the stop again, so a count they reset never
+  // reached its limit, and the follow could keep losing its stop for ever.
+  setup({ priceSol: 0.001, host: { rearm: () => ({ ...REARM, followStops: true, maxInARow: 2 }) } });
+  save({ sizing: 'fixed', sizeValue: 1, maxTradeSol: 1, delayMs: 0, dailyLossLimitSol: 1000, walletLossStopSol: 0.5 });
+  const loseStop = async (i) => {
+    const mint = `Los${i + 2}${'1'.repeat(40)}`;
+    copy.onWalletTrade(trade({ isBuy: true, mint, signature: `lb${i}` }));
+    await tick();
+    copy.onWalletTrade(trade({ isBuy: false, mint, priceSol: 0.00025, soldFraction: 1, signature: `ls${i}` }));
+    await tick();
+    copy.checkMaxHolds();
+  };
+  // The hour really passes: a comeback restarts the loss count from "now", and
+  // the next copies have to happen after that.
+  const realNow = Date.now;
+  let clock = realNow();
+  Date.now = () => clock;
+  const waitItOut = () => {
+    clock = copy.all()[0].rearmAt;
+    copy.checkMaxHolds(clock);
+    clock += 1000;
+  };
+  try {
+    await loseStop(0);
+    assert.equal(copy.all()[0].stopTries, 1);
+    waitItOut();
+    assert.equal(copy.all()[0].enabled, true);
+    await loseStop(1);
+    assert.equal(copy.all()[0].stopTries, 2, 'the copies that landed did not reset it');
+    waitItOut();
+    assert.equal(copy.all()[0].enabled, true);
+    await loseStop(2);
+    assert.equal(copy.all()[0].enabled, false);
+    assert.equal(copy.all()[0].rearmAt, null, 'the limit holds: it stays off');
+    copy.upsert({ ...copy.all()[0], enabled: true });
+    assert.equal(copy.all()[0].stopTries, 0, 'until the user switches it on');
+  } finally {
+    Date.now = realNow;
+  }
+});
+
+test('auto re-arm: restart switches live follows off, says why, and only the switch brings them back', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rearm-restart-'));
+  try {
+    copy._reset();
+    copy.init(dir);
+    copy.attach(makeHost({ host: { rearm: () => REARM } }).host);
+    const on = save({ mode: 'live', sizing: 'fixed', sizeValue: 1, maxTradeSol: 1, delayMs: 0, label: 'on' });
+    const mine = copy.upsert({ ...cfg({ wallet: 'Mine1111111111111111111111111111111111111', label: 'paused by me', mode: 'live' }) });
+    assert.ok(mine.ok, mine.message);
+    copy.persistNow?.();
+    await new Promise((r) => setTimeout(r, 400));
+    copy._reset();
+    copy.init(dir);
+    let list = copy.all();
+    const one = list.find((c) => c.label === 'on');
+    const two = list.find((c) => c.label === 'paused by me');
+    assert.equal(one.enabled, false, 'a restart switches it off');
+    assert.match(one.pausedReason, /restarted/);
+    assert.equal(one.pausedBy, 'restart');
+    assert.equal(one.rearmAt, null, 'and no timer brings it back');
+    copy.checkMaxHolds(Date.now() + 86_400_000);
+    assert.equal(copy.all().find((c) => c.label === 'on').enabled, false);
+    // The restart switch.
+    copy.attach(makeHost({ host: { rearm: () => ({ ...REARM, restart: true }) } }).host);
+    assert.equal(copy.restoreAfterRestart(), 1, 'only the one that was running');
+    list = copy.all();
+    assert.equal(list.find((c) => c.label === 'on').enabled, true);
+    assert.equal(list.find((c) => c.label === 'paused by me').enabled, false, 'one the user had off stays off');
+    assert.equal(copy.restoreAfterRestart(), 0, 'once');
+    void on;
+    void two;
+  } finally {
+    await new Promise((r) => setTimeout(r, 100));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('three failed live copies in a row pause the follow; one that lands resets the count', async () => {
   const notes = [];
   const h = setup({ priceSol: 0.001, buyResult: { ok: false, message: 'Simulation failed: insufficient funds' }, host: { notify: (title) => notes.push(title) } });
@@ -2902,7 +3752,7 @@ test('three failed live copies in a row pause the follow; one that lands resets 
   await tick();
   const c = copy.all()[0];
   assert.equal(c.enabled, false, 'the third pauses it');
-  assert.match(c.pausedReason, /3 copies in a row failed/);
+  assert.match(c.pausedReason, /3 copies in a row failed, so it paused/);
   assert.match(c.pausedReason, /insufficient funds/, 'with the last reason');
   assert.equal(notes.length, 1);
   copy.onWalletTrade(trade({ isBuy: true, mint: mintN(3), signature: 'f3' }));
@@ -2974,21 +3824,911 @@ test('LIVE: a sell refused mid-migration is held for the pool, tried again on th
   assert.equal(h.calls.sells.length, 3, 'and it is never sold twice');
 });
 
-test('LIVE: a sell still migrating after ten minutes is given up loudly; the copy stays open', async () => {
+test('LIVE: a sell still migrating after ten minutes moves to the slow retry; the copy stays open', async () => {
   const notes = [];
   const h = await openLiveCopy({ sellResult: { ok: false, message: MIGRATING }, host: { notify: (title, body) => notes.push({ title, body }) } });
   copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
   await tick();
-  copy.checkMaxHolds(Date.now() + 10 * 60_000 + 1_000);
+  const t10 = Date.now() + 10 * 60_000 + 1_000;
+  copy.checkMaxHolds(t10);
   await tick();
-  assert.equal(h.calls.sells.length, 1, 'given up, not tried once more');
+  assert.equal(h.calls.sells.length, 1, 'handed over this tick, not tried yet');
   const snap = copy.snapshot();
   assert.equal(snap.recent.find((t) => t.kind !== 'exit').state, 'open');
-  assert.match(snap.recent.find((t) => t.kind === 'exit').reason, /still moving to PumpSwap after 10 minutes/);
-  assert.ok(notes.some((n) => /Copy sell failed/.test(n.title)));
-  copy.checkMaxHolds(Date.now() + 20 * 60_000);
+  assert.match(snap.recent.find((t) => t.kind === 'exit').reason, /still moving to PumpSwap after 10 minutes — trying again/);
+  assert.ok(notes.some((n) => /Copy sell still waiting/.test(n.title)));
+  copy.checkMaxHolds(t10 + 31_000);
+  await tick();
+  assert.equal(h.calls.sells.length, 2, 'tried again on the slow clock');
+  copy.checkMaxHolds(t10 + 32_000);
+  await tick();
+  assert.equal(h.calls.sells.length, 2, 'and not every tick: a still-migrating coin backs off');
+});
+
+// ── A sell still owed survives a restart (2026-11-04) ─────────────────
+
+/** A real failing sell against a real store, then the app "restarts". */
+async function failedSellThenRestart(fraction, afterHost = {}) {
+  copy._reset();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'krypt-retry-'));
+  copy.init(dir);
+  const first = makeHost({ priceSol: 0.001, sellResult: { ok: false, message: 'blockhash expired' } });
+  copy.attach(first.host);
+  save({ mode: 'live', sizing: 'fixed', sizeValue: 1, maxTradeSol: 1, delayMs: 0 });
+  copy.onWalletTrade(trade({ isBuy: true, signature: 'buy1' }));
+  await tick();
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: fraction, signature: 'sell1' }));
+  await tick();
+  assert.equal(first.calls.sells.length, 1, 'the first sell failed');
+  copy.flushSync();
+  const saved = JSON.parse(fs.readFileSync(path.join(dir, 'copytrade.json'), 'utf8'));
+  assert.equal(saved.sellRetries.length, 1, 'what is owed is on disk');
+  return { dir, saved, afterHost };
+}
+
+function restartWith(dir, over) {
+  copy._reset();
+  copy.init(dir);
+  const notes = [];
+  const h = makeHost({ priceSol: 0.001, host: { notify: (title, body) => notes.push({ title, body }) }, ...over });
+  copy.attach(h.host);
+  return { h, notes };
+}
+
+test('a failed sell comes back after a restart, waits while Live is off, and goes when it is on', async () => {
+  const { dir } = await failedSellThenRestart(1);
+  const { h, notes } = restartWith(dir, { liveBlockedReason: 'the engine is not armed' });
+  const later = Date.now() + 2 * 3_600_000;
+  copy.checkMaxHolds(later);
+  await tick();
+  assert.equal(h.calls.sells.length, 0, 'Live is off: nothing is sold');
+  assert.ok(notes.some((n) => /Failed sells are still owed/.test(n.title)), 'and the person is told');
+  const row = () => copy.snapshot().recent.find((t) => t.kind === 'exit');
+  assert.match(row().reason, /waiting — the app restarted.*the engine is not armed/);
+  h.host.liveBlockedReason = () => null;
+  copy.checkMaxHolds(later + 1_000);
+  await tick();
+  assert.equal(h.calls.sells.length, 1, 'Live on: it goes');
+  assert.equal(copy.snapshot().recent.find((t) => t.kind !== 'exit').state, 'closed', 'and closes the copy');
+  copy.checkMaxHolds(later + 2 * 3_600_000);
+  await tick();
+  assert.equal(h.calls.sells.length, 1, 'once');
+});
+
+test('after its first try a restored sell follows the session rule: the person stopping Live ends it', async () => {
+  const { dir } = await failedSellThenRestart(1);
+  const { h, notes } = restartWith(dir, { sellResult: { ok: false, message: 'blockhash expired' } });
+  const later = Date.now() + 2 * 3_600_000;
+  copy.checkMaxHolds(later);
+  await tick();
+  assert.equal(h.calls.sells.length, 1, 'tried, and failed again');
+  h.host.liveBlockedReason = () => 'the engine is not armed';
+  copy.checkMaxHolds(later + 2 * 3_600_000);
+  await tick();
+  assert.match(copy.snapshot().recent.find((t) => t.kind === 'exit').reason, /not retried — the engine is not armed/);
+  assert.ok(notes.some((n) => /Copy sell stopped/.test(n.title)));
+  h.host.liveBlockedReason = () => null;
+  copy.checkMaxHolds(later + 4 * 3_600_000);
+  await tick();
+  assert.equal(h.calls.sells.length, 1, 'and coming back does not revive it');
+});
+
+test('a share that was going out when the app stopped is not sold again; it may have landed', async () => {
+  const { dir, saved } = await failedSellThenRestart(0.4);
+  saved.sellRetries[0].inFlight = true;
+  fs.writeFileSync(path.join(dir, 'copytrade.json'), JSON.stringify(saved));
+  const { h, notes } = restartWith(dir, {});
+  copy.checkMaxHolds(Date.now() + 2 * 3_600_000);
+  await tick();
+  assert.equal(h.calls.sells.length, 0, 'never a second sell of a share that may have landed');
+  assert.ok(notes.some((n) => /Check your wallet/.test(n.title)));
+  assert.match(copy.snapshot().recent.find((t) => t.kind === 'exit').reason, /may have landed/);
+  copy.flushSync();
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'copytrade.json'), 'utf8')).sellRetries.length, 0, 'and it stays forgotten');
+});
+
+test('a share not going out when the app stopped is tried again', async () => {
+  const { dir } = await failedSellThenRestart(0.4);
+  const { h } = restartWith(dir, {});
+  copy.checkMaxHolds(Date.now() + 2 * 3_600_000);
+  await tick();
+  assert.deepEqual(h.calls.sells, [{ mint: MINT, pct: 40 }]);
+});
+
+test('a full sell that was going out when the app stopped is left to the person too', async () => {
+  const { dir, saved } = await failedSellThenRestart(1);
+  saved.sellRetries[0].inFlight = true;
+  fs.writeFileSync(path.join(dir, 'copytrade.json'), JSON.stringify(saved));
+  const { h, notes } = restartWith(dir, {});
+  copy.checkMaxHolds(Date.now() + 3 * 60 * 60_000);
+  await tick();
+  assert.equal(h.calls.sells.length, 0, 'the balance could be another follow\'s bag');
+  assert.ok(notes.some((n) => /Check your wallet/.test(n.title)));
+});
+
+test('a held migration sell that fails another way stays one hold: the share is sold once', async () => {
+  const answers = [{ ok: false, message: MIGRATING }, { ok: false, message: 'blockhash expired' }];
+  const h = await openLiveCopy();
+  const sold = [];
+  h.host.sell = async (_mint, pct) => {
+    const next = answers.shift();
+    if (next) return next;
+    sold.push(pct);
+    return { ok: true, message: 'sold', signature: `poolsell${sold.length}` };
+  };
+  copy.onWalletTrade(trade({ isBuy: false, sol: 0.5, priceSol: 0.002, soldFraction: 0.5, signature: 'sell1' }));
+  await tick();
+  const t0 = Date.now();
+  for (const at of [31_000, 62_000, 93_000, 124_000, 155_000]) {
+    copy.checkMaxHolds(t0 + at);
+    await tick();
+  }
+  assert.deepEqual(sold, [50], 'the leader sold half, and half was sold, once');
+  assert.equal(copy.snapshot().recent.find((t) => t.kind !== 'exit').remainingPct, 50);
+});
+
+test('an unconfirmed migration sell ends the wait, and a share is not sent again', async () => {
+  const answers = [{ ok: false, message: MIGRATING }, { ok: false, message: 'not confirmed in time', pending: true, signature: 'maybe' }];
+  const h = await openLiveCopy();
+  let sends = 0;
+  h.host.sell = async () => {
+    sends += 1;
+    return answers.shift() ?? { ok: true, message: 'sold', signature: 'again' };
+  };
+  copy.onWalletTrade(trade({ isBuy: false, sol: 0.5, priceSol: 0.002, soldFraction: 0.5, signature: 'sell1' }));
+  await tick();
+  const t0 = Date.now();
+  for (const at of [31_000, 62_000, 3 * 60_000, 4 * 3_600_000]) {
+    copy.checkMaxHolds(t0 + at);
+    await tick();
+  }
+  assert.equal(sends, 2, 'it may land, and another could sell the share twice');
+});
+
+test('a retry never sells a bag another follow holds in the same wallet', async () => {
+  const notes = [];
+  const h = setup({ priceSol: 0.001, chain: { balance: 0n, bought: 1_000_000_000n, decimals: 6 }, host: { notify: (title, body) => notes.push({ title, body }) } });
+  const OTHER = 'Xther111111111111111111111111111111111111111';
+  const base = { mode: 'live', sizing: 'fixed', sizeValue: 1, maxTradeSol: 1, delayMs: 0, oncePerMint: false };
+  save(base);
+  save({ ...cfg(), ...base, wallet: OTHER, label: 'Other' });
+  assert.equal(copy.all().length, 2);
+  copy.onWalletTrade(trade({ isBuy: true, signature: 'buy1' }));
+  await tick();
+  copy.onWalletTrade(trade({ wallet: OTHER, isBuy: true, signature: 'buy2' }));
+  await tick();
+  assert.equal(h.calls.chain.balance, 2_000_000_000n, 'both follows hold a bag');
+  const realSell = h.host.sell;
+  // A's sell comes back unconfirmed, and in fact landed.
+  h.host.sell = async () => {
+    h.calls.chain.balance -= 1_000_000_000n;
+    return { ok: false, message: 'not confirmed in time', pending: true, signature: 'landedUnseen' };
+  };
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  h.host.sell = realSell;
+  copy.checkMaxHolds(Date.now() + 3 * 60_000);
+  await tick();
+  assert.equal(h.calls.chain.balance, 1_000_000_000n, 'the other follow\'s bag is untouched');
+  assert.ok(notes.some((n) => /Check your wallet/.test(n.title)));
+});
+
+test('a sell the chain says landed is not sent again', async () => {
+  const notes = [];
+  const h = await openLiveCopy({ sellResult: { ok: false, message: 'not confirmed in time', pending: true, signature: 'landed' }, host: { notify: (title, body) => notes.push({ title, body }), sendLanded: (sig) => (sig === 'landed' ? true : null) } });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  copy.checkMaxHolds(Date.now() + 3 * 60_000);
   await tick();
   assert.equal(h.calls.sells.length, 1);
+  assert.ok(notes.some((n) => /landed after all/.test(n.body)));
+});
+
+test('a retry waits while the ledger is still reading the send it could not confirm', async () => {
+  let answer = 'reading';
+  const h = await openLiveCopy({ sellResult: { ok: false, message: 'not confirmed in time', pending: true, signature: 'slow' }, host: { sendLanded: () => answer } });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  const t0 = Date.now();
+  copy.checkMaxHolds(t0 + 3 * 60_000);
+  await tick();
+  assert.equal(h.calls.sells.length, 1, 'nothing goes while it may yet read as landed');
+  answer = false;
+  copy.checkMaxHolds(t0 + 4 * 60_000);
+  await tick();
+  assert.equal(h.calls.sells.length, 2, 'failed on chain: try again');
+});
+
+test('a stop ends a migration wait at once: one row, and clearing the stop does not sell', async () => {
+  const notes = [];
+  const h = await openLiveCopy({ sellResult: { ok: false, message: MIGRATING }, host: { notify: (title, body) => notes.push({ title, body }) } });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  const rowsBefore = copy.snapshot().recent.length;
+  const t0 = Date.now();
+  h.host.liveBlockedReason = () => 'the kill switch is on';
+  for (const at of [1_000, 16_000, 31_000]) {
+    copy.checkMaxHolds(t0 + at);
+    await tick();
+  }
+  assert.equal(copy.snapshot().recent.length, rowsBefore, 'no row per tick');
+  assert.match(copy.snapshot().recent.find((t) => t.kind === 'exit').reason, /not executed — the kill switch is on/);
+  assert.ok(notes.some((n) => /Copy sell stopped/.test(n.title)));
+  h.host.liveBlockedReason = () => null;
+  copy.checkMaxHolds(t0 + 60_000);
+  await tick();
+  assert.equal(h.calls.sells.length, 1, 'clearing the stop does not bring it back');
+});
+
+test('a follow flipped to Paper ends a migration wait', async () => {
+  const h = await openLiveCopy({ sellResult: { ok: false, message: MIGRATING } });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  assert.equal(copy.upsert({ ...copy.all()[0], mode: 'paper' }).ok, true);
+  copy.checkMaxHolds(Date.now() + 31_000);
+  await tick();
+  assert.equal(h.calls.sells.length, 1);
+  assert.match(copy.snapshot().recent.find((t) => t.kind === 'exit').reason, /on paper now/);
+});
+
+test('a share that joins while a retry queues is sold by that retry, not lost', async () => {
+  const h = await openLiveCopy({ chain: { bought: 1_000_000_000n } });
+  const real = h.host.sell;
+  // The first sell, 40 %, fails.
+  h.host.sell = async () => ({ ok: false, message: 'blockhash expired' });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 0.4, priceSol: 0.002, soldFraction: 0.4, signature: 'sell1' }));
+  await tick();
+  // The leader sells the rest, and that send takes a while and fails too.
+  let fail;
+  h.host.sell = () => new Promise((r) => { fail = () => r({ ok: false, message: 'blockhash expired' }); });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 0.6, priceSol: 0.002, soldFraction: 1, signature: 'sell2' }));
+  await tick();
+  // The retry comes due and queues behind it.
+  copy.checkMaxHolds(Date.now() + 31_000);
+  await tick();
+  h.host.sell = real;
+  fail();
+  await tick();
+  await tick();
+  assert.equal(h.calls.chain.balance, 0n, 'the leader is all out, and so are we');
+  assert.equal(copy.snapshot().recent.find((t) => t.kind !== 'exit').state, 'closed');
+});
+
+/** Two follows, one wallet, one coin; follow A's sell has failed. */
+async function twoFollowsOneFailed(over = {}) {
+  const notes = [];
+  const h = setup({ priceSol: 0.001, chain: { balance: 0n, bought: 1_000_000_000n, decimals: 6 }, host: { notify: (title, body) => notes.push({ title, body }) }, ...over });
+  const OTHER = 'Xther111111111111111111111111111111111111111';
+  const base = { mode: 'live', sizing: 'fixed', sizeValue: 1, maxTradeSol: 1, delayMs: 0, oncePerMint: false };
+  save(base);
+  save({ ...cfg(), ...base, wallet: OTHER, label: 'Other' });
+  copy.onWalletTrade(trade({ isBuy: true, signature: 'buy1' }));
+  await tick();
+  copy.onWalletTrade(trade({ wallet: OTHER, isBuy: true, signature: 'buy2' }));
+  await tick();
+  const real = h.host.sell;
+  h.host.sell = async () => ({ ok: false, message: 'blockhash expired' });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  h.host.sell = real;
+  h.calls.sells.length = 0;
+  return { h, notes, A: () => copy.all().find((c) => c.wallet !== OTHER), B: () => copy.all().find((c) => c.wallet === OTHER) };
+}
+
+test('a retry with no known quantity does not sell a wallet another follow shares', async () => {
+  const { h, notes, A } = await twoFollowsOneFailed();
+  const snap = copy.snapshot().recent.filter((t) => t.kind !== 'exit' && t.configId === A().id);
+  assert.equal(snap.length, 1);
+  copy._load(copy.all(), copy.snapshot().recent.map((t) => (t.id === snap[0].id ? { ...t, tokensLeftRaw: null, tokensRaw: null } : t)));
+  copy.checkMaxHolds(Date.now() + 31_000);
+  await tick();
+  assert.equal(h.calls.sells.length, 0, 'never a share of the whole account');
+  assert.ok(notes.some((n) => /Check your wallet/.test(n.title)), 'and the person is told');
+});
+
+test('a retry does not send "all of it" when the balance cannot be read and another follow shares the wallet', async () => {
+  const { h } = await twoFollowsOneFailed();
+  h.host.walletTokens = async () => null;
+  const t0 = Date.now();
+  copy.checkMaxHolds(t0 + 31_000);
+  await tick();
+  assert.equal(h.calls.sells.length, 0, 'it waits');
+  h.host.walletTokens = async () => ({ raw: h.calls.chain.balance.toString(), decimals: 6 });
+  copy.checkMaxHolds(t0 + 3 * 60_000);
+  await tick();
+  assert.equal(h.calls.sells.length, 1, 'and goes when it can be read');
+  assert.equal(h.calls.chain.balance, 1_000_000_000n, 'its own tokens only');
+});
+
+test('a full sell that comes back unconfirmed and joins a retry is asked about first', async () => {
+  const asked = [];
+  const h = await openLiveCopy({ host: { sendLanded: (sig) => { asked.push(sig); return sig === 'maybe' ? true : null; } } });
+  h.host.sell = async () => ({ ok: false, message: 'blockhash expired' });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 0.4, priceSol: 0.002, soldFraction: 0.4, signature: 'sell1' }));
+  await tick();
+  let sends = 0;
+  h.host.sell = async () => {
+    sends += 1;
+    return { ok: false, message: 'not confirmed in time', pending: true, signature: 'maybe' };
+  };
+  copy.onWalletTrade(trade({ isBuy: false, sol: 0.6, priceSol: 0.002, soldFraction: 1, signature: 'sell2' }));
+  await tick();
+  assert.equal(sends, 1);
+  const t0 = Date.now();
+  copy.checkMaxHolds(t0 + 31_000);
+  await tick();
+  assert.equal(sends, 1, 'not resent in thirty seconds');
+  copy.checkMaxHolds(t0 + 3 * 60_000);
+  await tick();
+  assert.deepEqual(asked, ['maybe']);
+  assert.equal(sends, 1, 'it landed: nothing more goes');
+});
+
+test('a ledger that never answers cannot freeze a retry for the day', async () => {
+  const h = await openLiveCopy({ sellResult: { ok: false, message: 'not confirmed in time', pending: true, signature: 'slow' }, host: { sendLanded: () => 'reading' } });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  const t0 = Date.now();
+  copy.checkMaxHolds(t0 + 3 * 60_000);
+  await tick();
+  assert.equal(h.calls.sells.length, 1);
+  assert.match(copy.snapshot().recent.find((t) => t.kind === 'exit').reason, /checking whether it landed/);
+  copy.checkMaxHolds(t0 + 19 * 60_000);
+  await tick();
+  assert.equal(h.calls.sells.length, 2, 'it stops waiting and tries');
+});
+
+test('a retry never abandons a new buy, and never sells a re-buy the leader still holds', async () => {
+  const h = await openLiveCopy({ chain: { bought: 1_000_000_000n } });
+  const real = h.host.sell;
+  h.host.sell = async () => ({ ok: false, message: 'blockhash expired' });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  h.host.sell = real;
+  // The leader buys back in, and the copy goes out while the retry comes due.
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(copy.upsert({ ...copy.all()[0], oncePerMint: false }).ok, true);
+  const realBuy = h.host.buy;
+  let finishBuy;
+  h.host.buy = (...a) => new Promise((r) => { finishBuy = () => realBuy(...a).then(r); });
+  copy.onWalletTrade(trade({ isBuy: true, signature: 'buy2' }));
+  await tick();
+  assert.ok(finishBuy, 'the new buy is on its way');
+  copy.checkMaxHolds(Date.now() + 31_000);
+  await tick();
+  finishBuy();
+  await tick();
+  await tick();
+  assert.equal(h.calls.buys.length, 2);
+  assert.equal(h.calls.chain.balance, 1_000_000_000n, 'the old bag went, the new one stayed');
+  const open = copy.snapshot().recent.filter((t) => t.kind !== 'exit' && t.state === 'open');
+  assert.equal(open.length, 1, 'the re-buy is open');
+});
+
+test('a sell that came back short keeps a row that says it is being retried', async () => {
+  const h = await openLiveCopy({ chain: { bought: 160_000_000_000n }, fillShare: 0.5 });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  assert.equal(h.calls.sells.length, 2);
+  assert.ok(copy.snapshot().recent.some((t) => t.kind === 'exit' && /came back short/.test(t.reason ?? '')));
+  assert.equal(copy.upsert({ ...copy.all()[0], mode: 'paper' }).ok, true);
+  copy.checkMaxHolds(Date.now() + 31_000);
+  await tick();
+  assert.ok(copy.snapshot().recent.some((t) => t.kind === 'exit' && /on paper now/.test(t.reason ?? '')), 'and ending it is said out loud');
+});
+
+test('a wallet emptied during a migration wait ends the wait with one row', async () => {
+  const h = await openLiveCopy({ chain: { bought: 1_000_000_000n } });
+  const real = h.host.sell;
+  h.host.sell = async () => ({ ok: false, message: MIGRATING });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  h.host.sell = real;
+  h.calls.chain.balance = 0n;
+  const n = copy.snapshot().recent.length;
+  const t0 = Date.now();
+  for (const at of [16_000, 32_000, 48_000]) {
+    copy.checkMaxHolds(t0 + at);
+    await tick();
+  }
+  assert.equal(copy.snapshot().recent.length, n, 'no row per tick');
+});
+
+test('a send that never comes back still ends, out loud', async () => {
+  const notes = [];
+  const h = await openLiveCopy({ host: { notify: (title, body) => notes.push({ title, body }) } });
+  h.host.sell = async () => ({ ok: false, message: 'blockhash expired' });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  h.host.sell = () => new Promise(() => {});
+  const t0 = Date.now();
+  copy.checkMaxHolds(t0 + 31_000);
+  await tick();
+  copy.checkMaxHolds(t0 + 26 * 3_600_000);
+  await tick();
+  assert.ok(notes.some((n) => /never came back/.test(n.body)));
+  assert.match(copy.snapshot().recent.find((t) => t.kind === 'exit').reason, /never came back/);
+});
+
+test('max hold joins a held sell: it does not send past the backoff or past an unknown send', async () => {
+  let answer = null;
+  const h = setup({ priceSol: 0.001, sellResult: { ok: false, message: 'blockhash expired' }, host: { sendLanded: () => answer } });
+  save({ mode: 'live', sizing: 'fixed', sizeValue: 1, maxTradeSol: 1, delayMs: 0, exitMaxHoldMin: 1 });
+  copy.onWalletTrade(trade({ isBuy: true, signature: 'buy1' }));
+  await tick();
+  const t0 = Date.now() + 2 * 60_000;
+  for (let i = 0; i < 7; i += 1) {
+    copy.checkMaxHolds(t0 + i * 15_000);
+    await tick();
+    await tick();
+  }
+  assert.ok(h.calls.sells.length <= 3, `the backoff holds: ${h.calls.sells.length} sends in 90 s`);
+  assert.ok(h.calls.sells.length >= 1);
+  assert.equal(copy.snapshot().recent.filter((t) => t.kind === 'exit').length, 1, 'and one row');
+  void answer;
+});
+
+test('an own exit joining an unconfirmed send does not sell what that send may have sold', async () => {
+  const h = setup({ priceSol: 0.001, sellResult: { ok: false, message: 'not confirmed', pending: true, signature: 'maybe' }, host: { sendLanded: () => true } });
+  save({ mode: 'live', sizing: 'fixed', sizeValue: 1, maxTradeSol: 1, delayMs: 0, exitMaxHoldMin: 1 });
+  copy.onWalletTrade(trade({ isBuy: true, signature: 'buy1' }));
+  await tick();
+  const t0 = Date.now() + 2 * 60_000;
+  for (const at of [0, 15_000, 30_000, 45_000, 60_000]) {
+    copy.checkMaxHolds(t0 + at);
+    await tick();
+    await tick();
+  }
+  assert.equal(h.calls.sells.length, 1, 'one send, until the chain has answered');
+  copy.checkMaxHolds(t0 + 3 * 60_000);
+  await tick();
+  assert.equal(h.calls.sells.length, 1, 'it landed');
+  assert.equal(copy.snapshot().recent.find((t) => t.kind !== 'exit').state, 'closed', 'and the copy is booked closed');
+  copy.checkMaxHolds(t0 + 5 * 60_000);
+  await tick();
+  assert.equal(h.calls.sells.length, 1, 'so the rule has nothing left to fire on');
+});
+
+test('a copy handed back to the person is left alone by its own rules', async () => {
+  const notes = [];
+  const h = setup({ priceSol: 0.001, chain: { balance: 0n, bought: 1_000_000_000n, decimals: 6 }, host: { notify: (title, body) => notes.push({ title, body }) } });
+  const OTHER = 'Xther111111111111111111111111111111111111111';
+  const base = { mode: 'live', sizing: 'fixed', sizeValue: 1, maxTradeSol: 1, delayMs: 0, oncePerMint: false };
+  save({ ...base, exitMaxHoldMin: 60 });
+  save({ ...cfg(), ...base, wallet: OTHER, label: 'Other' });
+  copy.onWalletTrade(trade({ isBuy: true, signature: 'buy1' }));
+  await tick();
+  copy.onWalletTrade(trade({ wallet: OTHER, isBuy: true, signature: 'buy2' }));
+  await tick();
+  const real = h.host.sell;
+  h.host.sell = async () => {
+    h.calls.chain.balance -= 1_000_000_000n;
+    return { ok: false, message: 'not confirmed', pending: true, signature: 'landedUnseen' };
+  };
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  h.host.sell = real;
+  const t0 = Date.now();
+  copy.checkMaxHolds(t0 + 3 * 60_000);
+  await tick();
+  assert.ok(notes.some((n) => /Check your wallet/.test(n.title)), 'handed back');
+  copy.checkMaxHolds(t0 + 2 * 3_600_000);
+  await tick();
+  await tick();
+  assert.equal(h.calls.chain.balance, 1_000_000_000n, 'max hold does not then take the other follow\'s bag');
+});
+
+test('a leader trim does not turn a held full sell into all of a later copy too', async () => {
+  const notes = [];
+  const h = await openLiveCopy({ chain: { bought: 1_000_000_000n }, host: { notify: (title, body) => notes.push({ title, body }) } });
+  const real = h.host.sell;
+  h.host.sell = async () => ({ ok: false, message: 'blockhash expired' });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  assert.equal(copy.upsert({ ...copy.all()[0], oncePerMint: false }).ok, true);
+  copy.onWalletTrade(trade({ isBuy: true, signature: 'buy2' }));
+  await tick();
+  copy.onWalletTrade(trade({ isBuy: false, sol: 0.1, priceSol: 0.002, soldFraction: 0.3, signature: 'sell2' }));
+  await tick();
+  assert.ok(notes.some((n) => /covers only the earlier copy/.test(n.body)), 'the share not sold is said');
+  h.host.sell = real;
+  copy.checkMaxHolds(Date.now() + 3 * 60_000);
+  await tick();
+  await tick();
+  assert.equal(h.calls.chain.balance, 1_000_000_000n, 'the older copy went; the later one is not dumped');
+});
+
+test('a landed send closes only the copies it was for; one that joined after is still sold', async () => {
+  let answer = 'reading';
+  const h = await openLiveCopy({ chain: { bought: 1_000_000_000n }, host: { sendLanded: () => answer } });
+  const real = h.host.sell;
+  h.host.sell = async () => {
+    h.calls.chain.balance -= 1_000_000_000n;
+    return { ok: false, message: 'not confirmed', pending: true, signature: 'landed' };
+  };
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  const firstRow = copy.snapshot().recent.find((t) => t.kind !== 'exit').id;
+  h.host.sell = real;
+  assert.equal(copy.upsert({ ...copy.all()[0], oncePerMint: false }).ok, true);
+  copy.onWalletTrade(trade({ isBuy: true, signature: 'buy2' }));
+  await tick();
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell2' }));
+  await tick();
+  assert.equal(h.calls.chain.balance, 1_000_000_000n, 'nothing goes while the first send is unknown');
+  answer = true;
+  const t0 = Date.now();
+  copy.checkMaxHolds(t0 + 3 * 60_000);
+  await tick();
+  const first = copy.snapshot().recent.find((t) => t.id === firstRow);
+  assert.equal(first.state, 'closed');
+  assert.equal(first.tokensLeftRaw, '0');
+  assert.equal(h.calls.chain.balance, 1_000_000_000n, 'the re-buy is not booked as sold');
+  copy.checkMaxHolds(t0 + 4 * 60_000);
+  await tick();
+  assert.equal(h.calls.chain.balance, 0n, 'and it is still owed, so it goes');
+});
+
+test('two follows whose addresses cannot be read are not assumed to be separate wallets', async () => {
+  const h = setup({ priceSol: 0.001, chain: { balance: 0n, bought: 1_000_000_000n, decimals: 6 } });
+  const OTHER = 'Xther111111111111111111111111111111111111111';
+  const base = { mode: 'live', sizing: 'fixed', sizeValue: 1, maxTradeSol: 1, delayMs: 0, oncePerMint: false };
+  save(base);
+  save({ ...cfg(), ...base, wallet: OTHER, label: 'Other', walletId: 'w_named' });
+  copy.onWalletTrade(trade({ isBuy: true, signature: 'buy1' }));
+  await tick();
+  copy.onWalletTrade(trade({ wallet: OTHER, isBuy: true, signature: 'buy2' }));
+  await tick();
+  const real = h.host.sell;
+  h.host.sell = async () => {
+    h.calls.chain.balance -= 1_000_000_000n;
+    return { ok: false, message: 'not confirmed', pending: true, signature: 'landedUnseen' };
+  };
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  h.host.sell = real;
+  copy.checkMaxHolds(Date.now() + 3 * 60_000);
+  await tick();
+  assert.equal(h.calls.chain.balance, 1_000_000_000n);
+});
+
+test('a try that queued re-checks the wallet before it sends', async () => {
+  let signer = 'WalletOne';
+  const h = await openLiveCopy({ chain: { bought: 1_000_000_000n }, host: { signerOf: () => signer } });
+  h.host.sell = async () => ({ ok: false, message: 'blockhash expired' });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 0.4, priceSol: 0.002, soldFraction: 0.4, signature: 'sell1' }));
+  await tick();
+  let finish;
+  let sends = 0;
+  h.host.sell = () => { sends += 1; return new Promise((r) => { finish = () => r({ ok: false, message: 'blockhash expired' }); }); };
+  copy.onWalletTrade(trade({ isBuy: false, sol: 0.3, priceSol: 0.002, soldFraction: 0.5, signature: 'sell2' }));
+  await tick();
+  copy.checkMaxHolds(Date.now() + 31_000);
+  await tick();
+  signer = 'WalletTwo';
+  finish();
+  await tick();
+  await tick();
+  assert.equal(sends, 1, 'nothing goes out from the wallet it switched to');
+  assert.match(copy.snapshot().recent.find((t) => t.kind === 'exit').reason, /signs with another wallet/);
+});
+
+test('a leader sell or an AI sell of a handed-back copy is said, not silently dropped', async () => {
+  const h = await openLiveCopy({ chain: { bought: 1_000_000_000n } });
+  const rowsNow = copy.snapshot().recent.map((t) => ({ ...t, handedBack: true }));
+  copy._load(copy.all(), rowsNow);
+  const out = copy.aiSellCopy(copy.all()[0].id, MINT, 50, 'test');
+  assert.equal(out.ok, false);
+  assert.match(out.message, /handed to the person/);
+  const before = h.calls.sells.length;
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  assert.equal(h.calls.sells.length, before);
+  assert.match(copy.snapshot().recent.find((t) => t.kind === 'exit').reason, /handed to you/);
+  assert.ok(h.calls.toasts.some((t) => /handed to you/.test(t.message)));
+});
+
+test('"the active wallet" and that wallet by name are one wallet to a held sell', async () => {
+  const h = setup({ priceSol: 0.001, chain: { balance: 0n, bought: 1_000_000_000n, decimals: 6 }, host: { signerOf: () => 'SameAddress' } });
+  const OTHER = 'Xther111111111111111111111111111111111111111';
+  const base = { mode: 'live', sizing: 'fixed', sizeValue: 1, maxTradeSol: 1, delayMs: 0, oncePerMint: false };
+  save(base);
+  save({ ...cfg(), ...base, wallet: OTHER, label: 'Other', walletId: 'w_named' });
+  copy.onWalletTrade(trade({ isBuy: true, signature: 'buy1' }));
+  await tick();
+  copy.onWalletTrade(trade({ wallet: OTHER, isBuy: true, signature: 'buy2' }));
+  await tick();
+  assert.equal(h.calls.chain.balance, 2_000_000_000n);
+  const real = h.host.sell;
+  h.host.sell = async () => {
+    h.calls.chain.balance -= 1_000_000_000n;
+    return { ok: false, message: 'not confirmed', pending: true, signature: 'landedUnseen' };
+  };
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  h.host.sell = real;
+  copy.checkMaxHolds(Date.now() + 3 * 60_000);
+  await tick();
+  assert.equal(h.calls.chain.balance, 1_000_000_000n, 'the other follow keeps its bag');
+});
+
+test('a held sell does not follow a wallet switch onto another wallet\'s bag', async () => {
+  const notes = [];
+  let signer = 'WalletOne';
+  const h = await openLiveCopy({ sellResult: { ok: false, message: 'blockhash expired' }, host: { signerOf: () => signer, notify: (title, body) => notes.push({ title, body }) } });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  signer = 'WalletTwo';
+  copy.checkMaxHolds(Date.now() + 31_000);
+  await tick();
+  assert.equal(h.calls.sells.length, 1, 'nothing sent from the new wallet');
+  assert.ok(notes.some((n) => /another wallet/.test(n.body)));
+  assert.match(copy.snapshot().recent.find((t) => t.kind === 'exit').reason, /signs with another wallet/);
+});
+
+test('a retry that lands short and fails its top-up still owes only the old copy', async () => {
+  const h = await openLiveCopy({ chain: { bought: 1_000_000_000n } });
+  const real = h.host.sell;
+  h.host.sell = async () => ({ ok: false, message: 'blockhash expired' });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  assert.equal(copy.upsert({ ...copy.all()[0], oncePerMint: false }).ok, true);
+  copy.onWalletTrade(trade({ isBuy: true, signature: 'buy2' }));
+  await tick();
+  assert.equal(h.calls.chain.balance, 2_000_000_000n, 'a re-buy is held too');
+  // The retry sells half of what it asked, and its top-up fails.
+  let sends = 0;
+  h.host.sell = async (mint, pct, opts) => {
+    sends += 1;
+    if (sends > 1) return { ok: false, message: 'blockhash expired' };
+    h.calls.chain.balance -= BigInt(opts.tokensRaw) / 2n;
+    return { ok: true, message: 'sold', signature: 'half' };
+  };
+  const t0 = Date.now();
+  copy.checkMaxHolds(t0 + 31_000);
+  await tick();
+  await tick();
+  h.host.sell = real;
+  copy.checkMaxHolds(t0 + 3 * 3_600_000);
+  await tick();
+  await tick();
+  assert.equal(h.calls.chain.balance, 1_000_000_000n, 'the re-buy is untouched');
+});
+
+test('a landed send does not make a held sell take this follow\'s own re-buy', async () => {
+  const notes = [];
+  const h = await openLiveCopy({ chain: { bought: 1_000_000_000n }, host: { notify: (title, body) => notes.push({ title, body }) } });
+  const real = h.host.sell;
+  h.host.sell = async () => {
+    h.calls.chain.balance -= 1_000_000_000n;
+    return { ok: false, message: 'not confirmed', pending: true, signature: 'landedUnseen' };
+  };
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  h.host.sell = real;
+  assert.equal(copy.upsert({ ...copy.all()[0], oncePerMint: false }).ok, true);
+  copy.onWalletTrade(trade({ isBuy: true, signature: 'buy2' }));
+  await tick();
+  assert.equal(h.calls.chain.balance, 1_000_000_000n, 'all that is left is the re-buy');
+  copy.checkMaxHolds(Date.now() + 3 * 60_000);
+  await tick();
+  assert.equal(h.calls.chain.balance, 1_000_000_000n);
+  assert.ok(notes.some((n) => /Check your wallet/.test(n.title)));
+});
+
+test('a wallet that holds none of the coin ends a retry out loud', async () => {
+  const notes = [];
+  const h = await openLiveCopy({ chain: { bought: 1_000_000_000n }, host: { notify: (title, body) => notes.push({ title, body }) } });
+  const real = h.host.sell;
+  h.host.sell = async () => ({ ok: false, message: 'blockhash expired' });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  h.host.sell = real;
+  h.calls.chain.balance = 0n;
+  copy.checkMaxHolds(Date.now() + 31_000);
+  await tick();
+  assert.ok(notes.some((n) => /holds none/.test(n.body)));
+  assert.match(copy.snapshot().recent.find((t) => t.kind === 'exit').reason, /holds none of this coin/);
+});
+
+test('a stop seen while a try queues ends it; clearing the stop does not sell', async () => {
+  const h = await openLiveCopy();
+  const real = h.host.sell;
+  h.host.sell = async () => ({ ok: false, message: 'blockhash expired' });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 0.4, priceSol: 0.002, soldFraction: 0.4, signature: 'sell1' }));
+  await tick();
+  let finish;
+  h.host.sell = () => new Promise((r) => { finish = () => r({ ok: false, message: 'blockhash expired' }); });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 0.3, priceSol: 0.002, soldFraction: 0.5, signature: 'sell2' }));
+  await tick();
+  const t0 = Date.now();
+  copy.checkMaxHolds(t0 + 31_000);
+  await tick();
+  h.host.liveBlockedReason = () => 'the kill switch is on';
+  finish();
+  await tick();
+  await tick();
+  h.host.liveBlockedReason = () => null;
+  let later = 0;
+  h.host.sell = async () => { later += 1; return real('m', 1, {}); };
+  copy.checkMaxHolds(t0 + 3 * 3_600_000);
+  await tick();
+  assert.equal(later, 0);
+  assert.match(copy.snapshot().recent.find((t) => t.kind === 'exit').reason, /not executed — the kill switch is on/);
+});
+
+test('slippage failures do not pause a follow unless that is switched on', async () => {
+  const fails = (message, rearm) => {
+    const h = setup({ priceSol: 0.001, buyResult: { ok: false, message }, host: { rearm: () => rearm } });
+    save({ mode: 'live', sizing: 'fixed', sizeValue: 1, maxTradeSol: 1, delayMs: 0, oncePerMint: false });
+    return h;
+  };
+  const off = { failedTrades: true, lossLimits: false, followStops: false, restart: false, slippagePauses: false, failsInARow: 3, firstWaitMin: 5, maxInARow: 0 };
+  const go = async (tag, n = 5) => {
+    for (let i = 0; i < n; i += 1) {
+      copy.onWalletTrade(trade({ isBuy: true, mint: `${tag}${i + 2}${'1'.repeat(44 - tag.length - 1)}`, signature: `${tag}${i}` }));
+      await tick();
+    }
+  };
+  for (const message of [
+    'Simulation reverted: TooLittleSolReceived (6003): x — price moved past your slippage between quote and send; retry or raise slippage',
+    'Landed but reverted on-chain 5abc… {"InstructionError":[3,{"Custom":6002}]} — price moved past your slippage [local tx]',
+    'Slippage: quote moved past the limit',
+  ]) {
+    const h = fails(message, off);
+    await go('Sa');
+    assert.equal(h.calls.buys.length, 5, 'it keeps copying');
+    assert.equal(copy.all()[0].enabled, true, message);
+    assert.equal(copy.snapshot().recent.filter((t) => t.state !== 'open').length, 5, 'each on the record');
+  }
+  fails('Landed but reverted on-chain 5abc… {"InstructionError":[3,{"Custom":6002}]} — price moved past your slippage [local tx]', { ...off, slippagePauses: true });
+  await go('Sb', 3);
+  assert.equal(copy.all()[0].enabled, false, 'switched on, it counts');
+  assert.equal(copy.all()[0].pausedBy, 'fails');
+  fails('Simulation failed: blockhash not found', off);
+  await go('Sc', 3);
+  assert.equal(copy.all()[0].enabled, false, 'a failure that is not slippage still counts');
+  fails('Landed but reverted on-chain 5abc… {"InstructionError":[3,{"Custom":6040}]} [local tx]', off);
+  await go('Sd', 3);
+  assert.equal(copy.all()[0].enabled, false, 'nor does a bare number');
+});
+
+test('a revert is read as slippage by the program that gave the number', () => {
+  const custom = (n) => ({ InstructionError: [3, { Custom: n }] });
+  for (const [source, code] of [['local', 6002], ['local', 6003], ['local', 6042], ['pumpswap', 6004], ['pumpswap', 6040], ['jupiter', 6001]]) {
+    assert.equal(revertIsSlippage(custom(code), source), true, `${source} ${code}`);
+  }
+  for (const [source, code, what] of [
+    ['local', 6040, 'pump: not enough SOL for rent'],
+    ['local', 6004, 'pump: mint does not match'],
+    ['pumpswap', 6002, 'PumpSwap: zero quote amount'],
+    ['pumpswap', 6003, 'PumpSwap: too little pool liquidity'],
+    ['jupiter', 6002, 'a code Jupiter did not give'],
+    ['relayer', 6040, 'rent on pump, slippage on PumpSwap: cannot tell'],
+    ['nobody', 6002, 'a source not on the list'],
+  ]) {
+    assert.equal(revertIsSlippage(custom(code), source), false, what);
+  }
+  assert.equal(revertIsSlippage('BlockhashNotFound', 'local'), false);
+  assert.equal(revertIsSlippage(undefined, 'local'), false);
+});
+
+test('an unconfirmed share with no signature to ask about is left to the person', async () => {
+  const h = await openLiveCopy({ chain: { bought: 1_000_000_000n }, host: { sendLanded: () => false } });
+  const real = h.host.sell;
+  h.host.sell = async () => ({ ok: false, message: 'not confirmed', pending: true });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 0.4, priceSol: 0.002, soldFraction: 0.4, signature: 'sell1' }));
+  await tick();
+  h.host.sell = real;
+  copy.checkMaxHolds(Date.now() + 3 * 60_000);
+  await tick();
+  assert.equal(h.calls.chain.balance, 1_000_000_000n, 'not sent again');
+  assert.match(copy.snapshot().recent.find((t) => t.kind === 'exit').reason, /cannot be read/);
+});
+
+test('a stop ends a retry that is not due yet: it does not sell when the stop clears', async () => {
+  const h = await openLiveCopy({ sellResult: { ok: false, message: 'blockhash expired' } });
+  copy.onWalletTrade(trade({ isBuy: false, sol: 1, priceSol: 0.002, soldFraction: 1, signature: 'sell1' }));
+  await tick();
+  const t0 = Date.now();
+  h.host.liveBlockedReason = () => 'the kill switch is on';
+  copy.checkMaxHolds(t0 + 1_000);
+  await tick();
+  assert.match(copy.snapshot().recent.find((t) => t.kind === 'exit').reason, /not retried — the kill switch is on/);
+  h.host.liveBlockedReason = () => null;
+  copy.checkMaxHolds(t0 + 3_600_000);
+  await tick();
+  assert.equal(h.calls.sells.length, 1, 'clearing the stop does not bring it back');
+});
+
+test('after a restart, arming Live makes a stop count even before the sell is due', async () => {
+  const { dir, saved } = await failedSellThenRestart(1);
+  saved.sellRetries[0].nextAt = Date.now() + 3_600_000;
+  fs.writeFileSync(path.join(dir, 'copytrade.json'), JSON.stringify(saved));
+  const { h } = restartWith(dir, {});
+  copy.checkMaxHolds(Date.now());
+  await tick();
+  assert.equal(h.calls.sells.length, 0, 'armed, not due');
+  h.host.liveBlockedReason = () => 'the engine is not armed';
+  copy.checkMaxHolds(Date.now() + 1_000);
+  await tick();
+  assert.match(copy.snapshot().recent.find((t) => t.kind === 'exit').reason, /not retried/);
+  h.host.liveBlockedReason = () => null;
+  copy.checkMaxHolds(Date.now() + 2 * 3_600_000);
+  await tick();
+  assert.equal(h.calls.sells.length, 0);
+});
+
+test('a sell owed from long ago still waits for Live after a restart, and goes', async () => {
+  const { dir } = await failedSellThenRestart(1);
+  const { h, notes } = restartWith(dir, { liveBlockedReason: 'the engine is not armed' });
+  const later = Date.now() + 25 * 3_600_000;
+  copy.checkMaxHolds(later);
+  await tick();
+  assert.equal(h.calls.sells.length, 0, 'nothing without Live');
+  assert.ok(!notes.some((n) => /gave up/.test(n.title)));
+  h.host.liveBlockedReason = () => null;
+  copy.checkMaxHolds(later + 1_000);
+  await tick();
+  assert.equal(h.calls.sells.length, 1);
+});
+
+test('a broken retry entry on disk does not cost the whole book', () => {
+  copy._reset();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'krypt-retry-'));
+  fs.writeFileSync(path.join(dir, 'copytrade.json'), JSON.stringify({ version: 1, configs: [], trades: [], sellRetries: [null, 7, { key: 1 }, { key: 'a', mint: 'm', configId: 'c', rowId: 'r', fraction: 3, firstAt: 1 }], migrationWaits: 'nope' }));
+  copy.init(dir);
+  assert.equal(copy.failure(), null);
+  copy.checkMaxHolds();
+});
+
+// ── Trimmed rows still count (2026-11-04) ─────────────────────────────
+
+const closedRows = (configId, n, pnl, at) =>
+  Array.from({ length: n }, (_, i) => ({ id: `old${i}`, configId, mode: 'paper', wallet: WALLET, mint: `m${i}`, symbol: 'OLD', state: 'closed', kind: 'copy', at: at - i, closedAt: at - i, ourSol: 0.1, pnlSol: pnl, reason: null }));
+
+test('the result, the counts and the chart do not fall when the book is trimmed', async () => {
+  setup({ priceSol: 0.001 });
+  save({ mode: 'paper', sizing: 'fixed', sizeValue: 1, maxTradeSol: 1, delayMs: 0 });
+  const c = copy.all()[0];
+  copy._load([c], closedRows(c.id, 2_000, 0.01, Date.now() - 60_000));
+  const before = copy.snapshot();
+  assert.ok(Math.abs(before.stats[c.id].realizedPnlSol - 20) < 1e-9);
+  for (let i = 0; i < 5; i += 1) {
+    copy.onWalletTrade(trade({ isBuy: true, mint: `new${i}1111111111111111111111111111111`, signature: `b${i}` }));
+    await tick();
+  }
+  const after = copy.snapshot();
+  const s = after.stats[c.id];
+  assert.ok(Math.abs(s.realizedPnlSol - 20) < 1e-9, `result kept: ${s.realizedPnlSol}`);
+  assert.equal(s.wins, 2_000);
+  assert.ok(s.trades >= 2_000, 'trimmed copies still count as copies');
+  const chart = after.pnlByDay.paper.reduce((a, d) => a + d.pnl, 0);
+  assert.ok(Math.abs(chart - 20) < 1e-9, `chart kept: ${chart}`);
+});
+
+test('a follow loss stop still sees a loss trimmed from the book, and a reset clears what the trim kept', async () => {
+  setup({ priceSol: 0.001 });
+  save({ mode: 'paper', sizing: 'fixed', sizeValue: 1, maxTradeSol: 1, delayMs: 0 });
+  const c = copy.all()[0];
+  const rows = closedRows(c.id, 2_000, 0, Date.now() - 60_000);
+  rows[rows.length - 1].pnlSol = -6;
+  copy._load([{ ...c, lossStopFrom: 1 }], rows);
+  // No stop yet, so nothing pauses it: the row with the loss is simply trimmed.
+  copy.onWalletTrade(trade({ isBuy: true, signature: 'b0' }));
+  await tick();
+  assert.ok(!copy.snapshot().recent.some((t) => t.pnlSol === -6));
+  assert.equal(copy.snapshot().stats[c.id].realizedPnlSol, -6, 'still in the result');
+  assert.equal(copy.upsert({ ...copy.all()[0], walletLossStopSol: 5 }).ok, true);
+  copy.checkMaxHolds();
+  const paused = copy.all()[0];
+  assert.equal(paused.enabled, false, 'the stop still fires on it');
+  assert.match(paused.pausedReason, /down 6/);
+  assert.equal(copy.resetPaper().ok, true);
+  const s = copy.snapshot().stats[c.id];
+  assert.equal(s.wins + s.losses, 0);
+  assert.equal(s.realizedPnlSol, 0, 'a reset leaves nothing behind');
+  assert.deepEqual(copy.snapshot().pnlByDay.paper, []);
 });
 
 test('a failed copy followed by one that lands starts the streak again', async () => {
@@ -3067,8 +4807,8 @@ test('copy simple: three answers make a valid, paper, switched-on config with de
     assert.equal(c.sizing, 'fixed');
     assert.equal(c.sizeValue, size);
     assert.equal(c.maxTradeSol, size, 'the cap is the size');
-    assert.ok(Math.abs(c.dailyLossLimitSol - Math.round(size * 3 * 1000) / 1000) < 1e-9, 'three trades of loss a day (was ten until 2026-10-23)');
-    assert.ok(Math.abs(c.walletLossStopSol - Math.round(size * 4 * 1000) / 1000) < 1e-9, 'and the follow pauses itself after four');
+    assert.equal(c.dailyLossLimitSol, 0, 'no daily loss limit unless the user sets one');
+    assert.equal(c.walletLossStopSol, null, 'and no loss stop');
     assert.equal(c.copySells, true);
     assert.equal(c.exitMaxHoldMin, 30, 'the missed-sell backstop');
     assert.equal(ownExitsOf(c).maxHoldMin, 30);
@@ -3096,8 +4836,8 @@ test('the Follow page: a percentage of their trade, capped, with limits from the
   assert.equal(c.sizing, 'proportional');
   assert.equal(c.sizeValue, 25);
   assert.equal(c.maxTradeSol, 0.2, 'the cap is the most one copy spends');
-  assert.ok(Math.abs(c.dailyLossLimitSol - 0.6) < 1e-9, 'three caps a day');
-  assert.ok(Math.abs(c.walletLossStopSol - 0.8) < 1e-9);
+  assert.equal(c.dailyLossLimitSol, 0);
+  assert.equal(c.walletLossStopSol, null);
   assert.equal(c.mode, 'paper');
   assert.equal(c.enabled, true);
   assert.equal(c.minLeaderSellPct, 50, 'trims under half their bag are skipped at every size');
@@ -3453,6 +5193,27 @@ test('own exits run on a paused config that still holds a copy', async () => {
   copy.markToMarket(MINT, 0.0016);
   await tick();
   assert.equal(h.calls.sells.length, 1, 'its take-profit sold, paused or not');
+});
+
+test('after a long sleep a leader who left is recorded once, says asleep, and nothing is sold', async () => {
+  const h = setup({ priceSol: 0.001, leaderHolding: 0 });
+  copy._load([loadedConfig()], [loadedRow({ at: Date.now() - 60_000 })]);
+  copy._setBootAt(Date.now() - 3_600_000);
+  const away = { text: 'while this computer was asleep', before: Date.now() - 1_000 };
+  const r = await copy.checkLeadersAfterBoot(12, away);
+  assert.deepEqual(r, { checked: 1, gone: 1 });
+  const exits = copy.snapshot().recent.filter((t) => t.kind === 'exit');
+  assert.equal(exits.length, 1);
+  assert.match(exits[0].reason, /while this computer was asleep/);
+  assert.equal(h.calls.sells.length, 0, 'recorded, never traded');
+  const again = await copy.checkLeadersAfterBoot(12, away);
+  assert.equal(again.gone, 0, 'the next wake does not say it again');
+  assert.equal(copy.snapshot().recent.filter((t) => t.kind === 'exit').length, 1);
+  // A copy bought after the sleep was watched the whole time.
+  const h2 = setup({ priceSol: 0.001, leaderHolding: 0 });
+  copy._load([loadedConfig()], [loadedRow({ at: Date.now() })]);
+  assert.equal((await copy.checkLeadersAfterBoot(12, { text: 'x', before: Date.now() - 60_000 })).checked, 0);
+  assert.equal(h2.calls.holdingReads.length, 0);
 });
 
 test('the boot check records a leader who left while the app was closed — and sells nothing', async () => {
@@ -4157,6 +5918,69 @@ test('the open-copies ceiling shows on every follow it holds, and is alerted onc
   assert.match(stats[0].hold.message, /1 of 1 paper copies are open across all follows/);
   assert.equal(stats[0].hold.until, null, 'it lifts when a copy closes, not at a time');
   assert.equal(h.calls.toasts.filter((t) => /New copies are on hold/.test(t.message)).length, 1, 'one alert for the filling, not one per buy');
+});
+
+test('no limit set: 30 copies in one minute all go through, and nothing holds it', async () => {
+  // Both limits used to read 0 as "none left": `used >= 0` is true at once.
+  assert.equal(defaultConfig(WALLET, 'x').dailyTradeLimit, 0, 'the default is none');
+  assert.equal(defaultConfig(WALLET, 'x').maxCopiesPerMinute, 0);
+  setup({ priceSol: 0.001 });
+  save({ sizing: 'fixed', sizeValue: 0.01, maxTradeSol: 1, delayMs: 0 });
+  const id = copy.all()[0].id;
+  assert.equal(copy.snapshot().stats[id].hold ?? null, null);
+  for (let i = 0; i < 30; i++) {
+    copy.onWalletTrade(trade({ isBuy: true, mint: `Mny${String(i + 10)}${'1'.repeat(38)}`, signature: `mb${i}` }));
+    await tick();
+  }
+  const st = copy.snapshot().stats[id];
+  assert.equal(st.hold ?? null, null, 'still nothing holding it');
+  assert.equal(copy.snapshot().recent.filter((t) => t.configId === id && /limit/.test(t.reason ?? '')).length, 0, 'none skipped for a limit');
+  assert.equal(copy.snapshot().recent.filter((t) => t.configId === id && t.state === 'open').length, 30);
+});
+
+test('a limit the user did set still works, and an old follow with no per-minute value keeps the old 10', async () => {
+  setup({ priceSol: 0.001 });
+  save({ sizing: 'fixed', sizeValue: 0.01, maxTradeSol: 1, delayMs: 0, dailyTradeLimit: 2 });
+  for (let i = 0; i < 4; i++) {
+    copy.onWalletTrade(trade({ isBuy: true, mint: `Lim${String(i + 10)}${'1'.repeat(38)}`, signature: `lb${i}` }));
+    await tick();
+  }
+  const id = copy.all()[0].id;
+  assert.equal(copy.snapshot().stats[id].hold.kind, 'daily-trades');
+  setup({ priceSol: 0.001 });
+  save({ sizing: 'fixed', sizeValue: 0.01, maxTradeSol: 1, delayMs: 0, maxCopiesPerMinute: null });
+  for (let i = 0; i < 13; i++) {
+    copy.onWalletTrade(trade({ isBuy: true, mint: `Old${String(i + 10)}${'1'.repeat(38)}`, signature: `ob${i}` }));
+    await tick();
+  }
+  assert.ok(copy.snapshot().recent.some((t) => /10 copies per minute/.test(t.reason ?? '')), 'null reads as the old default');
+});
+
+test('the per-trade cap: 0 is no cap everywhere it is compared', () => {
+  const eng = fs.readFileSync(new URL('../electron/engine/engine.ts', import.meta.url), 'utf8');
+  assert.equal(/[<>] *s\.execution\.maxLiveSol|Math\.min\([^)]*execution\.maxLiveSol|\?\? *s\.execution\.maxLiveSol/.test(eng), false, 'every comparison goes through liveCap: a bare one refuses every trade at 0');
+});
+
+test('no loss limit set: copies at zero, keeps copying after a loss, and nothing stops it', async () => {
+  // 0 used to mean "stop": `realized <= -0` is true before the first copy.
+  assert.equal(defaultConfig(WALLET, 'x').dailyLossLimitSol, 0, 'the default is none');
+  assert.equal(defaultConfig(WALLET, 'x').walletLossStopSol ?? null, null);
+  setup({ priceSol: 0.001 });
+  save({ sizing: 'fixed', sizeValue: 1, maxTradeSol: 1, delayMs: 0 });
+  const id = copy.all()[0].id;
+  assert.equal(copy.snapshot().stats[id].hold ?? null, null, 'not held at zero');
+  for (let i = 0; i < 3; i++) {
+    const mint = `Nol${i + 2}${'1'.repeat(40)}`;
+    copy.onWalletTrade(trade({ isBuy: true, mint, signature: `nb${i}` }));
+    await tick();
+    copy.onWalletTrade(trade({ isBuy: false, mint, sol: 0.3, priceSol: 0.0003, soldFraction: 1, signature: `ns${i}` }));
+    await tick();
+    copy.checkMaxHolds();
+  }
+  const st = copy.snapshot().stats[id];
+  assert.ok(st.realizedPnlSol < -1, 'three real losses went through');
+  assert.equal(st.hold ?? null, null, 'still nothing holding it');
+  assert.equal(copy.all()[0].enabled, true, 'and it is still on');
 });
 
 test('a follow past its daily loss limit shows the stop on its card', async () => {

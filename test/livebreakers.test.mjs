@@ -163,7 +163,7 @@ test('engine: sells NEVER consult the breaker (an exit is never blocked)', () =>
 });
 
 test('engine: arm() captures the real-SOL baseline and resets the streak', () => {
-  const body = between(/\n  arm\(hasWallet: boolean\)/, /\n  private async captureLiveBaseline/);
+  const body = between(/\n  arm\(hasWallet: boolean,/, /\n  private async captureLiveBaseline/);
   assert.match(body, /liveBaselineLamports = this\.walletBalanceLamports/);
   assert.match(body, /liveConsecutiveLosses = 0/);
 });
@@ -359,7 +359,7 @@ console.log(`livebreakers: ${passed}/${total} tests passed`);
   assert.match(engineSrc, /this\.armedWhenUpgradeHit = this\.armed;\n\s+this\.disarm\('program_upgrade'\);/, 'the armed state is captured before the disarm');
   const main = fs.readFileSync(new URL('../electron/main.ts', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
   const hook = main.slice(main.indexOf('getEngine().onRearmAfterUpgrade = () => {'), main.indexOf('getEngine().onDisarm = (reason) => {'));
-  assert.match(hook, /getEngine\(\)\.arm\(wallet\.exists\(\)\)/, 'through the same arm() as the top-bar switch');
+  assert.match(hook, /getEngine\(\)\.arm\(wallet\.exists\(\), \{ keepSession: true \}\)/, 'through the same arm() as the top-bar switch, keeping the session count');
   assert.match(hook, /liveEnabled: true/, 'and Live is saved as the mode, so the top bar tells the truth');
   console.log('ok  a checked pump upgrade re-arms live only when it disarmed it, and only through the top-bar path');
 }

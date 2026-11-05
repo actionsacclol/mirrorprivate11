@@ -21,6 +21,7 @@
 // Paper mode is a SIMULATION of the real bytes with a pretend balance;
 // nothing is broadcast and no paper position is kept.
 
+import { makeChainQueue } from '@shared/chainQueue';
 import { keccak256, type Address, type Hex } from 'viem';
 import { broadcastClient, client, feeFields, waitForReceipt } from './client';
 import { ADDR, SELECTOR, TOPIC } from './chain';
@@ -107,6 +108,14 @@ export interface TradeRequest {
    * signing.
    */
   honestBalance?: boolean;
+  /**
+   * Asked when this trade reaches the head of the chain's queue, and a reason
+   * refuses it there. A queued buy can wait a long time, and whatever decided
+   * it (Live on, the follow on, the leader still in) may have changed.
+   */
+  atHead?: () => string | null;
+  /** Native a buy must leave behind to pay for selling it again. */
+  keepNative?: number;
   /**
    * Sign as this wallet instead of the chain's active one. The fill is
    * recorded under it. Used by copy trading, so a copy runs on its own
@@ -702,20 +711,16 @@ export async function quote(req: TradeRequest): Promise<EvmQuote | { error: stri
 
 // ── Execution ─────────────────────────────────────────────────────────
 
-/** One trade at a time PER CHAIN: nonces are sequential on a chain, and two
- *  sells racing each other on the same holding is how a "100 %" reverts. */
-const chains = new Map<EvmChainKind, Promise<unknown>>();
-function serialised<T>(chain: EvmChainKind, fn: () => Promise<T>): Promise<T> {
-  const prev = chains.get(chain) ?? Promise.resolve();
-  const next = prev.then(fn, fn);
-  chains.set(chain, next.catch(() => undefined));
-  return next;
+/** One trade at a time PER CHAIN, buys behind everything else: shared/chainQueue. */
+const chains = makeChainQueue<EvmChainKind>();
+function serialised<T>(chain: EvmChainKind, fn: () => Promise<T>, isBuy = false): Promise<T> {
+  return chains.run(chain, fn, isBuy);
 }
 
 /** Settles when no EVM trade is in flight. The caller BOUNDS the wait — an
  *  app must always be able to quit (house rule: never block an exit). */
 export async function inFlight(): Promise<void> {
-  await Promise.allSettled([...chains.values()]);
+  await chains.idle();
 }
 
 /**
@@ -753,7 +758,7 @@ async function sendCall(
   owner: Address,
   call: BuiltCall,
   policy: EvmPolicy,
-  opts: { simulateOnly: boolean; overrideBalance?: bigint; wait: boolean; onSent?: (hash: Hex) => void; walletId?: string; feeMultiplier?: number },
+  opts: { simulateOnly: boolean; overrideBalance?: bigint; wait: boolean; onSent?: (hash: Hex) => void; walletId?: string; feeMultiplier?: number; keepWei?: bigint },
 ): Promise<SendOutcome> {
   const c = client(chain);
   const stateOverride = opts.overrideBalance !== undefined ? [{ address: owner, balance: opts.overrideBalance }] : undefined;
@@ -792,12 +797,12 @@ async function sendCall(
   // so "value + gas" was only ever checked by the node, after the signature
   // existed. Found by audit 2026-09-11 on a whole-balance BNB buy.
   {
-    const need = call.value + gas * fees.maxFeePerGas;
+    const need = call.value + gas * fees.maxFeePerGas + (opts.keepWei ?? 0n);
     if (need > bal) {
       const sym = EVM_CHAIN_META[chain].nativeSymbol;
       return {
         ok: false,
-        message: `Not enough ${sym} for this plus gas: it needs ${weiToEth(need).toFixed(6)} ${sym} and the wallet has ${weiToEth(bal).toFixed(6)}. Nothing was signed.`,
+        message: `Not enough ${sym} for this plus gas${opts.keepWei ? ' and what selling it later costs' : ''}: it needs ${weiToEth(need).toFixed(6)} ${sym} and the wallet has ${weiToEth(bal).toFixed(6)}. Nothing was signed.`,
         hash: null,
         receipt: null,
         gas,
@@ -934,12 +939,14 @@ export function sendBuilt(
 }
 
 export function execute(req: TradeRequest): Promise<EvmTradeResult> {
-  return serialised(req.chain, () => executeNow(req));
+  return serialised(req.chain, () => executeNow(req), req.side === 'buy');
 }
 
 async function executeNow(req: TradeRequest): Promise<EvmTradeResult> {
   const t0 = Date.now();
   const chain = req.chain;
+  const refused = req.atHead?.() ?? null;
+  if (refused) return failed(chain, 'policy', refused);
   const sym = EVM_CHAIN_META[chain].nativeSymbol;
   const owner = req.walletId ? evmWallet.addressOfWallet(req.walletId) : evmWallet.address(chain);
   if (!owner) return failed(chain, 'route', req.walletId ? 'That wallet no longer exists' : 'No EVM wallet — create one on the Wallet page');
@@ -1023,6 +1030,7 @@ async function executeNow(req: TradeRequest): Promise<EvmTradeResult> {
     walletId: req.walletId,
     simulateOnly: false,
     wait: true,
+    ...(req.side === 'buy' && req.keepNative ? { keepWei: BigInt(Math.round(req.keepNative * 1e18)) } : {}),
     onSent: (hash) => {
       ledger.recordFill({ chain, token, symbol, side: req.side, hash, requested, decimals: p.decimals, wallet: owner, venue: p.venue.venue, feeWei: null });
     },

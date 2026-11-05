@@ -392,4 +392,27 @@ await okAsync('a BUY whose block is pruned everywhere is still priced from the t
 
 globalThis.fetch = () => Promise.reject(new Error('offline test — no RPC'));
 
+// ── trimming never forgets a token still held (2026-11-04) ────────────
+
+ok('trim: the oldest fill goes unless it is the cost basis of a token still held', () => {
+  const dir = freshDir();
+  const row = (over) => ({ id: over.hash, chain: 'robinhood', wallet: WALLET, symbol: 'X', side: 'buy', requested: 1, decimals: 18, nativeDeltaWei: '-1', gasWei: null, feeWei: null, state: 'reconciled', note: null, venue: 'x', attempts: 0, ...over });
+  const fills = [row({ hash: '0xheld', token: '0xheld', at: 1, tokenDeltaRaw: '100' })];
+  for (let i = 0; i < 3_999; i += 1) {
+    fills.push(row({ hash: `0xb${i}`, token: `0xt${i}`, at: 10 + i, tokenDeltaRaw: '5' }));
+    fills.push(row({ hash: `0xs${i}`, token: `0xt${i}`, at: 10 + i, side: 'sell', tokenDeltaRaw: '-5' }));
+  }
+  fills.push(row({ hash: '0xlast', token: '0xlast', at: 99_999, tokenDeltaRaw: '1' }));
+  assert.equal(fills.length, 8_000);
+  fs.writeFileSync(path.join(dir, FILE), JSON.stringify({ version: 2, fills, tracked: {} }));
+  ledger._reset();
+  ledger.init(dir);
+  ledger.recordFill({ ...base, hash: '0xnew', token: '0xnew', feeWei: null });
+  const rows = ledger.all();
+  assert.equal(rows.length, 8_000);
+  assert.ok(rows.some((f) => f.hash === '0xheld'), 'the held token keeps its buy');
+  assert.ok(!rows.some((f) => f.hash === '0xb0'), 'the oldest finished one went');
+  ledger._reset();
+});
+
 console.log(`\n${passed} evm ledger cases passed`);

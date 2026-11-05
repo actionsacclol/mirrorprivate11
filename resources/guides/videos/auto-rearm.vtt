@@ -1,0 +1,37 @@
+WEBVTT
+
+1
+00:00:00.967 --> 00:00:12.008
+Left running, a bot meets bad minutes: a busy network, a slow connection, a coin that will not trade. Auto re-arm, in Settings under Advanced, decides what comes back on by itself.
+
+2
+00:00:12.716 --> 00:00:25.106
+Failed trades. After three in a row, a follow pauses, then comes back on. The wait starts at five minutes and doubles, up to an hour. This is on by default. Slippage failures do not count, unless you turn that on.
+
+3
+00:00:26.797 --> 00:00:33.135
+pump.fun upgrades switch live off for a moment. It comes back once the app has checked the upgrade against real launches.
+
+4
+00:00:34.190 --> 00:00:45.328
+Loss limits are different. By default they stay off until you turn live back on. You can change that, but read the warning: each comeback starts the loss count again, so it can lose your limit again.
+
+5
+00:00:46.050 --> 00:00:53.887
+A follow’s own loss stop works the same way. App restarts are off by default too. Turned on, whatever was running comes back when the app opens.
+
+6
+00:00:55.839 --> 00:01:04.293
+These set how many failures pause it, the first wait, and how many comebacks in a row before it stays off. A trade that lands starts that count again.
+
+7
+00:01:05.019 --> 00:01:09.137
+A paused follow says why, and when it comes back. Keep it off cancels that.
+
+8
+00:01:13.798 --> 00:01:23.166
+A pause, a loss limit or an upgrade never stops selling. Your own switch to Paper, the kill switch and locking do stop automatic exits, and they always win.
+
+9
+00:01:24.518 --> 00:01:36.271
+Two more things for long runs. A failed sell keeps trying by itself until it sells. And Keep this computer awake stops it going to sleep by itself while something is running. Closing a laptop lid still sleeps it.

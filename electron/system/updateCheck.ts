@@ -26,8 +26,12 @@
 // to a private address is the standard way out of an allowlist — and the body
 // is capped while it is read rather than after.
 
+import { createHash } from 'node:crypto';
+import path from 'node:path';
 import { app } from 'electron';
-import { readVersionDoc, updateStatus, type UpdateStatus, type VersionDoc } from '@shared/version';
+// Plain `fs` treats app.asar as a folder. This reads the file itself.
+import { createReadStream } from 'original-fs';
+import { judgeBuild, readVersionDoc, updateStatus, type BuildCheck, type UpdateStatus, type VersionDoc } from '@shared/version';
 import { logger } from './logger';
 
 /** The only URL this module will ever request. Krypto Mirror's OWN document:
@@ -178,4 +182,40 @@ export async function check(force = false): Promise<UpdateStatus> {
   })();
   await inFlight;
   return status();
+}
+
+let ownHash: Promise<string | null> | null = null;
+
+/** SHA-256 of this install's app.asar, once per run. Null when unreadable. */
+function hashOwnBuild(): Promise<string | null> {
+  ownHash ??= new Promise((resolve) => {
+    const hash = createHash('sha256');
+    createReadStream(path.join(process.resourcesPath, 'app.asar'))
+      .on('data', (chunk) => hash.update(chunk))
+      .on('end', () => resolve(hash.digest('hex')))
+      .on('error', (err) => {
+        logger.warn(`build check: could not read app.asar — ${err.message}`);
+        resolve(null);
+      });
+  });
+  return ownHash;
+}
+
+/**
+ * "Is this the right app?" Asks krypt.cc now and compares this install with
+ * what it publishes. Sends nothing about the install: the hash is compared
+ * here. Never throws.
+ */
+export async function verifyBuild(): Promise<BuildCheck> {
+  await check(true);
+  const result = judgeBuild({
+    current: currentVersion(),
+    doc,
+    failure,
+    packaged: app.isPackaged,
+    platform: `${process.platform}-${process.arch}`,
+    ownHash: app.isPackaged ? await hashOwnBuild() : null,
+  });
+  logger.info(`build check: ${result.verdict} (this build ${result.current}, published ${result.latest ?? 'unknown'})`);
+  return result;
 }

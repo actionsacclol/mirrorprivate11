@@ -37,6 +37,7 @@ import * as lab from '@shared/lab';
 import { getAccountInfo, getBalance, getMultipleAccountInfo, getTokenBalanceForMint } from './chain/rpcClient';
 import * as kryptoMode from './engine/kryptoMode';
 import * as kryptoTrader from './engine/kryptoTrader';
+import { readRearm } from '@shared/rearm';
 import type { TraderEvmHost, TraderLedgerFill, TraderMarket } from './engine/kryptoTrader';
 import { EMPTY_MARKET_FACTS, TRADER_ID_RE, TRADER_OWN_COIN_MESSAGE, TRADER_OWN_COIN_MESSAGE_EVM, traderOptionsOf, type TraderFit, type TraderLimits, type TraderMarketFacts, type TraderParamsByPreset } from '@shared/kryptoTrader';
 import * as evmLedger from './evm/ledger';
@@ -158,6 +159,9 @@ import { MCP_ACCESS_LEVELS, MCP_IPC_CHANNELS, MCP_NEVER_CHANNELS, MCP_PORT_MAX, 
 import * as profiles from './system/profiles';
 import { attachChain as attachScoutChain, sourceFor as scoutSourceFor } from './engine/scoutScanSources';
 import * as evmWallet from './evm/evmWallet';
+import * as vault from './system/vault';
+import * as vaultFlows from './system/vaultFlows';
+import { capRaised, followCapsRaised, settingsCapsRaised, VAULT_GATES } from '@shared/vault';
 import { SCOUT_CHAINS, SCOUT_RANK_SORT, SCOUT_SCAN_HOURS, SCOUT_SORTS, SCOUT_WINNERS_HOURS, applyScoutFilters, boardRecord, boardWeeks, emptyRow, rankScout, scorecard, scoutFiltersAllOn, summarise, type ScoutChain, type ScoutScanHours, type ScoutSort, type ScoutWindow } from '@shared/walletScout';
 import * as evmDiscover from './evm/discover';
 import * as evmMarket from './evm/market';
@@ -178,7 +182,7 @@ import { AIO_CHAIN_LABEL, AIO_CHAINS, AIO_EVM_PATHS, AIO_SOLANA_PATHS, aioEvmPat
 import { CHAIN_RESERVE, REFUEL_USD } from '@shared/aioConvert';
 import { COMPRESS_COIN, COMPRESS_KEEP, describeCompress, excludeKey, planCompress, safeSymbol, type CompressPlan } from '@shared/aioCompress';
 import { KRYPTO_TOKEN } from '@shared/krypto';
-import { EVM_CHAINS, EVM_CHAIN_META, NATIVE_ADDRESS, isEvmAddress, isEvmChain, type EvmChainKind, type ChainKind } from '@shared/evm';
+import { EVM_CHAINS, EVM_CHAIN_META, EVM_EXIT_GAS, NATIVE_ADDRESS, isEvmAddress, isEvmChain, type EvmChainKind, type ChainKind } from '@shared/evm';
 import * as launcher from './engine/launcher';
 import type { LaunchDeps } from './engine/launcher';
 import { MAX_DESCRIPTION, MAX_NAME, MAX_SYMBOL, type LaunchDraft } from '@shared/launch';
@@ -443,7 +447,42 @@ function weakKeyStore(): string | null {
 
 function confirmNative(sender: Electron.WebContents, opts: Electron.MessageBoxOptions): Promise<Electron.MessageBoxReturnValue> {
   const win = BrowserWindow.fromWebContents(sender);
+  // A window closed to the tray can still be asked to confirm something, by the
+  // AI connection for one. The question must not wait where nobody can see it.
+  if (win && !win.isVisible()) win.show();
   return win ? dialog.showMessageBox(win, opts) : dialog.showMessageBox(opts);
+}
+
+/** The Save dialog, attached to the window that asked. */
+function saveDialogFor(sender: Electron.WebContents, opts: Electron.SaveDialogOptions): Promise<Electron.SaveDialogReturnValue> {
+  const win = BrowserWindow.fromWebContents(sender);
+  return win ? dialog.showSaveDialog(win, opts) : dialog.showSaveDialog(opts);
+}
+
+/**
+ * Suggested names for a file of plaintext keys. File grabbers sweep the Desktop,
+ * Documents and Downloads for names with "wallet" or "private" in them, so the
+ * names used to do their work for them. The warning lives in the dialog and at
+ * the top of the file instead.
+ */
+const KEY_FILE_NAMES = { solana: 'km-export.txt', evm: 'km-export-evm.txt', backup: 'km-backup.json' } as const;
+
+/** The gate on writing keys to a file. A page can ask, but only a person can press this. */
+async function confirmKeyFile(sender: Electron.WebContents, channel: string, message: string, what: string): Promise<boolean> {
+  const { response } = await confirmNative(sender, {
+    type: 'warning',
+    buttons: ['Cancel', 'Continue'],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+    title: 'Private keys',
+    message,
+    detail:
+      `This writes the keys of ${what} as plain text. Anyone or any program that reads the file can spend those funds, with no password.\n\n` +
+      'Save it to a USB drive or another offline place, not a synced folder, and delete it when you are done. If you did not just ask for this in Krypto Mirror, press Cancel.',
+  });
+  if (response !== 1) logger.warn(`${channel} cancelled at the confirmation dialog`);
+  return response === 1;
 }
 
 /** The address(es) a pasted secret would add — derived here, for the
@@ -564,9 +603,105 @@ let aioPhraseShown = false;
  */
 const mcpHandlers = new Map<string, (e: unknown, ...args: unknown[]) => unknown>();
 
+/** What a request would loosen, when that is what makes it need the password. */
+type GateAsk = { title: string; detail?: string } | null;
+const sentence = (what: string[]): string => `This changes ${what.join(', and ')}.`;
+const CONDITIONAL_GATES: Record<string, (args: unknown[]) => GateAsk> = {
+  'settings:update': ([patch]) => {
+    const raised = settingsCapsRaised(store.load() as unknown as Parameters<typeof settingsCapsRaised>[0], (patch ?? {}) as Parameters<typeof settingsCapsRaised>[1]);
+    return raised.length ? { title: 'Raise a safety limit', detail: sentence(raised) } : null;
+  },
+  'wallet:setMaxBalance': ([sol]) => {
+    const was = wallet.info().maxBalanceSol;
+    return capRaised(was, Number(sol), true) ? { title: 'Raise a safety limit', detail: sentence([Number(sol) === 0 ? "this wallet's balance cap, to off" : `this wallet's balance cap, from ${was} to ${Number(sol)} SOL`]) } : null;
+  },
+  'copy:save': ([raw]) => {
+    const r = (raw ?? {}) as Record<string, unknown>;
+    const existing = copyTrade.snapshot().configs.find((c) => c.id === r.id) ?? null;
+    // Judged on what the handler below will store, not on what was sent: a
+    // number sent as text or null must not slip past and then be coerced.
+    const orNull = (v: unknown): number | null => (v === null || v === undefined ? null : Number(v));
+    const raised = followCapsRaised(existing, {
+      mode: r.mode === 'live' ? 'live' : 'paper',
+      sizing: r.sizing === 'proportional' ? 'proportional' : 'fixed',
+      sizeValue: Number(r.sizeValue),
+      maxTradeSol: Number(r.maxTradeSol),
+      dailyLossLimitSol: Number(r.dailyLossLimitSol),
+      dailyTradeLimit: Number(r.dailyTradeLimit),
+      maxCopiesPerMinute: orNull(r.maxCopiesPerMinute),
+      walletLossStopSol: orNull(r.walletLossStopSol),
+    });
+    return raised.length ? { title: existing ? 'Raise a follow\'s limits' : 'Add a live follow', detail: sentence(raised) } : null;
+  },
+  'automation:setEnabled': ([id, enabled]) => {
+    if (enabled !== true) return null;
+    const script = automation.snapshot(false).scripts.find((x) => x.id === id);
+    return script?.mode === 'live' ? { title: 'Start a live script', detail: 'This script would spend real funds with nobody watching.' } : null;
+  },
+  'mcp:setBudget': ([raw]) => {
+    const b = (raw ?? {}) as Record<string, unknown>;
+    const m = store.load().mcp.budget as unknown as Record<string, unknown>;
+    const up = ['maxBuySol', 'hourlyCapSol', 'maxTradesPerMinute', 'followMaxCopySol', 'followDailyLossSol', 'followDailyCopies'].some((k) => capRaised(m[k], Number(b[k])));
+    return up ? { title: 'Raise the AI connection\'s budget', detail: 'The AI connection could then spend more without asking.' } : null;
+  },
+  'mcp:setEnabled': ([on]) => (on === true ? { title: 'Switch on the AI connection' } : null),
+  'mcp:setAccess': ([level]) => {
+    const rank = (l: unknown): number => MCP_ACCESS_LEVELS.indexOf(l as McpAccess);
+    return rank(level) > rank(store.load().mcp.access) ? { title: 'Give the AI connection more access' } : null;
+  },
+  'profiles:duplicate': ([, copyWallets]) => (copyWallets === true ? { title: 'Copy your wallets into a new profile' } : null),
+  // The spending limits on a session that is live. The pacing floors are not caps.
+  'kryptoTrader:setEnvelope': ([id, raw]) => {
+    const s = kryptoTrader.list().find((x) => x.id === id);
+    const next = Number((raw as { maxLossPct?: unknown } | null)?.maxLossPct);
+    return s?.mode === 'live' && capRaised(s.options.maxLossPct, next) ? { title: 'Raise a session\'s limit', detail: sentence([`the most this session can lose, from ${s.options.maxLossPct}% to ${next}%`]) } : null;
+  },
+  'kryptoTrader:setLimits': ([id, raw]) => {
+    const s = kryptoTrader.list().find((x) => x.id === id);
+    const p = (raw ?? {}) as Record<string, unknown>;
+    const was = (s?.options.limits ?? {}) as unknown as Record<string, unknown>;
+    const up = ['maxTradesPerHour', 'maxDailyBuysX'].some((k) => capRaised(was[k], Number(p[k]), true));
+    return s?.mode === 'live' && up ? { title: 'Raise a session\'s limit', detail: 'This lets a live session trade more.' } : null;
+  },
+  'kryptoMode:setLimits': ([id, raw]) => {
+    const s = kryptoMode.list().find((x) => x.id === id);
+    const p = (raw ?? {}) as { budgetSol?: unknown; limits?: { maxTradesPerHour?: unknown } };
+    const up = capRaised(s?.budgetSol, Number(p.budgetSol)) || capRaised(s?.limits?.maxTradesPerHour, Number(p.limits?.maxTradesPerHour), true);
+    return s?.mode === 'live' && up ? { title: 'Raise a bot\'s limit', detail: 'This lets a live bot spend or trade more.' } : null;
+  },
+};
+
+/**
+ * The password's one door: every sensitive channel gets it here, as it registers,
+ * so a handler cannot forget it and no setting can switch it off. A channel the
+ * AI connection reaches comes with no window behind it: an always-gated channel
+ * is refused, and a conditional one runs under the access the user granted (with
+ * the password) and the ceilings that access has.
+ */
+function gateChannel(channel: string, fn: (e: unknown, ...args: unknown[]) => unknown): (e: unknown, ...args: unknown[]) => unknown {
+  const always = VAULT_GATES[channel];
+  const sometimes = CONDITIONAL_GATES[channel];
+  if (!always && !sometimes) return fn;
+  return async (e, ...args) => {
+    if (!vault.isOn()) return fn(e, ...args);
+    const sender = (e as { sender: Electron.WebContents | null }).sender;
+    if (!always && !sender) return fn(e, ...args);
+    const ask = always ? { title: always } : sometimes(args);
+    if (!ask) return fn(e, ...args);
+    const auth = await vaultFlows.authorize(sender, ask.title, ask.detail);
+    if (!auth.ok) return fail(auth.message);
+    try {
+      return await fn(e, ...args);
+    } finally {
+      vaultFlows.release();
+    }
+  };
+}
+
 function captureMcpHandlers(): void {
   const real = ipcMain.handle.bind(ipcMain);
-  ipcMain.handle = ((channel: string, fn: (e: unknown, ...args: unknown[]) => unknown) => {
+  ipcMain.handle = ((channel: string, raw: (e: unknown, ...args: unknown[]) => unknown) => {
+    const fn = gateChannel(channel, raw);
     if (MCP_IPC_CHANNELS.includes(channel) && !MCP_NEVER_CHANNELS.includes(channel)) mcpHandlers.set(channel, fn);
     return real(channel, fn as Parameters<typeof real>[1]);
   }) as typeof ipcMain.handle;
@@ -837,6 +972,13 @@ export function registerIpc(): void {
       // The module is written not to throw; if it ever does, the UI still
       // gets a state rather than a rejected invoke.
       return fail(`Could not check for updates: ${safeErr(err)}`);
+    }
+  });
+  ipcMain.handle('app:verifyBuild', async () => {
+    try {
+      return ok('ok', await updateCheck.verifyBuild());
+    } catch (err) {
+      return fail(`Could not check this copy: ${safeErr(err)}`);
     }
   });
 
@@ -1146,6 +1288,7 @@ export function registerIpc(): void {
         // 'chain_disabled' had been declared as a reason with no producer.
         if (was.enabled && !now.enabled) {
           evmRail.disarm(c, 'chain_disabled');
+          copyTrade.cancelLiveRearms(c);
           evmScanner.stop(c);
         }
       }
@@ -1187,8 +1330,22 @@ export function registerIpc(): void {
     }
   });
 
+  ipcMain.handle('rearm:pending', () => [
+    ...getEngine().rearmPending(),
+    ...copyTrade.pendingRearms(),
+  ]);
+  ipcMain.handle('rearm:cancel', (_e, kind: unknown, id: unknown) => {
+    if (typeof id !== 'string') return fail('Nothing to keep off');
+    if (kind === 'live') getEngine().cancelRearm();
+    else if (kind === 'follow') copyTrade.cancelRearm(id);
+    else return fail('Nothing to keep off');
+    return ok('It stays off until you turn it back on');
+  });
   ipcMain.handle('engine:kill', () => {
     const r = getEngine().killSwitch();
+    // "Stop everything" includes anything waiting to come back on.
+    copyTrade.cancelRearm();
+    getEngine().cancelRearm();
     // Both kill switches pause every Krypto Trader session (critic #9).
     kryptoTrader.pauseAll('the kill switch');
     // The kill switch is the "stop everything" button: it must also take
@@ -1389,7 +1546,7 @@ export function registerIpc(): void {
    * stored home address, so this cannot be pointed anywhere else. Serialised
    * behind in-flight live trades inside engine.withdraw (never races a buy).
    */
-  ipcMain.handle('wallet:withdraw', async (_e, args: unknown) => {
+  ipcMain.handle('wallet:withdraw', async (e, args: unknown) => {
     const a = (args && typeof args === 'object' ? args : {}) as { walletId?: unknown; lamports?: unknown };
     const walletId = typeof a.walletId === 'string' && a.walletId ? a.walletId : undefined;
     let lamports: number | 'max';
@@ -1405,6 +1562,24 @@ export function registerIpc(): void {
       const bal = await getBalance(resolveRpc(store.load().rpc).httpUrl, owner);
       if (!bal.ok || bal.data === undefined) return fail(`Balance unknown: ${bal.message}`);
       if (lamports > bal.data) return fail(`Amount exceeds the wallet balance (${(bal.data / 1e9).toFixed(4)} SOL)`);
+    }
+
+    // The address comes from the store, not the page, and page content cannot
+    // press this dialog. It is the last chance to see where the money is going.
+    const amount = lamports === 'max' ? 'the whole balance, less network fees' : `${(lamports / 1e9).toFixed(4)} SOL`;
+    const { response } = await confirmNative(e.sender, {
+      type: 'warning',
+      buttons: ['Cancel', 'Withdraw'],
+      defaultId: 0,
+      cancelId: 0,
+      noLink: true,
+      title: 'Confirm withdrawal',
+      message: `Withdraw ${amount}?`,
+      detail: `From:\n${owner}\n\nTo your withdrawal address:\n${home}\n\nThis cannot be undone. If you did not just ask for this in Krypto Mirror, press Cancel.`,
+    });
+    if (response !== 1) {
+      logger.warn('wallet:withdraw cancelled at the confirmation dialog');
+      return fail('Withdrawal cancelled');
     }
 
     logger.warn(`wallet:withdraw requested — ${lamports === 'max' ? 'max' : `${(lamports / 1e9).toFixed(4)} SOL`} from ${owner.slice(0, 8)}… to ${home}`);
@@ -1587,27 +1762,30 @@ export function registerIpc(): void {
     return r.ok ? ok('ok', wallet.info()) : fail(r.message);
   });
 
-  ipcMain.handle('wallet:backup', async () => {
-    const win = BrowserWindow.getFocusedWindow();
-    const res = await dialog.showSaveDialog(win!, {
+  ipcMain.handle('wallet:backup', async (e) => {
+    if (!(await confirmKeyFile(e.sender, 'wallet:backup', 'Save this wallet\'s private key to a file?', 'the active wallet'))) return fail('Backup cancelled');
+    const res = await saveDialogFor(e.sender, {
       title: 'Back up trading wallet keypair',
-      defaultPath: 'krypto-mirror-wallet.json',
+      defaultPath: KEY_FILE_NAMES.backup,
       filters: [{ name: 'Solana keypair', extensions: ['json'] }],
     });
     if (res.canceled || !res.filePath) return fail('Backup cancelled');
     const r = wallet.backupToFile(res.filePath);
+    logger.warn(r.ok ? 'wallet:backup — a private key was written to a file the user chose' : `wallet:backup failed — ${r.message}`);
     return r.ok ? ok(r.message) : fail(r.message);
   });
 
-  ipcMain.handle('wallet:export', async () => {
-    const win = BrowserWindow.getFocusedWindow();
-    const res = await dialog.showSaveDialog(win!, {
+  ipcMain.handle('wallet:export', async (e) => {
+    const n = wallet.list().length;
+    if (!(await confirmKeyFile(e.sender, 'wallet:export', `Save the private keys of ${n} wallet${n === 1 ? '' : 's'} to a file?`, `${n} Solana wallet${n === 1 ? '' : 's'}`))) return fail('Export cancelled');
+    const res = await saveDialogFor(e.sender, {
       title: 'Export all wallets (private keys, plaintext)',
-      defaultPath: 'krypt-wallets-PRIVATE.txt',
+      defaultPath: KEY_FILE_NAMES.solana,
       filters: [{ name: 'Text file', extensions: ['txt'] }],
     });
     if (res.canceled || !res.filePath) return fail('Export cancelled');
     const r = wallet.exportAllToFile(res.filePath);
+    logger.warn(r.ok ? `wallet:export — ${r.count} private key(s) were written to a file the user chose` : `wallet:export failed — ${r.message}`);
     return r.ok ? ok(r.message, { count: r.count }) : fail(r.message);
   });
 
@@ -1671,6 +1849,33 @@ export function registerIpc(): void {
   const aioAnnounce = (): void => {
     broadcast({ kind: 'aioChanged' });
   };
+  vaultFlows.register({
+    liveArmed: () => {
+      const on = armedChains();
+      return on.length ? on.join(' and ') : null;
+    },
+    stopTrading: () => {
+      getEngine().disarm('user');
+      const cur = store.load();
+      store.update({ execution: { ...cur.execution, liveEnabled: false } });
+      for (const c of EVM_CHAINS) if (evmRail.armed(c)) evmRail.disarm(c, 'user');
+      copyTrade.cancelLiveRearms();
+      kryptoTrader.pauseAll('your wallets were locked');
+      getEngine().announceStatus();
+    },
+    openLivePositions: () => copyTrade.openLiveCopies() + getEngine().heldLiveCount(),
+    inUse: (family, id) => {
+      if (copyTrade.usesWallet(id)) return 'A follow copies with it. Change or remove that follow first.';
+      if (family === 'solana' && kryptoMode.list().some((s) => s.walletId === id)) return 'A Krypto Mode bot trades from it. Remove that bot first.';
+      return kryptoTrader.walletRemoveBlocked(id, family);
+    },
+    onUnlocked: () => {
+      syncLiveMode();
+      recoverCrashOnce();
+      announceAfterUnlock();
+    },
+    onChanged: () => broadcast({ kind: 'vaultChanged' }),
+  });
   ipcMain.handle('aio:info', () => ok('ok', aioWallet.info()));
   // Everything both addresses hold, every chain, in dollars. Reads only.
   ipcMain.handle('aio:balances', async (_e, refresh: unknown) => {
@@ -2642,6 +2847,11 @@ export function registerIpc(): void {
     traderSession: async (id) => kryptoTrader.mcpDetail(id),
     traderGate: (id) => kryptoTrader.mcpGate(id),
     traderAct: (id, intent, expectedSeq) => kryptoTrader.submit(id, intent, 'mcp', expectedSeq),
+    keepFollowOff: (id) => copyTrade.cancelRearm(id),
+    liveStoppedBy: () => {
+      const l = getEngine().liveState();
+      return l.armed ? null : l.lastDisarmReason;
+    },
     trades: async (limit) => getEngine().tradeHistory().slice(0, limit),
     // `hostBuy` / `hostSell` are the same pair user scripts reach, so the EVM
     // routing, the paper book and the live rails are one implementation with
@@ -2715,9 +2925,13 @@ export function registerIpc(): void {
           feeLane: x.feeLane ?? 'fast',
           liveSlippagePct: x.liveSlippagePct,
         },
-        copies: { maxOpenCopies: x.maxOpenCopies, autoSellOnExit: x.autoSellOnExit },
+        copies: { maxOpenCopies: x.maxOpenCopies > 0 ? x.maxOpenCopies : null, autoSellOnExit: x.autoSellOnExit },
         // The live safety limits: the user's, readable, never the AI's to move.
-        liveSafety: { maxLiveSol: x.maxLiveSol, maxLiveSessionLossSol: x.maxLiveSessionLossSol, maxLiveConsecutiveLosses: x.maxLiveConsecutiveLosses },
+        // Null, not 0: an AI reading a cap of 0 would take it for "may not spend".
+        evmLiveCaps: { robinhood: s.evm.robinhood.maxLiveNative > 0 ? s.evm.robinhood.maxLiveNative : null, bnb: s.evm.bnb.maxLiveNative > 0 ? s.evm.bnb.maxLiveNative : null },
+        // What comes back by itself after a stop. A paused follow may return.
+        autoRearm: { ...readRearm(x.rearm), upgrades: x.rearmAfterVerifiedUpgrade !== false },
+        liveSafety: { maxLiveSol: x.maxLiveSol > 0 ? x.maxLiveSol : null, maxLiveSessionLossSol: x.maxLiveSessionLossSol > 0 ? x.maxLiveSessionLossSol : null, maxLiveConsecutiveLosses: x.maxLiveConsecutiveLosses },
         paperBankroll: snap.paperBankroll ?? null,
         connection: { access: s.mcp.access, budget: s.mcp.budget },
         keys: { heliusKeySet: !!s.rpc.heliusApiKey, customRpcSet: !!s.rpc.httpUrl },
@@ -2884,6 +3098,7 @@ export function registerIpc(): void {
       // The follow ceiling (2026-11-02); an older panel that does not send it keeps the stored one.
       followMaxCopySol: b.followMaxCopySol === undefined ? m.budget.followMaxCopySol : Number(b.followMaxCopySol),
       followDailyLossSol: b.followDailyLossSol === undefined ? m.budget.followDailyLossSol : Number(b.followDailyLossSol),
+      followDailyCopies: b.followDailyCopies === undefined ? m.budget.followDailyCopies : Number(b.followDailyCopies),
     };
     if (!(next.maxBuySol > 0) || next.maxBuySol > 25) return fail('Max per trade must be between 0 and 25');
     if (!(next.hourlyCapSol > 0) || next.hourlyCapSol > 100) return fail('The hourly cap must be between 0 and 100');
@@ -2891,6 +3106,7 @@ export function registerIpc(): void {
     if (!Number.isInteger(next.maxTradesPerMinute) || next.maxTradesPerMinute < 1 || next.maxTradesPerMinute > 60) return fail('Trades per minute must be between 1 and 60');
     if (!(next.followMaxCopySol > 0) || next.followMaxCopySol > 25) return fail('The follow ceiling per copy must be between 0 and 25');
     if (!(next.followDailyLossSol > 0) || next.followDailyLossSol > 100) return fail('The follow ceiling for a day’s loss must be between 0 and 100');
+    if (!Number.isInteger(next.followDailyCopies) || next.followDailyCopies < 1 || next.followDailyCopies > 1000) return fail('The follow ceiling for copies a day must be a whole number from 1 to 1000');
     store.update({ mcp: { ...m, budget: next } });
     return ok('Saved.', mcpPayload());
   });
@@ -3308,7 +3524,7 @@ export function registerIpc(): void {
     const s = store.load();
     if (!s.evm[chain].enabled) return `${EVM_CHAIN_META[chain].name} is switched off in Settings`;
     if (!evmRail.armed(chain)) return `${EVM_CHAIN_META[chain].name} is in Paper — arm it on its wallet page`;
-    return null;
+    return evmWallet.lockReason(chain);
   };
   const evmTraderMarkets = async (chain: EvmChainKind, tokens: string[]): Promise<Map<string, TraderMarket | null>> => {
     const out = new Map<string, TraderMarket | null>();
@@ -4969,6 +5185,7 @@ export function registerIpc(): void {
     const c = chainOf(chain);
     if (!c) return fail('Unknown chain');
     const r = evmRail.disarm(c, 'user');
+    copyTrade.cancelLiveRearms(c);
     return ok(r.message, evmRail.liveState(c));
   });
 
@@ -5071,15 +5288,17 @@ export function registerIpc(): void {
       return fail(`Wallet not removed: ${safeErr(err)}`);
     }
   });
-  ipcMain.handle('evm:wallet:export', async () => {
-    const win = BrowserWindow.getFocusedWindow();
-    const res = await dialog.showSaveDialog(win!, {
+  ipcMain.handle('evm:wallet:export', async (e) => {
+    const n = evmRail.wallet.list('robinhood').length;
+    if (!(await confirmKeyFile(e.sender, 'evm:wallet:export', `Save the private keys of ${n} EVM wallet${n === 1 ? '' : 's'} to a file?`, `${n} EVM wallet${n === 1 ? '' : 's'}, on every EVM chain`))) return fail('Export cancelled');
+    const res = await saveDialogFor(e.sender, {
       title: 'Export EVM wallets (private keys, plaintext)',
-      defaultPath: 'krypt-evm-wallets-PRIVATE.txt',
+      defaultPath: KEY_FILE_NAMES.evm,
       filters: [{ name: 'Text file', extensions: ['txt'] }],
     });
     if (res.canceled || !res.filePath) return fail('Export cancelled');
     const r = evmRail.wallet.exportAll(res.filePath);
+    logger.warn(r.ok ? `evm:wallet:export — ${r.count} private key(s) were written to a file the user chose` : `evm:wallet:export failed — ${r.message}`);
     return r.ok ? ok(r.message, { count: r.count }) : fail(r.message);
   });
   ipcMain.handle('evm:wallet:refreshBalance', async (_e, chain: unknown) => {
@@ -5284,6 +5503,7 @@ export function registerIpc(): void {
 
   ipcMain.handle('live:disarm', () => {
     const r = getEngine().disarm('user');
+    copyTrade.cancelLiveRearms('solana');
     return ok(r.message, getEngine().liveState());
   });
 
@@ -5300,6 +5520,7 @@ export function registerIpc(): void {
       store.update({ execution: { ...cur.execution, liveEnabled: true } });
     } else {
       getEngine().disarm('user');
+      copyTrade.cancelLiveRearms('solana');
       store.update({ execution: { ...cur.execution, liveEnabled: false } });
     }
     // arm()/disarm() pushed a status BEFORE the mode bit above was written;
@@ -6132,7 +6353,7 @@ export function registerIpc(): void {
 
   getEngine().setEvmCopy({
     buy: async (chain, token, amountNative, walletId, opts) => {
-      const r = await evmRail.buy(chain, token, amountNative, false, { walletId, ...(opts?.slippagePct !== undefined ? { slippagePct: opts.slippagePct } : {}) });
+      const r = await evmRail.buy(chain, token, amountNative, false, { walletId, keepNative: EVM_EXIT_GAS[chain], ...(opts?.atHead ? { atHead: opts.atHead } : {}), ...(opts?.slippagePct !== undefined ? { slippagePct: opts.slippagePct } : {}) });
       return { ok: r.ok, message: r.message, signature: r.hash ?? undefined, pending: r.stage === 'pending', spentSol: r.amountIn ? Number(BigInt(r.amountIn)) / 1e18 : undefined };
     },
     // `amountRaw` wins over the percent in the rail, which is the point: a
@@ -6140,7 +6361,7 @@ export function registerIpc(): void {
     // from a share of a balance that also contains hand-bought bags.
     sell: async (chain, token, pct, walletId, amountRaw, opts) => {
       const r = await evmRail.sell(chain, token, pct, false, { walletId, amountRaw, ...(opts?.slippagePct !== undefined ? { slippagePct: opts.slippagePct } : {}) });
-      return { ok: r.ok, message: r.stage === 'pending' ? `broadcast but not confirmed in time — check Trades (${r.message})` : r.message, signature: r.hash ?? undefined };
+      return { ok: r.ok, message: r.stage === 'pending' ? `broadcast but not confirmed in time — check Trades (${r.message})` : r.message, pending: r.stage === 'pending', signature: r.hash ?? undefined };
     },
     // The three reads copy trading settles a position with: what this wallet
     // holds, what a confirmed transaction moved, and — for a copy opened
@@ -6170,7 +6391,7 @@ export function registerIpc(): void {
       const s = store.load();
       if (!s.evm[chain].enabled) return `${EVM_CHAIN_META[chain].name} is switched off in Settings`;
       if (!evmRail.armed(chain)) return `${EVM_CHAIN_META[chain].name} is in Paper — arm it on its wallet page`;
-      return null;
+      return evmWallet.lockReason(chain);
     },
     // A copy above the chain's per-trade cap is refused and recorded
     // (copyTrade, house rule 2), as on Solana (2026-10-24).
@@ -6232,6 +6453,12 @@ export function registerIpc(): void {
     if (r.walletId !== undefined && r.walletId !== null) {
       const ours = copyChain === 'solana' ? wallet.list().some((w) => w.id === r.walletId) : evmWallet.list(copyChain).some((w) => w.id === r.walletId);
       if (typeof r.walletId !== 'string' || !ours) return fail('The wallet to copy with is not one of yours on that chain');
+      // Copies sign unattended, and a savings wallet only signs when someone types.
+      const rows = copyChain === 'solana' ? wallet.vaultRows() : evmWallet.vaultRows();
+      const enc = rows.find((w) => w.id === r.walletId)?.enc;
+      if (r.mode === 'live' && enc && vault.isSealed(enc) && vault.scopeOf(enc) === 'cold') {
+        return fail('That is a savings wallet, so it cannot copy trades. Turn on "Can auto-trade" for it in Settings first.');
+      }
     }
     // The address is handed to the wallet watcher to open a live
     // subscription on, so it has to BE an address — `validateConfig` only
@@ -6617,11 +6844,48 @@ export function registerIpc(): void {
  * whether the user's or a safety breaker's, persists liveEnabled=false so the
  * top bar shows Paper only when the app is actually in Paper.
  */
+/** Tell every page the signer can be used now: balances, holdings and the rest. */
+function announceAfterUnlock(): void {
+  getEngine().announceStatus();
+  // Said where it is seen. Live refuses to arm on this wallet until it is fixed.
+  const refused = wallet.lockReason();
+  if (refused) broadcast({ kind: 'toast', level: 'error', message: refused });
+}
+
+let crashRecoveryRan = false;
+
+/**
+ * Sell what a crashed run left behind, once per launch. Called on a timer at boot
+ * and again from the unlock, so it cannot run twice, and cannot run while locked,
+ * when none of those sells could be signed.
+ */
+export function recoverCrashOnce(): void {
+  if (crashRecoveryRan || wallet.lockReason()) return;
+  crashRecoveryRan = true;
+  getEngine().recoverAfterCrash().catch((err) => logger.warn(`crash recovery: ${err}`));
+}
+
+/** The restart switch, once per run, and not until the wallets can sign. */
+let restartRestored = false;
+function restoreAfterRestartOnce(): void {
+  if (restartRestored || vault.isLocked()) return;
+  restartRestored = true;
+  if (!readRearm(store.load().execution.rearm).restart) return;
+  logger.warn(`auto re-arm after restart: ${copyTrade.restoreAfterRestart()} follow(s) back on`);
+}
+
 export function syncLiveMode(): void {
+  // Armed first: the alert says which restored follows can actually spend.
+  armIfSavedLive();
+  restoreAfterRestartOnce();
+}
+
+function armIfSavedLive(): void {
   const s = store.load();
   const eng = getEngine();
   if (!s.execution.liveEnabled) return;
   if (!wallet.exists()) return; // no signer yet — stays Paper until one exists
+  if (wallet.lockReason()) return; // the unlock calls this again
   if (eng.liveState().armed) return;
   const r = eng.arm(true);
   logger.info(r.ok ? 'trading mode: LIVE (default)' : `trading mode: could not arm — ${r.message}`);

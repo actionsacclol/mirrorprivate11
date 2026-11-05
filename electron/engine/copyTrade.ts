@@ -11,6 +11,7 @@
 // the price N milliseconds later is the exact self-flattery that makes
 // copy-trading look profitable when it is not.
 
+import { DEFAULT_REARM, nextRearm, rearmClock, type RearmPending, type RearmSettings } from '@shared/rearm';
 import fs from 'node:fs';
 import type { ScoutSort } from '@shared/scoutSort';
 import { type ChainKind, nativeSymbolOf } from '@shared/evm';
@@ -34,7 +35,12 @@ import {
   COPY_LATENCY_FLOOR_MS,
   MIGRATION_RETRY_MS,
   MIGRATION_WAIT_MAX_MS,
+  SELL_SEND_HUNG_MS,
+  slippageFailed,
+  SELL_RETRY_PENDING_MS,
   curveMigrating,
+  failPauseReason,
+  sellRetryWaitMs,
   MIN_LIVE_COPY_SOL,
   emptyLeaderStats,
   validateConfig,
@@ -61,7 +67,7 @@ import {
   type PaperBankrollView,
   type SkipRuleCount,
   type CopyHold,
-  chainOf, isBlocked, isDustRemainder, rawOf, uiTokens } from '@shared/copytrade';
+  chainOf, dailyLossHit, dailyTradesHit, isBlocked, isDustRemainder, rawOf, uiTokens } from '@shared/copytrade';
 import type { DeliveryTiming } from './walletWatcher';
 import * as recorder from './recorder';
 import { traderClaimFor } from './traderClaims';
@@ -155,6 +161,8 @@ export interface FillRead {
 
 /** Per-execution overrides. A host free to ignore them still type-checks. */
 export interface CopyExecOpts {
+  /** BNB and Robinhood: asked when the buy reaches the head of the chain's queue. A reason refuses it. */
+  atHead?: () => string | null;
   /** This config's `maxSlippagePct`, which the host is asked to honour. */
   slippagePct?: number;
   /** The wallet this config signs with; absent = the active wallet. */
@@ -176,6 +184,11 @@ export interface CopyExecOpts {
 }
 
 export interface CopyHost {
+  /** What comes back on by itself. Absent = nothing does. */
+  rearm?(): RearmSettings;
+  /** Point the wallet watcher at the follows now on. Saving a follow does this;
+   *  a follow that comes back by itself must too, or it is on and hears nothing. */
+  syncWatch?(): void;
   /** Fire a real buy. Only called for a `live` config. */
   buy(mint: string, sol: number, opts?: CopyExecOpts): Promise<CopyExecResult>;
   /** Sell `pct`% of what THIS wallet holds of `mint`. Only called for a
@@ -190,6 +203,11 @@ export interface CopyHost {
    * must never trap a position it already holds.
    */
   exitBlockedReason?(chain?: ChainKind): string | null;
+  /** Did this send land? True or false once the chain has said; 'reading' while
+   *  the ledger is still asking; null if nothing is known. */
+  sendLanded?(signature: string, chain: ChainKind): boolean | 'reading' | null;
+  /** The address a follow signs with: null walletId is whichever wallet is active. */
+  signerOf?(walletId: string | null, chain: ChainKind): string | null;
   /**
    * Why a LIVE BUY specifically cannot execute, or null (copy-11).
    *
@@ -329,6 +347,10 @@ export function init(userDataDir: string): void {
   configs = [];
   trades = [];
   leaders = {};
+  trimmedBook = {};
+  sellRetries.clear();
+  migrationWaits.clear();
+  restoredNotice = null;
 
   // Fail CLOSED: "I could not read the file" is not "there is no file"
   // (copy-6). A missing file is a first run; anything else means configs,
@@ -354,6 +376,9 @@ export function init(userDataDir: string): void {
       leaders?: Record<string, LeaderBook>;
       pendingExits?: Array<{ key: string; trade: WalletTrade }>;
       skipTallies?: Record<string, Record<string, SkipTally>>;
+      trimmedBook?: Record<string, TrimmedRecord>;
+      sellRetries?: unknown;
+      migrationWaits?: unknown;
       paperBankroll?: Partial<PaperBankroll>;
     };
     configs = Array.isArray(raw?.configs) ? raw.configs : [];
@@ -361,6 +386,8 @@ export function init(userDataDir: string): void {
     leaders = raw?.leaders && typeof raw.leaders === 'object' && !Array.isArray(raw.leaders) ? raw.leaders : {};
     if (raw?.skipTallies && typeof raw.skipTallies === 'object' && !Array.isArray(raw.skipTallies)) skipTallies = raw.skipTallies;
     else tallySkipsFromRows();
+    if (raw?.trimmedBook && typeof raw.trimmedBook === 'object' && !Array.isArray(raw.trimmedBook)) trimmedBook = raw.trimmedBook;
+    restoreRetries([raw?.sellRetries, raw?.migrationWaits], Date.now());
     bankroll = readBankroll(raw?.paperBankroll);
     for (const row of Array.isArray(raw?.pendingExits) ? raw.pendingExits : []) {
       if (row && typeof row.key === 'string' && row.trade && typeof row.trade.mint === 'string') {
@@ -388,10 +415,21 @@ export function init(userDataDir: string): void {
   // experiment is a useless one. Disarming stops ENTRIES only: the copies
   // it already holds are still followed out (`managesExits`).
   let disarmed = 0;
+  offByRestart.clear();
   for (const c of configs) {
     if (c.mode === 'live' && c.enabled) {
       c.enabled = false;
+      c.pausedReason = 'the app restarted';
+      c.pausedAt = Date.now();
+      c.pausedBy = 'restart';
+      c.rearmAt = null;
+      offByRestart.add(c.id);
       disarmed += 1;
+    } else if (c.mode === 'live' && !c.enabled && c.rearmAt != null) {
+      // It was waiting to come back when the app closed. A restart still ends
+      // that, unless the restart switch says otherwise.
+      c.rearmAt = null;
+      offByRestart.add(c.id);
     }
   }
   if (!loadFailure) {
@@ -442,7 +480,7 @@ export async function drainForQuit(timeoutMs: number): Promise<void> {
   closing = true;
   const until = Date.now() + timeoutMs;
   while (Date.now() < until) {
-    const sending = [...buysInFlight.values()].some((f) => f.submitted);
+    const sending = [...buysInFlight.values()].some((list) => list.some((f) => f.submitted));
     if (!sending && exitChains.size === 0) break;
     await new Promise((r) => setTimeout(r, 100));
   }
@@ -472,6 +510,10 @@ function writeNow(): void {
             // open and nothing remembers it was meant to close.
             pendingExits: [...pendingExits.entries()].map(([key, trade]) => ({ key, trade })),
             skipTallies,
+            trimmedBook,
+            // A sell still owed is an instruction too. See `restoreRetries`.
+            sellRetries: [...sellRetries.entries()].map(([key, w]) => ({ key, ...w })),
+            migrationWaits: [...migrationWaits.entries()].map(([key, w]) => ({ key, ...w })),
             paperBankroll: bankroll,
           },
           null,
@@ -521,6 +563,12 @@ export function upsert(input: Omit<CopyConfig, 'id' | 'createdAt'> & { id?: stri
     }
     Object.assign(existing, input);
     if (toLive) existing.enabled = false;
+    // A follow moved to another mode is the user's new decision. A comeback
+    // planned for the old one must not switch it on, least of all in Live.
+    if (existing.mode !== wasMode) {
+      existing.rearmAt = null;
+      offByRestart.delete(existing.id);
+    }
     // Switched on by the user: an engine pause is over, and the per-wallet
     // stop counts from now — the losses that tripped it are not counted again.
     if (turningOn && existing.enabled) clearPause(existing);
@@ -563,6 +611,8 @@ export function remove(id: string): { ok: boolean; message: string } {
   if (configs.length === before) return { ok: false, message: 'Config not found' };
   withdrawAsks((a) => a.configId === id, 'the follow was removed');
   trades = trades.filter((t) => t.configId !== id);
+  delete trimmedBook[`${id}:paper`];
+  delete trimmedBook[`${id}:live`];
   // Runtime state dies with the config (copy-9): an exit chain keyed to it
   // would otherwise pin the map forever, and a reservation it never released
   // would count against a config that no longer exists.
@@ -628,7 +678,7 @@ function paperHeld(): { sol: number; open: number } {
     sol += t.ourSol * ((t.remainingPct ?? 100) / 100);
     open += 1;
   }
-  for (const f of buysInFlight.values()) if (f.paperSol !== undefined) sol += f.paperSol;
+  for (const list of buysInFlight.values()) for (const f of list) if (f.paperSol !== undefined) sol += f.paperSol;
   return { sol, open };
 }
 
@@ -670,8 +720,15 @@ export async function setPaperBankroll(input: { enabled?: boolean; usd?: number;
     host?.log('info', 'copy: paper bankroll off — paper copies spend without a balance');
     return { ok: true, message: 'Paper bankroll off. Paper copies no longer draw from a balance.', bankroll: bankrollView() };
   }
-  const fresh = input.restart === true || !bankroll.enabled || usd !== bankroll.usd || bankroll.startSol === null || bankroll.startedAt === null;
-  if (!fresh) return { ok: true, message: 'No change.', bankroll: bankrollView() };
+  const fresh = input.restart === true || usd !== bankroll.usd || bankroll.startSol === null || bankroll.startedAt === null;
+  if (!fresh) {
+    // Switched back on with the same amount: the run carries on where it was.
+    if (bankroll.enabled) return { ok: true, message: 'No change.', bankroll: bankrollView() };
+    bankroll = { ...bankroll, enabled: true };
+    persist();
+    host?.changed();
+    return { ok: true, message: 'Paper bankroll back on, carrying on from where it was.', bankroll: bankrollView() };
+  }
   const price = (await host?.solUsd?.().catch(() => null)) ?? null;
   if (price === null || !(price > 0)) return fail('The SOL price is not available right now, so the dollars cannot be turned into SOL. Try again in a moment.');
   bankroll = { enabled: true, usd, startSol: usd / price, startedAt: Date.now(), startSolUsd: price, realizedSol: 0 };
@@ -713,6 +770,11 @@ export function resetPaper(configId?: string): { ok: boolean; message: string; c
     if (!key.endsWith(':paper')) continue;
     if (configId !== undefined && key !== `${configId}:paper`) continue;
     delete skipTallies[key];
+  }
+  for (const key of Object.keys(trimmedBook)) {
+    if (!key.endsWith(':paper')) continue;
+    if (configId !== undefined && key !== `${configId}:paper`) continue;
+    delete trimmedBook[key];
   }
   // Paper rows carry no runtime state a live row needs, but a parked exit or
   // an abandoned buy keyed to a config whose paper rows just vanished has
@@ -775,7 +837,16 @@ function managesExits(c: CopyConfig): boolean {
   return c.enabled || openConfigIds().has(c.id) || pendingCopies.has(c.id);
 }
 
+/** Something is meant to be running. A follow waiting to come back counts: a
+ *  sleeping computer never wakes for it. */
+export function keepsRunning(): boolean {
+  return configs.some((c) => c.enabled || c.rearmAt != null);
+}
+
 let watchCache: { v: number; byChain: Map<string, Set<string>> } | null = null;
+
+/** A copy already reported as left by its leader, so each wake does not repeat it. */
+const leaderLeftNoted = new Set<string>();
 
 /**
  * Wallets the engine must watch: every config taking entries, and every
@@ -808,21 +879,25 @@ function statsFor(c: CopyConfig): CopyStats {
   const copies = mine.filter((t) => t.kind !== 'exit');
   const closed = mine.filter((t) => t.state === 'closed' && t.pnlSol !== null);
   const open = copies.filter((t) => t.state === 'open');
+  // Rows trimmed from the book still happened (`noteTrimmed`).
+  const past = trimmedBook[`${c.id}:${c.mode}`];
+  const firstAt = mine.length ? Math.min(...mine.map((t) => t.at)) : null;
+  const lastAt = mine.length ? Math.max(...mine.map((t) => t.at)) : null;
   return {
     configId: c.id,
     mode: c.mode,
-    trades: copies.filter((t) => t.state !== 'skipped').length,
-    wins: closed.filter((t) => (t.pnlSol as number) > 0).length,
-    losses: closed.filter((t) => (t.pnlSol as number) < 0).length,
-    realizedPnlSol: closed.reduce((a, t) => a + (t.pnlSol as number), 0),
+    trades: copies.filter((t) => t.state !== 'skipped').length + (past?.trades ?? 0),
+    wins: closed.filter((t) => (t.pnlSol as number) > 0).length + (past?.wins ?? 0),
+    losses: closed.filter((t) => (t.pnlSol as number) < 0).length + (past?.losses ?? 0),
+    realizedPnlSol: closed.reduce((a, t) => a + (t.pnlSol as number), past?.pnlSol ?? 0),
     openCount: open.length,
     openCostSol: open.reduce((a, t) => a + t.ourSol * ((t.remainingPct ?? 100) / 100), 0),
-    skipped: copies.filter((t) => t.state === 'skipped' && t.reason !== null && !t.reason.startsWith('limit')).length,
-    blocked: copies.filter((t) => t.state === 'skipped' && t.reason?.startsWith('limit')).length,
+    skipped: copies.filter((t) => t.state === 'skipped' && t.reason !== null && !t.reason.startsWith('limit')).length + (past?.skipped ?? 0),
+    blocked: copies.filter((t) => t.state === 'skipped' && t.reason?.startsWith('limit')).length + (past?.blocked ?? 0),
     skipRules: skipRulesFor(c),
     hold: holdOf(c),
-    firstAt: mine.length ? Math.min(...mine.map((t) => t.at)) : null,
-    lastAt: mine.length ? Math.max(...mine.map((t) => t.at)) : null,
+    firstAt: past?.firstAt != null && (firstAt === null || past.firstAt < firstAt) ? past.firstAt : firstAt,
+    lastAt: past?.lastAt != null && (lastAt === null || past.lastAt > lastAt) ? past.lastAt : lastAt,
     unpriced: mine.filter((t) => t.kind === 'exit' && t.state === 'closed' && t.pnlBasis === 'pending').length,
     openAllModes: every.filter((t) => t.kind !== 'exit' && t.state === 'open').length,
   };
@@ -921,6 +996,17 @@ function pnlByDay(now: number): NonNullable<CopySnapshot['pnlByDay']> {
     cur.pnl += t.pnlSol;
     cur.closed += 1;
     m.set(day, cur);
+  }
+  for (const [key, past] of Object.entries(trimmedBook)) {
+    const m = key.endsWith(':paper') ? acc.paper : acc.live;
+    for (const [dayText, v] of Object.entries(past.days ?? {})) {
+      const day = Number(dayText);
+      if (day < from) continue;
+      const cur = m.get(day) ?? { pnl: 0, closed: 0 };
+      cur.pnl += v.pnl;
+      cur.closed += v.closed;
+      m.set(day, cur);
+    }
   }
   for (const mode of ['paper', 'live'] as const) {
     out[mode] = [...acc[mode].entries()].sort((a, b) => a[0] - b[0]).map(([day, v]) => ({ day, ...v }));
@@ -1181,6 +1267,7 @@ const MINUTE = 60_000;
 
 function perMinuteCap(c: CopyConfig): number {
   const v = c.maxCopiesPerMinute;
+  if (v === 0) return Number.POSITIVE_INFINITY;
   return typeof v === 'number' && v > 0 ? v : DEFAULT_COPIES_PER_MINUTE;
 }
 
@@ -1211,7 +1298,7 @@ function limitHit(c: CopyConfig, mint?: string): string | null {
   // used four of the day's copies. Their realised losses DO count below.
   // Copies still in flight count: they are already spending.
   const used = today.filter((t) => t.kind !== 'exit').length + (pendingCopies.get(c.id) ?? 0);
-  if (used >= c.dailyTradeLimit) {
+  if (dailyTradesHit(c, used)) {
     noteDailyTrades(c);
     return `limit: ${c.dailyTradeLimit} copies today`;
   }
@@ -1222,13 +1309,13 @@ function limitHit(c: CopyConfig, mint?: string): string | null {
   const realized = today
     .filter((t) => t.state === 'closed')
     .reduce((a, t) => a + (t.pnlSol ?? t.estPnlSol ?? 0), 0);
-  if (realized <= -c.dailyLossLimitSol) {
+  if (dailyLossHit(c, realized)) {
     noteDailyStop(c, realized);
     return `limit: down ${Math.abs(realized).toFixed(3)} SOL today`;
   }
   const stopped = walletStopHit(c);
   if (stopped) {
-    autoPause(c, stopped);
+    autoPause(c, stopped, 'stop');
     return `paused — ${stopped}`;
   }
   const open = openCeilingHit(c, mint);
@@ -1258,14 +1345,14 @@ function holdOf(c: CopyConfig): CopyHold | null {
   const today = todayFor(c);
   const used = today.filter((t) => t.kind !== 'exit').length + (pendingCopies.get(c.id) ?? 0);
   const realized = today.filter((t) => t.state === 'closed').reduce((a, t) => a + (t.pnlSol ?? t.estPnlSol ?? 0), 0);
-  if (realized <= -c.dailyLossLimitSol) {
+  if (dailyLossHit(c, realized)) {
     return {
       kind: 'daily-loss',
       message: `Stopped for today — down ${Math.abs(realized).toFixed(3)} SOL, past its ${c.dailyLossLimitSol} SOL daily loss limit. Starts again at midnight; open copies are still managed.`,
       until: nextMidnight(),
     };
   }
-  if (used >= c.dailyTradeLimit) {
+  if (dailyTradesHit(c, used)) {
     return {
       kind: 'daily-trades',
       message: `Stopped for today — all ${c.dailyTradeLimit} of today's copies are used. Starts again at midnight; open copies are still managed.`,
@@ -1340,7 +1427,7 @@ function walletStopHit(c: CopyConfig): string | null {
   const from = c.lossStopFrom ?? c.createdAt;
   const realized = trades
     .filter((t) => t.configId === c.id && t.mode === c.mode && t.state === 'closed' && (t.closedAt ?? t.at) >= from)
-    .reduce((a, t) => a + (t.pnlSol ?? t.estPnlSol ?? 0), 0);
+    .reduce((a, t) => a + (t.pnlSol ?? t.estPnlSol ?? 0), 0) + trimmedSinceStop(c, from);
   return realized <= -stop ? `down ${Math.abs(realized).toFixed(3)} since it was switched on, past its ${stop} stop` : null;
 }
 
@@ -1363,33 +1450,161 @@ function openCeilingHit(c: CopyConfig, mint?: string): string | null {
   return keys.size + inFlight >= cap ? `limit: ${cap} copies open across all follows` : null;
 }
 
+/** Nothing comes back by itself: what a host with no policy gets. */
+const REARM_NOTHING: RearmSettings = { ...DEFAULT_REARM, failedTrades: false };
+
 /** Live copies that failed in a row, per follow; reset by one that lands. */
 const failStreak = new Map<string, number>();
+/**
+ * Sends in a row that went out and never confirmed. Not failures, since each
+ * may be a real position, but a route that only times out must still run out:
+ * with no copy limits set, nothing else stops it. Twice the failed-send count,
+ * because a slow node can make good copies look like this for a while.
+ */
+const unconfirmedStreak = new Map<string, number>();
+const UNCONFIRMED_MULTIPLE = 2;
+function clearStreaks(id: string): void {
+  failStreak.delete(id);
+  unconfirmedStreak.delete(id);
+}
+/** Live follows this run's start switched off (or stopped waiting). */
+const offByRestart = new Set<string>();
 
 /**
  * Pause a follow on the engine's own authority: entries stop, exits go on,
  * the card says why, and the user is told. The user switching it back on
- * (upsert) is the only way out.
+ * (upsert) ends it at any time; auto re-arm can end it too, if its switch for
+ * this cause is on (shared/rearm.ts).
  */
-function autoPause(c: CopyConfig, why: string): void {
+function autoPause(c: CopyConfig, why: string, cause: 'fails' | 'stop'): void {
   if (!c.enabled) return;
+  const now = Date.now();
+  const tries = (cause === 'stop' ? c.stopTries : c.rearmTries) ?? 0;
+  const plan = nextRearm(host?.rearm?.() ?? REARM_NOTHING, cause, tries, now);
   c.enabled = false;
   c.pausedReason = why;
-  c.pausedAt = Date.now();
-  failStreak.delete(c.id);
+  c.pausedAt = now;
+  c.pausedBy = cause;
+  c.rearmAt = plan?.at ?? null;
+  if (cause === 'stop') c.stopTries = plan?.tries ?? tries;
+  else c.rearmTries = plan?.tries ?? tries;
+  clearStreaks(c.id);
   withdrawAsks((a) => a.configId === c.id && a.kind === 'entry', `the follow paused itself — ${why}`);
   persist();
   host?.changed();
   const who = c.label || c.wallet.slice(0, 6);
   host?.log('warn', `copy ${who}: paused — ${why}`);
-  alertUser(`Copying ${who} paused`, `${why[0].toUpperCase()}${why.slice(1)}. Open copies are still managed. Switch it back on in Following when you are ready.`);
+  (plan || tries === 0 ? alertUser : alertImportant)(
+    `Copying ${who} paused`,
+    `${why[0].toUpperCase()}${why.slice(1)}. Open copies are still managed. ${plan ? `It comes back on by itself at ${rearmClock(plan.at)}.` : 'Switch it back on in Following when you are ready.'}`,
+  );
 }
 
 function clearPause(c: CopyConfig): void {
   c.pausedReason = null;
   c.pausedAt = null;
+  c.pausedBy = null;
+  c.rearmAt = null;
+  c.rearmTries = 0;
+  c.stopTries = 0;
+  offByRestart.delete(c.id);
   c.lossStopFrom = Date.now();
-  failStreak.delete(c.id);
+  clearStreaks(c.id);
+}
+
+/**
+ * Follows whose wait is over come back on. Live ones wait for live to be able
+ * to run: a follow switched on into Paper or a locked wallet would use up its
+ * comebacks doing nothing. The switch is read again here, so turning it off
+ * during a wait keeps the follow off.
+ */
+function checkRearms(now: number): void {
+  const policy = host?.rearm?.();
+  if (!policy || !host) return;
+  for (const c of configs) {
+    if (c.enabled || c.rearmAt == null || now < c.rearmAt) continue;
+    const allowed = c.pausedBy === 'fails' ? policy.failedTrades : c.pausedBy === 'stop' ? policy.followStops : false;
+    if (!allowed) {
+      c.rearmAt = null;
+      persist();
+      host.changed();
+      continue;
+    }
+    if (c.mode === 'live' && host.liveBlockedReason(chainOf(c))) continue;
+    const stop = c.pausedBy === 'stop';
+    c.enabled = true;
+    c.pausedReason = null;
+    c.pausedAt = null;
+    c.pausedBy = null;
+    c.rearmAt = null;
+    // After a loss stop the count starts again, or it would stop straight back.
+    if (stop) c.lossStopFrom = now;
+    clearStreaks(c.id);
+    persist();
+    host.syncWatch?.();
+    host.changed();
+    const who = c.label || c.wallet.slice(0, 6);
+    host.log('warn', `copy ${who}: back on by itself (${(stop ? c.stopTries : c.rearmTries) ?? 0} in a row)`);
+    alertImportant(`Copying ${who} is back on`, c.mode === 'live' ? 'It came back on by itself and will spend real money. Change this in Settings, Auto re-arm.' : 'It came back on by itself on paper.');
+  }
+}
+
+/** Follows waiting to come back on. */
+export function pendingRearms(): RearmPending[] {
+  return configs
+    .filter((c) => !c.enabled && c.rearmAt != null)
+    .map((c) => ({ kind: 'follow' as const, id: c.id, name: c.label || c.wallet.slice(0, 6), at: c.rearmAt as number, why: c.pausedReason ?? 'paused by the app' }));
+}
+
+/** Keep a follow off (no id: all of them, for the kill switch). */
+export function cancelRearm(id?: string): void {
+  let changedAny = false;
+  for (const c of configs) {
+    if ((id === undefined || c.id === id) && c.rearmAt != null) {
+      c.rearmAt = null;
+      changedAny = true;
+    }
+    if (id === undefined || c.id === id) offByRestart.delete(c.id);
+  }
+  if (changedAny) {
+    persist();
+    host?.changed();
+  }
+}
+
+/** Live follows on one chain, or every chain, stop waiting: the user chose Paper
+ *  or locked up. Going Live again later must not switch them on by surprise. A
+ *  breaker switching live off is not the user's choice, and does not come here. */
+export function cancelLiveRearms(chain?: ChainKind): void {
+  for (const c of configs) if (c.mode === 'live' && (chain === undefined || chainOf(c) === chain)) cancelRearm(c.id);
+}
+
+/** The restart switch: what this run's start switched off comes back. It keeps
+ *  its loss-stop count, so a follow past its stop pauses again straight away. */
+export function restoreAfterRestart(): number {
+  let n = 0;
+  let waiting = 0;
+  for (const id of offByRestart) {
+    const c = configs.find((x) => x.id === id);
+    if (!c || c.enabled || c.mode !== 'live') continue;
+    c.enabled = true;
+    c.pausedReason = null;
+    c.pausedAt = null;
+    c.pausedBy = null;
+    c.rearmAt = null;
+    clearStreaks(c.id);
+    n += 1;
+    if (host?.liveBlockedReason(chainOf(c))) waiting += 1;
+  }
+  offByRestart.clear();
+  if (n > 0) {
+    persist();
+    host?.syncWatch?.();
+    host?.changed();
+    host?.log('warn', `copy: ${n} live follow${n === 1 ? '' : 's'} back on after the restart`);
+    alertImportant(`${n} live follow${n === 1 ? ' is' : 's are'} back on`, waiting > 0 ? `They were running when the app closed. ${waiting === n ? (n === 1 ? 'It waits' : 'They wait') : `${waiting} of them wait`} on Paper and spend nothing until you switch that chain to Live on the top bar. BNB and Robinhood always open in Paper.` : 'They were running when the app closed and will spend real money. Change this in Settings, Auto re-arm.');
+  }
+  return n;
 }
 
 /** Configs told about today's stop, so it is said once a day, not per copy. */
@@ -1410,13 +1625,18 @@ function noteDailyStop(c: CopyConfig, realized: number): void {
  */
 const NOTIFY_PER_HOUR = 6;
 const notifiedAt: number[] = [];
-function alertUser(title: string, body: string, toast = true): void {
+/** The two a person away from the screen must hear: spending again, or stopped for good. */
+function alertImportant(title: string, body: string): void {
+  alertUser(title, body, true, true);
+}
+
+function alertUser(title: string, body: string, toast = true, always = false): void {
   const h = host;
   if (!h) return;
   if (toast) h.toast('error', `${title} — ${body}`);
   const now = Date.now();
   while (notifiedAt.length && now - notifiedAt[0] >= 3_600_000) notifiedAt.shift();
-  if (notifiedAt.length >= NOTIFY_PER_HOUR) {
+  if (!always && notifiedAt.length >= NOTIFY_PER_HOUR) {
     h.log('warn', `copy alert not sent (${NOTIFY_PER_HOUR} this hour already): ${title} — ${body}`);
     return;
   }
@@ -1478,7 +1698,7 @@ function checkWalletStops(): void {
   for (const c of configs) {
     if (!c.enabled) continue;
     const why = walletStopHit(c);
-    if (why) autoPause(c, why);
+    if (why) autoPause(c, why, 'stop');
   }
 }
 
@@ -1498,8 +1718,9 @@ function trimTrades(): void {
   let excess = trades.length - MAX_TRADES;
   if (excess <= 0) return;
   const openIds = new Set(trades.filter((t) => t.state === 'open').map((t) => t.id));
+  const owed = new Set([...sellRetries.values(), ...migrationWaits.values()].map((w) => w.rowId));
   const keep = (t: CopyTrade): boolean =>
-    t.state === 'open' || t.pnlBasis === 'pending' || (t.parentId !== undefined && openIds.has(t.parentId));
+    t.state === 'open' || t.pnlBasis === 'pending' || (t.parentId !== undefined && openIds.has(t.parentId)) || owed.has(t.id);
   const drop = new Set<string>();
   for (const pass of ['skipped', 'any'] as const) {
     for (let i = trades.length - 1; i >= 0 && excess > 0; i -= 1) {
@@ -1507,10 +1728,72 @@ function trimTrades(): void {
       if (drop.has(t.id) || keep(t)) continue;
       if (pass === 'skipped' && t.state !== 'skipped') continue;
       drop.add(t.id);
+      noteTrimmed(t);
       excess -= 1;
     }
   }
   if (drop.size) trades = trades.filter((t) => !drop.has(t.id));
+}
+
+// ── What the trim took (2026-11-04) ───────────────────────────────────
+//
+// A closed copy trimmed from the book still happened. At 300 rows a day the
+// book is full in a week, and every total read from the rows then fell: the
+// result, the win count, the chart, and a follow's own loss stop, which could
+// then never fire. So a row leaves its numbers behind, per follow and mode.
+interface TrimmedRecord {
+  trades: number;
+  wins: number;
+  losses: number;
+  pnlSol: number;
+  skipped: number;
+  blocked: number;
+  firstAt: number | null;
+  lastAt: number | null;
+  /** Local day → that day's result, for the chart. Old days are dropped. */
+  days: Record<string, { pnl: number; closed: number }>;
+  /** What the loss stop counted, for the stop that started at `stopFrom`. */
+  stopFrom: number | null;
+  stopPnlSol: number;
+}
+let trimmedBook: Record<string, TrimmedRecord> = {};
+
+function noteTrimmed(t: CopyTrade): void {
+  const key = `${t.configId}:${t.mode}`;
+  const r = (trimmedBook[key] ??= { trades: 0, wins: 0, losses: 0, pnlSol: 0, skipped: 0, blocked: 0, firstAt: null, lastAt: null, days: {}, stopFrom: null, stopPnlSol: 0 });
+  r.firstAt = r.firstAt === null ? t.at : Math.min(r.firstAt, t.at);
+  r.lastAt = r.lastAt === null ? t.at : Math.max(r.lastAt, t.at);
+  if (t.kind !== 'exit') {
+    if (t.state !== 'skipped') r.trades += 1;
+    else if (t.reason?.startsWith('limit')) r.blocked += 1;
+    else if (t.reason !== null) r.skipped += 1;
+  }
+  if (t.state !== 'closed') return;
+  const closedAt = t.closedAt ?? t.at;
+  const c = configs.find((x) => x.id === t.configId);
+  const from = c ? (c.lossStopFrom ?? c.createdAt) : null;
+  if (c && from !== null && c.mode === t.mode && closedAt >= from) {
+    if (r.stopFrom !== from) {
+      r.stopFrom = from;
+      r.stopPnlSol = 0;
+    }
+    r.stopPnlSol += t.pnlSol ?? t.estPnlSol ?? 0;
+  }
+  if (t.pnlSol === null) return;
+  r.pnlSol += t.pnlSol;
+  if (t.pnlSol > 0) r.wins += 1;
+  else if (t.pnlSol < 0) r.losses += 1;
+  const day = localDay(closedAt);
+  const cur = (r.days[day] ??= { pnl: 0, closed: 0 });
+  cur.pnl += t.pnlSol;
+  cur.closed += 1;
+  const oldest = localDay(Date.now()) - (PNL_DAYS - 1);
+  for (const d of Object.keys(r.days)) if (Number(d) < oldest) delete r.days[d];
+}
+
+function trimmedSinceStop(c: CopyConfig, from: number): number {
+  const r = trimmedBook[`${c.id}:${c.mode}`];
+  return r && r.stopFrom === from ? r.stopPnlSol : 0;
 }
 
 // ── Skips by rule (2026-11-01) ────────────────────────────────────────
@@ -1872,6 +2155,16 @@ function liveOpenByConfig(): Record<string, number> {
   return out;
 }
 
+/** Live copies still open across every follow. */
+export function openLiveCopies(): number {
+  return trades.filter((t) => t.mode === 'live' && t.state === 'open' && t.kind !== 'exit').length;
+}
+
+/** Does a follow name this wallet to copy with? */
+export function usesWallet(walletId: string): boolean {
+  return configs.some((c) => c.walletId === walletId);
+}
+
 export function activeWalletLiveCopies(): number {
   const ids = new Set(configs.filter((c) => chainOf(c) === 'solana' && !c.walletId).map((c) => c.id));
   return trades.filter((t) => ids.has(t.configId) && t.mode === 'live' && t.state === 'open' && t.kind !== 'exit').length;
@@ -2082,7 +2375,17 @@ const exitChains = new Map<string, Promise<void>>();
 /** `${configId}:${mint}` → the buy is between `evaluateBuy` and its record. */
 /** `paperSol`: a bankroll-paid paper buy's size, held against the balance
  *  until its row opens, so two buys in one slot cannot spend the same SOL. */
-const buysInFlight = new Map<string, { since: number; submitted: boolean; paperSol?: number }>();
+interface BuyFlight {
+  since: number;
+  submitted: boolean;
+  paperSol?: number;
+}
+/** Every buy under way per config and coin: a bot leader clips one coin
+ *  several times, and one slot per coin lost track of the others. */
+const buysInFlight = new Map<string, BuyFlight[]>();
+/** A sell that has already been applied to these rows and is parked for the
+ *  buys still going: when it runs again it touches only rows opened since. */
+const pastRows = new WeakMap<WalletTrade, Set<string>>();
 /** `${configId}:${mint}` → the leader sell that landed mid-buy, newest wins. */
 const pendingExits = new Map<string, WalletTrade>();
 /** `${configId}:${mint}` marked abandoned: the leader left before we sent. */
@@ -2112,15 +2415,16 @@ const flightKey = (configId: string, mint: string): string => `${configId}:${min
  *  Returns true when it was parked (so the caller does not also drop it). */
 function parkExit(c: CopyConfig, t: WalletTrade): boolean {
   const key = flightKey(c.id, t.mint);
-  const flight = buysInFlight.get(key);
-  if (!flight) return false;
+  const flights = buysInFlight.get(key);
+  if (!flights?.length) return false;
   pendingExits.set(key, t);
   // Not yet sent: the entry itself is what we no longer want.
-  if (!flight.submitted) staleBuys.add(key);
+  const unsent = flights.some((f) => !f.submitted);
+  if (unsent) staleBuys.add(key);
   host?.log(
     'info',
     `copy: ${c.label || c.wallet.slice(0, 6)} ${t.note ? 'bought back' : 'sold'} ${t.symbol || t.mint.slice(0, 8)} while our buy was in flight — ` +
-      (flight.submitted ? 'exit queued for the moment it opens' : 'buy abandoned as stale'),
+      (unsent ? 'buy abandoned as stale' : 'exit queued for the moment it opens'),
   );
   return true;
 }
@@ -2205,18 +2509,28 @@ export function resumePendingExits(now = Date.now()): { fired: number; expired: 
  * balance is not "zero" and says nothing. Bounded, because the balance read
  * is one of the scarcest public RPC methods.
  */
-export async function checkLeadersAfterBoot(max = 12): Promise<{ checked: number; gone: number }> {
+export async function checkLeadersAfterBoot(
+  max = 12,
+  /** A long sleep instead of a boot: sells older than the watcher's catch-up
+   *  window are gone the same way. Only copies bought before `before` count. */
+  away?: { text: string; before: number },
+): Promise<{ checked: number; gone: number }> {
+  const when = away?.text ?? 'while the app was closed';
   const h = host;
   const out = { checked: 0, gone: 0 };
   if (!h?.leaderHolding) return out;
   const asked = new Set<string>();
-  for (const c of [...configs]) {
+  // Live copies first: paper rows must not use up the allowance.
+  for (const pass of ['live', 'paper'] as const) for (const c of [...configs]) {
     // Reverse and FOMO positions are not closed by the leader selling.
     if (isFomo(c) || directionOf(c) !== 'copy' || !c.copySells) continue;
-    for (const r of trades.filter((x) => x.configId === c.id && x.state === 'open' && x.kind !== 'exit' && resumedRow(x))) {
+    for (const r of trades.filter((x) => x.configId === c.id && x.state === 'open' && x.kind !== 'exit' && x.mode === pass && (away ? x.at < away.before : resumedRow(x)))) {
       const key = flightKey(c.id, r.mint);
-      if (asked.has(key)) continue;
-      if (out.checked >= max) return out;
+      if (asked.has(key) || leaderLeftNoted.has(key)) continue;
+      if (out.checked >= max) {
+        h.log('warn', `copy: checked ${max} open copies ${away ? 'after the sleep' : 'after the restart'}; the rest were not checked, so a wallet that left one of those will not be noted`);
+        return out;
+      }
       asked.add(key);
       out.checked += 1;
       let held: number | null = null;
@@ -2231,6 +2545,7 @@ export async function checkLeadersAfterBoot(max = 12): Promise<{ checked: number
       const open = trades.filter((x) => x.configId === c.id && x.mint === r.mint && x.state === 'open' && x.kind !== 'exit');
       if (!open.length) continue;
       out.gone += 1;
+      leaderLeftNoted.add(key);
       const who = c.label || c.wallet.slice(0, 6);
       const what = r.symbol || r.mint.slice(0, 8);
       const live = open.some((x) => x.mode === 'live');
@@ -2240,12 +2555,12 @@ export async function checkLeadersAfterBoot(max = 12): Promise<{ checked: number
           open[0],
           { chain: chainOf(c), wallet: c.wallet, mint: r.mint, symbol: r.symbol, isBuy: false, sol: 0, priceSol: 0, at: now },
           100,
-          `not executed — ${who} no longer holds this. They sold or moved it while the app was closed, and when is unknown, so nothing was sold. ` +
+          `not executed — ${who} no longer holds this. They sold or moved it ${when}, and when is unknown, so nothing was sold. ` +
             `You still hold it${live ? '' : ' on paper'}.`,
         ),
       );
-      h.log('warn', `copy: ${who} left ${what} while the app was closed — the copy is still open`);
-      if (live) alertUser(`${what}: not sold`, 'The wallet you follow sold it while the app was closed. You still hold it — sell by hand if you want out.');
+      h.log('warn', `copy: ${who} left ${what} ${when} — the copy is still open`);
+      if (live) alertUser(`${what}: not sold`, `The wallet you follow sold it ${when}. You still hold it — sell by hand if you want out.`);
     }
   }
   return out;
@@ -2408,6 +2723,17 @@ async function noteBuyQuantity(c: CopyConfig, rowId: string, res: CopyExecResult
   if (!row) return;
   let touched = false;
 
+  // The chain shows tokens arrived, so the route works, however late the
+  // confirmation was. Settings says a copy that lands starts the count again.
+  const landed = read ? rawOf(read.raw) : null;
+  if (landed !== null && landed > 0n) {
+    clearStreaks(c.id);
+    if (c.rearmTries) {
+      c.rearmTries = 0;
+      touched = true;
+    }
+  }
+
   const raw = got ? rawOf(got.raw) : null;
   if (raw !== null && raw > 0n && !row.tokensRaw) {
     row.tokensRaw = raw.toString();
@@ -2465,6 +2791,10 @@ async function noteBuyQuantity(c: CopyConfig, rowId: string, res: CopyExecResult
 
 /** What one mirrored sell means to do, in base units. */
 interface ExitPlan {
+  /** Everything left in the wallet is tracked for another follow. */
+  othersOnly?: boolean;
+  /** A held sell that must not go now: 'wait' tries again later, 'quantity' never. */
+  refuse?: 'wait' | 'quantity';
   /** Base units to sell; null when the copy's quantity is not tracked, 0n
    *  when their trim is smaller than one base unit of our position. */
   wantRaw: bigint | null;
@@ -2566,7 +2896,49 @@ const quantityReads = new Map<string, Promise<void>>();
 /** How long an exit waits for its buy's fill read before sizing without it. */
 const QUANTITY_WAIT_MS = 8_000;
 
-async function planExit(c: CopyConfig, rows: CopyTrade[], mint: string, fraction: number, h: CopyHost, waited = false): Promise<ExitPlan> {
+/** What the wallet holds of this coin besides the copies a held sell is owed from:
+ *  other follows' bags, and this follow's own later buys. */
+interface OthersHold {
+  raw: bigint;
+  /** Any other follow holds this coin here at all. */
+  any: boolean;
+  /** One of them holds a quantity nobody knows. */
+  unknown: boolean;
+  /** That quantity is being read right now. */
+  reading: boolean;
+}
+function heldBesides(c: CopyConfig, mint: string, owed: CopyTrade[]): OthersHold {
+  const out: OthersHold = { raw: 0n, any: false, unknown: false, reading: false };
+  const ids = new Set(owed.map((r) => r.id));
+  for (const r of trades) {
+    if (ids.has(r.id) || r.mint !== mint || r.state !== 'open' || r.kind === 'exit' || r.mode !== 'live') continue;
+    const other = configs.find((x) => x.id === r.configId);
+    if (!other || chainOf(other) !== chainOf(c) || !sameSigner(other, c)) continue;
+    out.any = true;
+    const left = rawOf(r.tokensLeftRaw);
+    if (left !== null) out.raw += left;
+    else {
+      out.unknown = true;
+      if (quantityReads.has(r.id)) out.reading = true;
+    }
+  }
+  return out;
+}
+
+/** Might these two follows sign with one wallet? "The active wallet" and that wallet
+ *  picked by name are the same one, and an address nobody can read is not known to
+ *  be a different one: the cost of wrongly saying yes is a sell handed to the person. */
+function sameSigner(a: CopyConfig, b: CopyConfig): boolean {
+  if ((a.walletId ?? null) === (b.walletId ?? null)) return true;
+  const sa = signerOf(a);
+  const sb = signerOf(b);
+  return sa === null || sb === null || sa === sb;
+}
+function signerOf(c: CopyConfig): string | null {
+  return host?.signerOf?.(c.walletId ?? null, chainOf(c)) ?? null;
+}
+
+async function planExit(c: CopyConfig, rows: CopyTrade[], mint: string, fraction: number, h: CopyHost, waited = false, others: OthersHold | null = null): Promise<ExitPlan> {
   if (waited) {
     // Second pass: never wait twice.
     for (const x of rows) quantityReads.delete(x.id);
@@ -2601,7 +2973,19 @@ async function planExit(c: CopyConfig, rows: CopyTrade[], mint: string, fraction
     // it (bounded) sizes this exit from our own tokens instead.
     const waits = rows.map((x) => quantityReads.get(x.id)).filter((p): p is Promise<void> => !!p);
     await Promise.race([Promise.all(waits), new Promise((r) => setTimeout(r, QUANTITY_WAIT_MS))]);
-    return planExit(c, rows, mint, fraction, h, true);
+    return planExit(c, rows, mint, fraction, h, true, others);
+  }
+  // A held sell never guesses in a wallet that holds another follow's tokens:
+  // the fallback below is a share of the WHOLE token account.
+  if (others?.any && (!complete || tracked <= 0n || (others.unknown && !others.reading))) {
+    plan.before.clear();
+    plan.refuse = 'quantity';
+    return plan;
+  }
+  if (others?.reading) {
+    plan.before.clear();
+    plan.refuse = 'wait';
+    return plan;
   }
   if (!complete || tracked <= 0n) {
     plan.before.clear();
@@ -2626,6 +3010,15 @@ async function planExit(c: CopyConfig, rows: CopyTrade[], mint: string, fraction
     // The chain is the ceiling. Our book can only ever be stale high — a
     // hand sell, a stop-loss rung, another config's mirror.
     if (want > bal.raw) want = bal.raw;
+    const reserved = others?.raw ?? 0n;
+    const free = bal.raw > reserved ? bal.raw - reserved : 0n;
+    if (want > free) want = free;
+    if (want <= 0n && reserved > 0n) {
+      plan.before.clear();
+      plan.wantRaw = 0n;
+      plan.othersOnly = true;
+      return plan;
+    }
     if (bal.raw > 0n) {
       // Percent × 100, rounded UP: the last basis point is worth overshooting
       // for, because the failure being fixed here is systematically selling
@@ -2633,6 +3026,11 @@ async function planExit(c: CopyConfig, rows: CopyTrade[], mint: string, fraction
       const bps = want >= bal.raw ? 10_000n : (want * 10_000n + bal.raw - 1n) / bal.raw;
       plan.pct = Math.max(0.01, Math.min(100, Number(bps) / 100));
     }
+  } else if (others?.any) {
+    // "All of it" with no balance to size against would be all of theirs too.
+    plan.before.clear();
+    plan.refuse = 'wait';
+    return plan;
   }
 
   plan.wantRaw = want;
@@ -2932,13 +3330,13 @@ function withdrawnReason(c: CopyConfig, base: CopyTrade): string | null {
   const realized = todayFor(c)
     .filter((t) => t.state === 'closed')
     .reduce((a, t) => a + (t.pnlSol ?? t.estPnlSol ?? 0), 0);
-  if (realized <= -c.dailyLossLimitSol) {
+  if (dailyLossHit(c, realized)) {
     noteDailyStop(c, realized);
     return `limit: down ${Math.abs(realized).toFixed(3)} SOL today`;
   }
   const stopped = walletStopHit(c);
   if (stopped) {
-    autoPause(c, stopped);
+    autoPause(c, stopped, 'stop');
     return `paused — ${stopped}`;
   }
   return null;
@@ -2977,7 +3375,8 @@ function walletPctFor(c: CopyConfig, open: CopyTrade[], mint: string, fraction: 
  * the leader has fully exited, the copier tries once more for the measured
  * remainder and then stops: an unbounded retry against a token that cannot
  * be sold burns fees forever, and a leftover the user can see beats a loop
- * they cannot.
+ * they cannot. What is still owed after this is retried slowly and on the
+ * record, until it sells (`holdSellRetry`).
  */
 const EXIT_MAX_ATTEMPTS = 2;
 
@@ -3026,8 +3425,33 @@ async function mirrorSell(
     // fraction; one that has is only ever chasing the remainder the last one
     // left behind, which is all of what is still tracked.
     const askFor = out.traded ? 1 : fraction;
-    const plan = await planExit(c, rows, t.mint, askFor, h);
+    // A retry may be chasing a sell that already landed unseen, and then the
+    // wallet's balance is someone else's. The balance alone cannot tell.
+    const plan = await planExit(c, rows, t.mint, askFor, h, false, isHeldSell(t) ? heldBesides(c, t.mint, rows) : null);
+    if (plan.refuse === 'wait') {
+      // A held sell's clock has already moved on: it comes back by itself.
+      h.log('info', `copy: the held ${what} sell waits — the tokens in this wallet could not be told apart right now`);
+      noteHeldWaiting(t);
+      break;
+    }
+    if (plan.refuse === 'quantity') {
+      endHeldSell(t, 'not retried — how many tokens this copy or another follow holds of this coin is not known, and they share this wallet, so a sell could take the wrong ones. You still hold it; sell by hand if you want out.', true);
+      alertUser('Check your wallet', `${what}: the failed sell was not tried again, because another follow holds this coin in the same wallet and the amounts are not known.`);
+      break;
+    }
     if (plan.wantRaw !== null && plan.wantRaw <= 0n) {
+      if (isHeldSell(t)) {
+        if (plan.othersOnly) {
+          endHeldSell(t, 'not retried — what is left of this coin in the wallet belongs to another follow, so this sell may already have landed. Check your wallet and sell by hand if you want out.', true);
+          alertUser('Check your wallet', `${what}: what is left belongs to another follow, so the failed sell was not tried again. It may already have landed.`);
+        } else if (plan.balanceRaw === 0n) {
+          endHeldSell(t, 'not retried — this wallet holds none of this coin now, so the sell may already have landed. Check your wallet.', true);
+          alertUser('Check your wallet', `${what}: the wallet holds none of it now, so the failed sell was not tried again. It may already have landed.`);
+        } else {
+          endHeldSell(t, 'not retried — what is left is less than one token');
+        }
+        break;
+      }
       if (attempt === 0) {
         out.slices.push(
           exitSkipped(rows[0], t, leaderPct, `not executed — ${who} sold ${leaderPct}% of their bag, which is less than one token of ours`),
@@ -3073,26 +3497,40 @@ async function mirrorSell(
       }
       // The coin is between its curve and its pool: the sell waits for the
       // pool instead of being dropped (waitForMigration).
-      if (!out.traded && curveMigrating(res.message)) {
-        const waiting = waitForMigration(c, t, rows[0], fraction, leaderPct, h);
+      // A retry already on the clock stays there: two holds would each sell a share.
+      if (!out.traded && !sellRetryOf.has(t) && curveMigrating(res.message)) {
+        const waiting = waitForMigration(c, t, rows, fraction, leaderPct, h);
         if (waiting) out.slices.push(waiting);
+        break;
+      }
+      // A held migration sell that failed some other way is still that one
+      // hold, now an ordinary failed sell. A second would sell the share again.
+      if (!out.traded && migrationRetries.has(t)) {
+        h.log('warn', `copy: the ${what} sell held for its pool failed: ${res.message}`);
+        waitFailedOtherwise(t, res);
         break;
       }
       // Nothing sold yet means the whole exit failed. Otherwise this was a
       // top-up that did not land, and the slice from the first pass is
       // already real — the row stays open for the remainder and says so.
       if (!out.traded) {
-        out.slices.push(exitSkipped(rows[0], t, leaderPct, res.message.slice(0, 160)));
         h.log('warn', `copy sell FAILED (${who} sold ${leaderPct}% of ${what}): ${res.message}`);
-        alertUser('Copy sell failed', `${leaderPct}% of ${what}: ${res.message}. You still hold it.`);
+        const row = holdSellRetry(c, t, rows, fraction, leaderPct, res, h, true);
+        if (row) out.slices.push(row);
       } else {
         h.log('warn', `copy: top-up sell for the ${what} remainder failed: ${res.message}`);
+        // The leader is fully out and part of the bag is not.
+        if (fraction >= 1) {
+          const row = holdSellRetry(c, t, rows, 1, leaderPct, res, h, false);
+          if (row) out.slices.push(row);
+        }
       }
       break;
     }
 
     out.traded = true;
     migrationLanded(t);
+    sellRetryLanded(t, h);
     out.signature = res.signature ?? out.signature;
     const seen = { sol: null as number | null, raw: null as bigint | null };
     const settled = await settleExit(c, rows, t.mint, plan, res, h, seen);
@@ -3130,8 +3568,10 @@ async function mirrorSell(
       h.toast(
         'warn',
         `Copy sell came back short — ${fmtTokens(left, stillOpen[0].tokenDecimals)} ${what} are still in your wallet. ` +
-          `The copy stays open for them; sell by hand if you want out now.`,
+          `The copy stays open for them and the rest is tried again; sell by hand if you want out now.`,
       );
+      const row = holdSellRetry(c, t, stillOpen, 1, leaderPct, { ok: false, message: 'the sell came back short' }, h, false);
+      if (row) out.slices.push(row);
     }
   }
 
@@ -3156,6 +3596,14 @@ interface MigrationWait {
   /** The "waiting" row, withdrawn once the sell lands. */
   rowId: string;
   inFlight: boolean;
+  /** When the try now in flight started. */
+  triedAt?: number;
+  /** The copies this is owed from: not a re-buy made after the leader sold. */
+  rowIds: string[];
+  /** The address it was owed from. Null when the host cannot say. */
+  signer: string | null;
+  /** Rules the AI has already answered about during this hold. */
+  aiAsked?: ExitRule[];
 }
 /** flightKey(config, mint) → the sell waiting on that coin's pool. */
 const migrationWaits = new Map<string, MigrationWait>();
@@ -3165,7 +3613,8 @@ const migrationRetries = new WeakMap<WalletTrade, string>();
  *  choice, not the leader's, so the follow's minimum-sell rule does not apply. */
 const aiSized = new WeakSet<WalletTrade>();
 
-function waitForMigration(c: CopyConfig, t: WalletTrade, row: CopyTrade, fraction: number, leaderPct: number, h: CopyHost): CopyTrade | null {
+function waitForMigration(c: CopyConfig, t: WalletTrade, rows: CopyTrade[], fraction: number, leaderPct: number, h: CopyHost): CopyTrade | null {
+  const row = rows[0];
   const key = flightKey(c.id, t.mint);
   const what = t.symbol || t.mint.slice(0, 8);
   const now = Date.now();
@@ -3177,9 +3626,9 @@ function waitForMigration(c: CopyConfig, t: WalletTrade, row: CopyTrade, fractio
   if (w) {
     // The leader sold again while the first sell waits: both shares are
     // owed, out of what we hold.
-    w.fraction = 1 - (1 - w.fraction) * (1 - fraction);
+    const left = joinShare(w, fraction, rows.map((x) => x.id));
     h.log('info', `copy: another ${what} sell joins the one waiting for its PumpSwap pool (${Math.round(w.fraction * 100)}% of the bag in all)`);
-    return null;
+    return shareLeftOut(rows, left, t, leaderPct);
   }
   const waiting = exitSkipped(
     row,
@@ -3187,7 +3636,7 @@ function waitForMigration(c: CopyConfig, t: WalletTrade, row: CopyTrade, fractio
     leaderPct,
     `waiting — ${what} is moving from pump’s curve to PumpSwap, and nothing can trade until it lands. The sell is tried again every ${MIGRATION_RETRY_MS / 1000} s for up to ${MIGRATION_WAIT_MAX_MS / 60_000} minutes.`,
   );
-  migrationWaits.set(key, { configId: c.id, mint: t.mint, symbol: what, fraction, firstAt: now, nextAt: now + MIGRATION_RETRY_MS, rowId: waiting.id, inFlight: false });
+  migrationWaits.set(key, { configId: c.id, mint: t.mint, symbol: what, fraction, firstAt: now, nextAt: now + MIGRATION_RETRY_MS, rowId: waiting.id, inFlight: false, rowIds: rows.map((x) => x.id), signer: signerOf(c) });
   h.log('warn', `copy: ${what} is migrating to PumpSwap — ${leaderPct}% sell held for the pool`);
   h.toast('info', `${what} is moving to PumpSwap — your copy sell will go through when it lands`);
   return waiting;
@@ -3209,26 +3658,245 @@ function settleMigrationWait(w: MigrationWait, reason: string): void {
   host?.changed();
 }
 
+/** A held exit of either kind. */
+function isHeldSell(t: WalletTrade): boolean {
+  return sellRetryOf.has(t) || migrationRetries.has(t);
+}
+
+/** What a held exit is still owed, or null if it ended while it queued. */
+function heldSellOf(t: WalletTrade): SellRetry | MigrationWait | null {
+  const retry = sellRetryOf.get(t);
+  if (retry !== undefined) return sellRetries.get(retry) ?? null;
+  const wait = migrationRetries.get(t);
+  if (wait !== undefined) return migrationWaits.get(wait) ?? null;
+  return null;
+}
+
+/**
+ * Another exit's share joins a hold. A hold has one share of all its copies, so a
+ * full exit can take in copies opened since, and a partial one cannot: 30 % of a
+ * re-buy on top of all of an older copy is not 100 % of both. Those copies are
+ * left out, and the caller says so. Returns them.
+ */
+function joinShare(w: { fraction: number; rowIds: string[] }, fraction: number, rowIds: string[]): string[] {
+  const fresh = rowIds.filter((id) => !w.rowIds.includes(id));
+  w.fraction = 1 - (1 - w.fraction) * (1 - fraction);
+  if (fraction >= 1) {
+    w.rowIds = [...w.rowIds, ...fresh];
+    return [];
+  }
+  return fresh;
+}
+
+/** A share of a later copy that a held sell does not cover: on the record, out loud. */
+function shareLeftOut(rows: CopyTrade[], left: string[], t: WalletTrade, pct: number): CopyTrade | null {
+  const row = rows.find((x) => left.includes(x.id));
+  if (!row) return null;
+  const what = t.symbol || t.mint.slice(0, 8);
+  alertUser('Check your wallet', `${what}: an older sell is still being retried and covers only the earlier copy, so ${pct}% of the later one was not sold. Sell by hand if you want out.`);
+  return exitSkipped(row, t, pct, 'not executed — an older sell of this coin is still being retried and covers only the earlier copy. This one is still held; sell by hand if you want out.');
+}
+
+/** The row says a sell is waiting, not that one is about to go at a time long past. */
+function noteHeldWaiting(t: WalletTrade): void {
+  const key = sellRetryOf.get(t);
+  const w = key === undefined ? undefined : sellRetries.get(key);
+  if (!w) return;
+  setSellRetryRow(w, `waiting — the tokens in this wallet could not be told apart just now. Checking again at ${rearmClock(w.nextAt)}. You still hold it.`);
+}
+
+/**
+ * An exit that arrived while a sell of this coin is held.
+ *
+ * A follow's own exit (max hold, a stop, the AI) joins it: a rule that fires again
+ * every tick would otherwise send every tick, past the backoff. Any exit joins while
+ * the last send's fate is unknown, because sending now could sell what that send
+ * already sold. A leader's sell with nothing unknown goes straight out.
+ */
+function joinHeldSell(c: CopyConfig, t: WalletTrade, fraction: number, rows: CopyTrade[], h: CopyHost): boolean {
+  const key = flightKey(c.id, t.mint);
+  const retry = sellRetries.get(key);
+  const w = retry ?? migrationWaits.get(key);
+  if (!w) return false;
+  const own = !!t.note || aiSized.has(t);
+  if (!own && !retry?.pendingSig) return false;
+  const before = w.fraction;
+  const left = joinShare(w, fraction, rows.map((x) => x.id));
+  const leftRow = shareLeftOut(rows, left, t, Math.max(1, Math.min(100, Math.round(fraction * 100))));
+  if (leftRow) record(leftRow);
+  if (w.fraction > before + 1e-9) {
+    // More is owed than the sleeping retry knew: it need not wait out its backoff.
+    if (!retry?.pendingSig) w.nextAt = Math.min(w.nextAt, Date.now());
+    h.log('info', `copy: this ${t.symbol || t.mint.slice(0, 8)} exit joins the sell already held (${Math.round(w.fraction * 100)}% of the bag in all)`);
+  }
+  persist();
+  return true;
+}
+
+function endHeldSell(t: WalletTrade, reason: string, giveBack = false): void {
+  const held = heldSellOf(t);
+  const said = giveBack ? handBack(held?.rowIds ?? [], reason) : reason;
+  const key = migrationRetries.get(t);
+  const w = key === undefined ? undefined : migrationWaits.get(key);
+  if (key !== undefined && w) {
+    migrationWaits.delete(key);
+    settleMigrationWait(w, said);
+    return;
+  }
+  endSellRetry(t, said);
+}
+
+/** These copies are the person's to deal with now: a rule firing again would sell
+ *  whatever the wallet holds, which may be someone else's. Returns the row's words. */
+function handBack(rowIds: string[], reason: string): string {
+  for (const r of trades) if (rowIds.includes(r.id)) r.handedBack = true;
+  return `${reason} Automatic exits are off for this copy now.`;
+}
+
+/** The unconfirmed send did land: book it, or the rows stay open and sell again.
+ *  Only the copies and the share it was for. True when the hold still owes more,
+ *  and then it is left saying what. */
+function settleLanded(c: CopyConfig, w: SellRetry, signature: string): boolean {
+  const now = Date.now();
+  const share = w.pendingFraction ?? 1;
+  const t: WalletTrade = { chain: chainOf(c), wallet: c.wallet, mint: w.mint, symbol: w.symbol, isBuy: false, sol: 0, priceSol: 0, at: now, tradeAt: now, soldFraction: share, note: 'the unconfirmed sell landed' };
+  const spot = host?.priceSol(w.mint, chainOf(c)) ?? null;
+  const mark = spot !== null && Number.isFinite(spot) && spot > 0 ? spot : null;
+  const sent = w.pendingRowIds ?? w.rowIds;
+  const rows = heldRows(c, { mint: w.mint, rowIds: sent });
+  const slices = rows.map((x) => applyExit(x, share, mark, t, signature, { leaderFraction: share, settled: null }));
+  for (const x of rows) {
+    if (share >= 1) {
+      x.tokensLeftRaw = '0';
+      x.leftoverRaw = null;
+    } else {
+      const left = rawOf(x.tokensLeftRaw);
+      if (left !== null) x.tokensLeftRaw = (left - (left * BigInt(Math.round(share * 1_000_000))) / 1_000_000n).toString();
+    }
+  }
+  // What joined this hold after that send is still owed: other copies, or a further
+  // share of these, which is a larger share of what the landed send left behind.
+  const rest = w.rowIds.filter((id) => !sent.includes(id));
+  const further = share < 1 ? 1 - (1 - w.fraction) / (1 - share) : 0;
+  const owed = share < 1 ? further > 1e-6 : rest.length > 0;
+  if (owed) {
+    if (share < 1) w.fraction = further;
+    else w.rowIds = rest;
+  } else {
+    trades = trades.filter((x) => x.id !== w.rowId);
+  }
+  trades.unshift(...slices);
+  trimTrades();
+  const ids = slices.filter((s) => s.pnlBasis === 'pending').map((s) => s.id);
+  if (ids.length) void awaitLiveExitPrice(c, signature, ids);
+  persist();
+  host?.changed();
+  return owed;
+}
+
+/** The copies a held sell is owed from. A re-buy after the leader sold is not one. */
+function heldRows(c: CopyConfig, w: { mint: string; rowIds: string[] }): CopyTrade[] {
+  return trades.filter((r) => r.configId === c.id && r.mint === w.mint && r.state === 'open' && r.kind !== 'exit' && r.mode === 'live' && w.rowIds.includes(r.id) && !r.handedBack);
+}
+
+/** Why a hold has nothing left to sell, when the reason is that its copy is the person's now. */
+function handedReason(w: { rowIds: string[] }): string | null {
+  return trades.some((r) => r.handedBack && w.rowIds.includes(r.id)) ? 'not retried — this copy was handed to you after a sell that may have landed. Check your wallet and sell by hand if you want out.' : null;
+}
+
+/** The wallet this follow signs with is not the one the sell was owed from. */
+function signerMoved(c: CopyConfig, w: { signer: string | null }): boolean {
+  const now = signerOf(c);
+  return w.signer !== null && now !== null && now !== w.signer;
+}
+
+/**
+ * A held migration sell moves to the slower retry: the coin is taking too long,
+ * or the sell failed some other way. One share, one hold. A sell that went out
+ * unconfirmed may land, and a share of it is not sent again.
+ */
+function waitToRetry(key: string, w: MigrationWait, now: number, reason: (wait: number) => string, res?: CopyExecResult): void {
+  migrationWaits.delete(key);
+  const pending = res?.pending === true;
+  const wait = pending ? SELL_RETRY_PENDING_MS : sellRetryWaitMs(0);
+  const pendingSig = pending ? res?.signature : undefined;
+  const other = sellRetries.get(key);
+  if (other) {
+    const left = joinShare(other, w.fraction, w.rowIds);
+    if (left.length) alertUser('Check your wallet', `${w.symbol}: an older sell is still being retried and covers only the earlier copy, so part of a later one was not sold. Sell by hand if you want out.`);
+    if (pending) {
+      other.pendingSig = pendingSig;
+      other.pendingRowIds = w.rowIds;
+      other.pendingFraction = w.fraction;
+      other.nextAt = Math.max(other.nextAt, now + wait);
+    }
+    settleMigrationWait(w, `${reason(other.nextAt)} It joined the sell already being retried. You still hold it.`);
+    return;
+  }
+  sellRetries.set(key, { configId: w.configId, mint: w.mint, symbol: w.symbol, fraction: w.fraction, firstAt: now, nextAt: now + wait, tries: 0, rowId: w.rowId, inFlight: false, rowIds: w.rowIds, signer: w.signer, pendingSig, pendingRowIds: pending ? w.rowIds : undefined, pendingFraction: pending ? w.fraction : undefined });
+  settleMigrationWait(w, `${reason(now + wait)} You still hold it.`);
+}
+
+/** A held migration sell failed, and not because of the migration. */
+function waitFailedOtherwise(t: WalletTrade, res: CopyExecResult): void {
+  const key = migrationRetries.get(t);
+  const w = key === undefined ? undefined : migrationWaits.get(key);
+  if (key === undefined || !w) return;
+  const message = res.message.slice(0, 160);
+  waitToRetry(key, w, Date.now(), (at) => (res.pending === true ? `${message} — checking at ${rearmClock(at)} whether it landed, and trying again if it did not.` : `${message} — trying again at ${rearmClock(at)}, until it sells.`), res);
+  alertUser('Copy sell failed', `${w.symbol}: ${res.message}. It tries again by itself until it sells.`);
+}
+
 /** On the 15 s clock: try each held sell again, or give it up. */
 function retryMigrationWaits(now: number): void {
   for (const [key, w] of migrationWaits) {
-    if (w.inFlight || now < w.nextAt) continue;
-    const c = configs.find((x) => x.id === w.configId);
-    const open = c ? trades.filter((r) => r.configId === c.id && r.mint === w.mint && r.state === 'open' && r.kind !== 'exit' && r.mode === 'live') : [];
-    if (!c || !open.length) {
-      migrationWaits.delete(key);
-      settleMigrationWait(w, 'not executed — the copy was closed before the coin finished moving to PumpSwap');
+    if (w.inFlight) {
+      if (sendHung(w, now)) {
+        migrationWaits.delete(key);
+        settleMigrationWait(w, handBack(w.rowIds, HUNG_REASON));
+      }
       continue;
     }
-    if (now - w.firstAt >= MIGRATION_WAIT_MAX_MS) {
+    const c = configs.find((x) => x.id === w.configId);
+    if (!c || !heldRows(c, w).length) {
       migrationWaits.delete(key);
+      settleMigrationWait(w, handedReason(w) ?? 'not executed — the copy was closed before the coin finished moving to PumpSwap');
+      continue;
+    }
+    if (c.mode !== 'live') {
+      migrationWaits.delete(key);
+      settleMigrationWait(w, 'not executed — this follow is on paper now, and the live position is still held');
+      continue;
+    }
+    if (signerMoved(c, w)) {
+      migrationWaits.delete(key);
+      settleMigrationWait(w, handBack(w.rowIds, MOVED_REASON));
+      alertUser('Check your wallet', `${w.symbol}: this follow signs with another wallet now, so the held sell was not sent. It is still in the wallet it was bought with.`);
+      continue;
+    }
+    // The person's own stop always wins over an automatic exit, due or not.
+    const blocked = host ? (host.exitBlockedReason ?? host.liveBlockedReason)(chainOf(c)) : null;
+    if (blocked) {
+      migrationWaits.delete(key);
+      settleMigrationWait(w, `not executed — ${blocked}. You still hold it.`);
+      alertUser('Copy sell stopped', `${w.symbol} will not be tried again: ${blocked}. You still hold it.`);
+      continue;
+    }
+    if (now < w.nextAt) continue;
+    if (now - w.firstAt >= MIGRATION_WAIT_MAX_MS) {
+      // Not given up: the coin is slow, and the leader is still out. From here
+      // it is any other sell that has not landed, on the slower clock.
+      // A retry mid-send would lose a share joined to it when it lands.
+      if (sellRetries.get(key)?.inFlight) continue;
       const mins = Math.round(MIGRATION_WAIT_MAX_MS / 60_000);
-      settleMigrationWait(w, `not executed — still moving to PumpSwap after ${mins} minutes. You still hold it; sell by hand if you want out.`);
-      alertUser('Copy sell failed', `${w.symbol} was still moving to PumpSwap after ${mins} minutes, so the mirrored sell was not placed. You still hold it.`);
+      waitToRetry(key, w, now, (at) => `still moving to PumpSwap after ${mins} minutes — trying again at ${rearmClock(at)}, until it sells.`);
+      alertUser('Copy sell still waiting', `${w.symbol} is still moving to PumpSwap after ${mins} minutes. You still hold it. It tries again by itself until it sells.`);
       continue;
     }
     w.inFlight = true;
+    w.triedAt = now;
     w.nextAt = now + MIGRATION_RETRY_MS;
+    noteTryStarted();
     const synthetic: WalletTrade = {
       chain: chainOf(c),
       wallet: c.wallet,
@@ -3245,6 +3913,357 @@ function retryMigrationWaits(now: number): void {
     migrationRetries.set(synthetic, key);
     void queueExit(c, synthetic, 'resume').finally(() => {
       w.inFlight = false;
+      persist();
+    });
+  }
+}
+
+/** A live sell that failed and is owed. Saved, so a restart does not forget it
+ *  (`restoreRetries`). */
+interface SellRetry {
+  configId: string;
+  mint: string;
+  symbol: string;
+  /** Share of what this copy holds still to sell. */
+  fraction: number;
+  firstAt: number;
+  nextAt: number;
+  tries: number;
+  /** The row on the record that says what is happening. */
+  rowId: string;
+  inFlight: boolean;
+  /** Came back from disk and has not been tried since. Live is normally off
+   *  after a restart, which is not the person's stop on this sell: it waits for
+   *  Live instead of ending. The first try makes it an ordinary retry again. */
+  restored?: boolean;
+  /** The row already says what it is waiting for. */
+  waitNoted?: boolean;
+  /** The send that came back unconfirmed: asked about before another goes. */
+  pendingSig?: string;
+  /** The copies that send was for. Copies that joined later are still owed. */
+  pendingRowIds?: string[];
+  /** The share of them it was for. */
+  pendingFraction?: number;
+  /** Rules the AI has already answered about during this hold. */
+  aiAsked?: ExitRule[];
+  /** When the try now in flight started. */
+  triedAt?: number;
+  /** When the ledger was first found still reading it. Not saved. */
+  readingSince?: number;
+  /** The copies this is owed from: not a re-buy made after the leader sold. */
+  rowIds: string[];
+  /** The address it was owed from. Null when the host cannot say. */
+  signer: string | null;
+}
+const sellRetries = new Map<string, SellRetry>();
+const MOVED_REASON = 'not retried — this follow signs with another wallet now, and these tokens are in the wallet it was bought with. Sell them from that wallet if you want out.';
+/** How long a sell waits to hear whether its unconfirmed send landed. A blockhash
+ *  is long dead by then, and the ledger may only be read when a page asks it to. */
+const PENDING_READ_MAX_MS = 15 * 60_000;
+/** A try that never came back still has to end, or this hold waits on it forever.
+ *  It may have landed, so the copy is the person's from then on. */
+const HUNG_REASON = 'not executed — a sell started an hour ago and never came back. It may have landed. Check your wallet and sell by hand if you want out.';
+function sendHung(w: { triedAt?: number; symbol: string }, now: number): boolean {
+  if (w.triedAt === undefined || now - w.triedAt < SELL_SEND_HUNG_MS) return false;
+  alertImportant('Check your wallet', `A sell of ${w.symbol} started an hour ago and never came back. It is not tried again.`);
+  return true;
+}
+/** Said once, on the first clock tick with a host to say it through. */
+let restoredNotice: { owed: number; doubts: string[] } | null = null;
+
+/**
+ * Sells that were owed when the app closed.
+ *
+ * One that was going out when the app stopped may have landed with nothing
+ * written down. A fresh balance does not settle that: selling a share again
+ * could sell it twice, and a "full" sell of a wallet that also holds another
+ * follow's bag or a hand-bought one would sell those. So it is handed to the
+ * person. `noteTryStarted` writes the marker to disk before each send.
+ */
+function restoreRetries(lists: unknown[], now: number): void {
+  let owed = 0;
+  const doubts: string[] = [];
+  for (const list of lists) {
+    for (const raw of Array.isArray(list) ? (list as Array<SellRetry & { key?: unknown }>) : []) {
+      if (!raw || typeof raw !== 'object') continue;
+      const { key, fraction, firstAt, rowId } = raw;
+      if (typeof key !== 'string' || typeof raw.mint !== 'string' || typeof raw.configId !== 'string' || typeof rowId !== 'string') continue;
+      if (typeof fraction !== 'number' || !(fraction > 0) || fraction > 1 || typeof firstAt !== 'number') continue;
+      const symbol = typeof raw.symbol === 'string' ? raw.symbol : raw.mint.slice(0, 8);
+      if (raw.inFlight === true) {
+        const row = trades.find((x) => x.id === rowId);
+        const said = handBack(Array.isArray(raw.rowIds) ? raw.rowIds : [], 'not retried — a sell was going out when the app closed. It may have landed, and another could sell more than this copy holds. Check your wallet and sell by hand if you want out.');
+        if (row) row.reason = said;
+        doubts.push(symbol);
+        continue;
+      }
+      const rowIds = Array.isArray(raw.rowIds) ? raw.rowIds.filter((x): x is string => typeof x === 'string') : [];
+      const same = sellRetries.get(key);
+      if (same) {
+        same.fraction = 1 - (1 - same.fraction) * (1 - fraction);
+        same.rowIds = [...new Set([...same.rowIds, ...rowIds])];
+        const row = trades.find((x) => x.id === rowId);
+        if (row) row.reason = 'joined the sell already being retried. You still hold it.';
+        continue;
+      }
+      sellRetries.set(key, {
+        configId: raw.configId,
+        mint: raw.mint,
+        symbol,
+        fraction,
+        firstAt,
+        nextAt: typeof raw.nextAt === 'number' ? raw.nextAt : now,
+        pendingSig: typeof raw.pendingSig === 'string' ? raw.pendingSig : undefined,
+        pendingRowIds: Array.isArray(raw.pendingRowIds) ? raw.pendingRowIds.filter((x): x is string => typeof x === 'string') : undefined,
+        pendingFraction: typeof raw.pendingFraction === 'number' ? raw.pendingFraction : undefined,
+        rowIds,
+        signer: typeof raw.signer === 'string' ? raw.signer : null,
+        tries: typeof raw.tries === 'number' ? raw.tries : 0,
+        rowId,
+        inFlight: false,
+        restored: true,
+      });
+      owed += 1;
+    }
+  }
+  if (owed > 0 || doubts.length > 0) restoredNotice = { owed, doubts };
+}
+
+/** A held sell is about to go out. Its marker is on disk before it does. */
+function noteTryStarted(): void {
+  persist();
+  flushSync();
+}
+/** A retry's synthetic exit → its key. */
+const sellRetryOf = new WeakMap<WalletTrade, string>();
+
+function setSellRetryRow(w: SellRetry, reason: string): void {
+  const row = trades.find((x) => x.id === w.rowId);
+  if (row) row.reason = reason;
+  persist();
+  host?.changed();
+}
+
+/**
+ * A sell failed: put it on the clock. Returns the row to record, when this is
+ * the first anyone has heard of it.
+ *
+ * A send that went out and is not confirmed may still land, so the next try first
+ * asks whether it did. If it did, it is booked. If it did not, the sell goes again.
+ * If nobody can say, a sell of everything goes again and never takes what another
+ * follow holds; a SHARE could be sold twice, so that one is left to the user.
+ */
+function holdSellRetry(c: CopyConfig, t: WalletTrade, rows: CopyTrade[], fraction: number, leaderPct: number, res: CopyExecResult, h: CopyHost, tell: boolean): CopyTrade | null {
+  const row = rows[0];
+  const key = flightKey(c.id, t.mint);
+  const what = t.symbol || t.mint.slice(0, 8);
+  const message = res.message.slice(0, 160);
+  const now = Date.now();
+  const w = sellRetries.get(key);
+  const doubt = res.pending === true && fraction < 1;
+  const wait = res.pending === true ? SELL_RETRY_PENDING_MS : sellRetryWaitMs(w?.tries ?? 0);
+  if (!w && sellRetryOf.has(t) && rows.some((x) => x.handedBack)) {
+    // It took so long the copy was handed to the person, who was told it would not be tried again.
+    h.log('warn', `copy: a ${what} sell came back after it was given up on: ${message}`);
+    return null;
+  }
+  if (w && sellRetryOf.has(t)) {
+    w.nextAt = Math.max(w.nextAt, now + wait);
+    w.pendingFraction = res.pending === true ? w.fraction : undefined;
+    w.pendingSig = res.pending === true ? res.signature : undefined;
+    w.pendingRowIds = res.pending === true ? rows.map((x) => x.id) : undefined;
+    setSellRetryRow(w, res.pending === true ? `${message} — checking at ${rearmClock(w.nextAt)} whether it landed, and trying again if it did not.` : `${message} — tried ${w.tries + 1} times, next at ${rearmClock(w.nextAt)}. You still hold it.`);
+    return null;
+  }
+  if (w && !doubt) {
+    // The leader sold again while the first sell waits: both shares are owed.
+    const left = joinShare(w, fraction, rows.map((x) => x.id));
+    if (res.pending === true) {
+      // Sent, unconfirmed and maybe landing: the next try asks about this one.
+      w.pendingSig = res.signature;
+      w.pendingRowIds = rows.map((x) => x.id);
+      w.pendingFraction = fraction;
+      w.readingSince = undefined;
+      w.nextAt = Math.max(w.nextAt, now + wait);
+    }
+    h.log('info', `copy: another ${what} sell joins the one being retried (${Math.round(w.fraction * 100)}% of the bag in all)`);
+    return shareLeftOut(rows, left, t, leaderPct);
+  }
+  // A hold already on the clock tracks one unconfirmed send at a time.
+  if (doubt && w) {
+    if (tell) alertUser('Copy sell failed', `${leaderPct}% of ${what}: ${res.message}. It may still land, so it is not tried again. Check your wallet.`);
+    return exitSkipped(row, t, leaderPct, handBack(rows.map((x) => x.id), `${message}. It may still land, so it was not tried again. Check your wallet and sell by hand if you want out.`));
+  }
+  const waiting = exitSkipped(row, t, leaderPct, res.pending === true ? `${message} — checking at ${rearmClock(now + wait)} whether it landed, and trying again if it did not.` : `${message} — trying again at ${rearmClock(now + wait)}, until it sells. You still hold it.`);
+  sellRetries.set(key, { configId: c.id, mint: t.mint, symbol: what, fraction, firstAt: now, nextAt: now + wait, tries: 0, rowId: waiting.id, inFlight: false, rowIds: rows.map((x) => x.id), signer: signerOf(c), pendingSig: res.pending === true ? res.signature : undefined, pendingRowIds: res.pending === true ? rows.map((x) => x.id) : undefined, pendingFraction: res.pending === true ? fraction : undefined });
+  if (tell) alertUser('Copy sell failed', `${leaderPct}% of ${what}: ${res.message}. It tries again by itself until it sells.`);
+  return waiting;
+}
+
+/**
+ * The person stopped this hold. If its last send is unread, this copy's numbers may
+ * be wrong, and its next exit would sell a share twice or take what another follow
+ * holds: book it if it landed, or leave the copy to the person.
+ */
+function endRetry(c: CopyConfig, key: string, w: SellRetry, sure: string, unsure: string): void {
+  sellRetries.delete(key);
+  const unread = w.pendingSig !== undefined || w.pendingFraction !== undefined;
+  const landed = !unread ? false : w.pendingSig ? (host?.sendLanded?.(w.pendingSig, chainOf(c)) ?? null) : null;
+  if (landed === false) {
+    setSellRetryRow(w, sure);
+  } else if (landed === true && w.pendingSig) {
+    if (settleLanded(c, w, w.pendingSig)) setSellRetryRow(w, sure);
+  } else {
+    setSellRetryRow(w, handBack(w.pendingRowIds ?? w.rowIds, `${unsure} The last sell was sent and may have landed. Check your wallet and sell by hand if you want out.`));
+  }
+}
+
+/** The retried sell landed: the "trying again" row is no longer true. */
+function sellRetryLanded(t: WalletTrade, h: CopyHost): void {
+  const key = sellRetryOf.get(t);
+  if (key === undefined) return;
+  const w = sellRetries.get(key);
+  sellRetries.delete(key);
+  if (!w) return;
+  trades = trades.filter((x) => x.id !== w.rowId);
+  alertUser('Copy sell went through', `${w.symbol}: the sell that failed landed on try ${w.tries + 1}.`);
+  h.log('info', `copy: the ${w.symbol} sell landed after ${w.tries} retr${w.tries === 1 ? 'y' : 'ies'}`);
+}
+
+function endSellRetry(t: WalletTrade, reason: string): void {
+  const key = sellRetryOf.get(t);
+  const w = key === undefined ? undefined : sellRetries.get(key);
+  if (key === undefined || !w) return;
+  sellRetries.delete(key);
+  setSellRetryRow(w, reason);
+}
+
+/** On the 15 s clock: try each failed sell again, or end it. */
+function retryFailedSells(now: number): void {
+  if (restoredNotice && host) {
+    const { owed, doubts } = restoredNotice;
+    restoredNotice = null;
+    if (owed > 0) {
+      host.log('warn', `copy: ${owed} failed sell${owed === 1 ? '' : 's'} still owed after the restart`);
+      alertImportant('Failed sells are still owed', `${owed} copy sell${owed === 1 ? '' : 's'} had not landed when the app closed. You still hold ${owed === 1 ? 'that coin' : 'those coins'}. ${owed === 1 ? 'It tries' : 'They try'} again while Live is on.`);
+    }
+    if (doubts.length > 0) {
+      alertImportant('Check your wallet', `A sell of ${doubts.join(', ')} was going out when the app closed. It may have landed, so it is not tried again.`);
+      persist();
+    }
+  }
+  for (const [key, w] of sellRetries) {
+    if (w.inFlight) {
+      if (sendHung(w, now)) {
+        sellRetries.delete(key);
+        setSellRetryRow(w, handBack(w.rowIds, HUNG_REASON));
+      }
+      continue;
+    }
+    const c = configs.find((x) => x.id === w.configId);
+    if (!c || !heldRows(c, w).length) {
+      sellRetries.delete(key);
+      setSellRetryRow(w, handedReason(w) ?? 'not retried — the copy closed another way');
+      continue;
+    }
+    if (c.mode !== 'live') {
+      endRetry(c, key, w, 'not retried — this follow is on paper now, and the live position is still held', 'not retried — this follow is on paper now.');
+      continue;
+    }
+    if (signerMoved(c, w)) {
+      sellRetries.delete(key);
+      setSellRetryRow(w, handBack(w.rowIds, MOVED_REASON));
+      alertUser('Check your wallet', `${w.symbol}: this follow signs with another wallet now, so the failed sell was not tried again. It is still in the wallet it was bought with.`);
+      continue;
+    }
+    // The person's own stop always wins over an automatic exit.
+    const blocked = host ? (host.exitBlockedReason ?? host.liveBlockedReason)(chainOf(c)) : null;
+    if (blocked && !w.restored) {
+      endRetry(c, key, w, `not retried — ${blocked}. You still hold it.`, `not retried — ${blocked}.`);
+      alertUser('Copy sell stopped', `${w.symbol} will not be tried again: ${blocked}. Check your wallet.`);
+      continue;
+    }
+    if (blocked) {
+      if (!w.waitNoted) {
+        w.waitNoted = true;
+        setSellRetryRow(w, `waiting — the app restarted and this sell is still owed. It tries again once this clears: ${blocked}. You still hold it.`);
+      }
+      continue;
+    }
+    // Live is on, so from here a person's stop ends this like any other.
+    if (w.restored) {
+      w.restored = false;
+      w.waitNoted = false;
+      persist();
+    }
+    if (now < w.nextAt) continue;
+    // The send we could not confirm: if the chain has since said it landed,
+    // sending again could only sell something else.
+    if (w.pendingSig || w.pendingFraction !== undefined) {
+      const landed = w.pendingSig ? (host?.sendLanded?.(w.pendingSig, chainOf(c)) ?? null) : null;
+      if (landed === true && w.pendingSig) {
+        if (settleLanded(c, w, w.pendingSig)) {
+          w.pendingSig = undefined;
+          w.pendingRowIds = undefined;
+          w.pendingFraction = undefined;
+          w.readingSince = undefined;
+        } else {
+          sellRetries.delete(key);
+        }
+        alertUser('Copy sell went through', `${w.symbol}: the sell that could not be confirmed landed after all.`);
+        continue;
+      }
+      if (landed === 'reading') {
+        if (w.readingSince === undefined) {
+          w.readingSince = now;
+          setSellRetryRow(w, 'the last sell was sent but not confirmed — checking whether it landed before sending another.');
+        }
+        if (now - w.readingSince < PENDING_READ_MAX_MS) continue;
+        host?.log('warn', `copy: still no answer on the unconfirmed ${w.symbol} sell after ${PENDING_READ_MAX_MS / 60_000} minutes — trying again`);
+      }
+      // Nobody can say. Going again could sell a share twice, and this copy's numbers
+      // may be wrong, so it is the person's. All of what is left is safe to ask for: it
+      // is sized from the wallet, and keeps clear of what others hold.
+      if (landed !== false && (w.fraction < 1 || (w.pendingFraction ?? 1) < 1)) {
+        const sent = w.pendingRowIds ?? w.rowIds;
+        const rest = w.rowIds.filter((id) => !sent.includes(id));
+        setSellRetryRow(w, handBack(sent, 'not retried — the last sell was sent, and whether it landed cannot be read. Another could sell this share twice. Check your wallet and sell by hand if you want out.'));
+        alertUser('Check your wallet', `${w.symbol}: whether the last sell landed cannot be read, so it is not tried again.`);
+        if (!rest.length) {
+          sellRetries.delete(key);
+          continue;
+        }
+        // Copies that joined after that send are not in doubt, and are still owed.
+        w.rowIds = rest;
+      }
+      // Answered, or asked for long enough. A send made while this try queues sets it again.
+      w.pendingSig = undefined;
+      w.pendingRowIds = undefined;
+      w.pendingFraction = undefined;
+      w.readingSince = undefined;
+    }
+    w.inFlight = true;
+    w.triedAt = now;
+    w.tries += 1;
+    w.nextAt = now + sellRetryWaitMs(w.tries);
+    noteTryStarted();
+    const synthetic: WalletTrade = {
+      chain: chainOf(c),
+      wallet: c.wallet,
+      mint: w.mint,
+      symbol: w.symbol,
+      isBuy: false,
+      sol: 0,
+      priceSol: 0,
+      at: now,
+      tradeAt: now,
+      soldFraction: w.fraction,
+      note: 'failed sell tried again',
+    };
+    sellRetryOf.set(synthetic, key);
+    void queueExit(c, synthetic, 'resume').finally(() => {
+      w.inFlight = false;
+      persist();
     });
   }
 }
@@ -3252,11 +4271,43 @@ function retryMigrationWaits(now: number): void {
 async function closeOpen(c: CopyConfig, t: WalletTrade): Promise<void> {
   const h = host;
   if (!h) return;
-  const rows = trades.filter((x) => x.configId === c.id && x.mint === t.mint && x.state === 'open' && x.kind !== 'exit');
+  const seen = pastRows.get(t);
+  let rows = trades.filter((x) => x.configId === c.id && x.mint === t.mint && x.state === 'open' && x.kind !== 'exit');
+  if (seen) rows = rows.filter((x) => !seen.has(x.id));
+  // A held sell is what is owed NOW, not what was owed when it joined the queue:
+  // it may have ended, grown, or had a send it must first ask about join it.
+  const heldSell = isHeldSell(t);
+  if (heldSell) {
+    const held = heldSellOf(t);
+    if (!held || (sellRetryOf.has(t) && ((held as SellRetry).pendingSig || (held as SellRetry).pendingFraction !== undefined))) return;
+    if (signerMoved(c, held)) {
+      endHeldSell(t, MOVED_REASON, true);
+      alertUser('Check your wallet', `${held.symbol}: this follow signs with another wallet now, so the held sell was not sent. It is still in the wallet it was bought with.`);
+      return;
+    }
+    t.soldFraction = held.fraction;
+    rows = rows.filter((x) => held.rowIds.includes(x.id) && !x.handedBack);
+    if (!rows.length) return;
+  } else {
+    const given = rows.filter((x) => x.handedBack);
+    if (given.length) {
+      rows = rows.filter((x) => !x.handedBack);
+      const name = t.symbol || t.mint.slice(0, 8);
+      record(exitSkipped(given[0], t, Math.max(1, Math.min(100, Math.round((fractionOf(t) ?? 1) * 100))), 'not executed — this copy was handed to you after a failed sell, so nothing automatic touches it. Sell by hand if you want out.'));
+      h.toast('warn', `Copy sell skipped — ${name} was handed to you after a failed sell. Sell it by hand if you want out.`);
+    }
+  }
   if (!rows.length) {
     // Nothing to close YET is not nothing to close: a buy may be mid-flight.
-    parkExit(c, t);
+    if (!seen) parkExit(c, t);
     return;
+  }
+  // Another buy of this coin is still going: this sell closes what is open now,
+  // and comes back for whatever that buy opens. An unsent one is abandoned.
+  // A held sell is neither: a buy made after it was never its business.
+  if (!seen && !heldSell && buysInFlight.has(flightKey(c.id, t.mint))) {
+    pastRows.set(t, new Set(rows.map((x) => x.id)));
+    parkExit(c, t);
   }
   // A row is governed by the mode it was OPENED in, not by what the config is
   // set to today (copy-3). Flipping a config from paper to live used to make
@@ -3264,7 +4315,7 @@ async function closeOpen(c: CopyConfig, t: WalletTrade): Promise<void> {
   // then label that broadcast "paper" in the history.
   // A retried migration sell is the live half of an exit whose paper half
   // was booked when the leader sold.
-  const paperRows = migrationRetries.has(t) ? [] : rows.filter((x) => x.mode === 'paper');
+  const paperRows = migrationRetries.has(t) || sellRetryOf.has(t) ? [] : rows.filter((x) => x.mode === 'paper');
   const liveRows = rows.filter((x) => x.mode === 'live');
 
   const who = c.label || c.wallet.slice(0, 6);
@@ -3305,7 +4356,8 @@ async function closeOpen(c: CopyConfig, t: WalletTrade): Promise<void> {
   // Acted on once per config, whichever delivery of the sell got here first
   // (see `mirroredSells`). Everything below — a mirror, a threshold skip, a
   // too-late skip — is this config's one answer to that transaction.
-  const actKey = t.signature ? `${c.id}:${t.signature}` : null;
+  // The second pass of a parked sell is new rows, not the same sell delivered twice.
+  const actKey = t.signature && !seen ? `${c.id}:${t.signature}` : null;
   if (actKey) {
     const done = mirroredSells.get(actKey);
     if (done !== undefined) {
@@ -3335,7 +4387,7 @@ async function closeOpen(c: CopyConfig, t: WalletTrade): Promise<void> {
   // a small remainder of a large sell.
   const minSell = c.minLeaderSellPct ?? null;
   // A retried migration sell already passed this when the leader sold.
-  if (minSell !== null && leaderSold * 100 < minSell && !migrationRetries.has(t) && !aiSized.has(t)) {
+  if (minSell !== null && leaderSold * 100 < minSell && !migrationRetries.has(t) && !sellRetryOf.has(t) && !aiSized.has(t)) {
     const share = Math.max(1, Math.round(leaderSold * 100));
     record(exitSkipped(rows[0], t, share, `not mirrored — they ${oppositeVerb(c)} ${share}% of their bag, under your ${minSell}% threshold`));
     return;
@@ -3381,7 +4433,9 @@ async function closeOpen(c: CopyConfig, t: WalletTrade): Promise<void> {
   let fills: LiveExit['fills'] = [];
 
   if (liveRows.length) {
-    if (c.mode !== 'live') {
+    if (c.mode !== 'live' && heldSell) {
+      endHeldSell(t, 'not retried — this follow is on paper now, and the live position is still held');
+    } else if (c.mode !== 'live') {
       // Flipped to paper with a REAL position still open. The wallet holds
       // those tokens; nothing may close them but a sell that happened.
       record(
@@ -3395,9 +4449,15 @@ async function closeOpen(c: CopyConfig, t: WalletTrade): Promise<void> {
       h.toast('warn', `${who} sold ${pct}% of ${what} — your live position from this config is still open`);
     } else {
       const blocked = (h.exitBlockedReason ?? h.liveBlockedReason)(chainOf(c));
-      if (blocked) {
+      if (blocked && heldSell) {
+        // The person's stop, seen while this try queued. It ends it, as on the clock.
+        endHeldSell(t, `not executed — ${blocked}. You still hold it.`);
+        alertUser('Copy sell stopped', `${what} will not be tried again: ${blocked}. You still hold it.`);
+      } else if (blocked) {
         record(exitSkipped(liveRows[0], t, pct, `not executed — ${blocked}`));
         h.toast('warn', `Copy sell skipped — ${who} sold ${pct}% of ${what}, but ${blocked}`);
+      } else if (!heldSell && joinHeldSell(c, t, theirs, liveRows, h)) {
+        // Answered by the sell already held for this coin.
       } else {
         const live = await mirrorSell(c, t, liveRows, theirs, exit, h);
         if (!stillConfigured(c.id)) return;
@@ -3686,7 +4746,16 @@ async function askEntry(
 async function askExit(c: CopyConfig, t: WalletTrade, rule: ExitRule): Promise<WalletTrade | null> {
   const h = host;
   if (!h?.aiAsk || !exitAsks(c.ai, rule) || !c.ai) return t;
-  const rows = trades.filter((r) => r.configId === c.id && r.mint === t.mint && r.state === 'open' && r.kind !== 'exit');
+  // A rule that fires every tick, on a coin a held sell is working on: asking each
+  // time would stack the AI's "sell 10%" answers. One ask per rule per hold, so a
+  // rule that fires only once still gets its answer and joins the hold.
+  const heldKey = flightKey(c.id, t.mint);
+  const held = sellRetries.get(heldKey) ?? migrationWaits.get(heldKey);
+  if (held && QUIETED_BY_HOLD.has(rule)) {
+    if (held.aiAsked?.includes(rule)) return null;
+    held.aiAsked = [...(held.aiAsked ?? []), rule];
+  }
+  const rows = trades.filter((r) => r.configId === c.id && r.mint === t.mint && r.state === 'open' && r.kind !== 'exit' && !r.handedBack);
   // Nothing open yet (their sell landed while our buy was in flight):
   // closeOpen parks it, and the parked exit is asked when it drains.
   if (!rows.length) return t;
@@ -3750,6 +4819,7 @@ export function aiSellCopy(configId: string, mint: string, percent: number, reas
   if (!(percent >= 1 && percent <= 100)) return { ok: false, message: 'percent must be between 1 and 100' };
   const rows = trades.filter((r) => r.configId === c.id && r.mint === mint && r.state === 'open' && r.kind !== 'exit');
   if (!rows.length) return { ok: false, message: `${followName(c)} holds no open copy of ${mint.slice(0, 8)}…` };
+  if (rows.every((r) => r.handedBack)) return { ok: false, message: `${followName(c)}'s copy of ${mint.slice(0, 8)}… was handed to the person after a failed sell. Nothing automatic sells it.` };
   const now = Date.now();
   const symbol = rows[0].symbol;
   const why = `the AI sold ${percent}% — ${reason.trim().slice(0, 200) || 'no reason given'}`;
@@ -3841,17 +4911,23 @@ async function evaluateBuy(c: CopyConfig, t: WalletTrade, extra: Partial<CopyTra
   // same slot sees it (copy-1). Everything below runs inside the try.
   reserve(c, Date.now());
   const key = flightKey(c.id, t.mint);
-  buysInFlight.set(key, { since: Date.now(), submitted: false, ...(run !== null ? { paperSol: base.ourSol } : {}) });
+  const me: BuyFlight = { since: Date.now(), submitted: false, ...(run !== null ? { paperSol: base.ourSol } : {}) };
+  buysInFlight.set(key, [...(buysInFlight.get(key) ?? []), me]);
   try {
-    await copyOnce(c, t, base, h);
+    await copyOnce(c, t, base, h, me);
   } finally {
     release(c.id);
-    buysInFlight.delete(key);
-    staleBuys.delete(key);
-    // Whatever happened above, a sell that landed mid-flight is applied now:
-    // the row it needs either exists or never will, and `closeOpen` handles
-    // both. Runs last so it sees the row `copyOnce` just recorded.
-    drainPendingExit(c, t.mint);
+    const others = (buysInFlight.get(key) ?? []).filter((f) => f !== me);
+    // Another buy of this coin still going keeps what it needs parked.
+    if (others.length) buysInFlight.set(key, others);
+    else {
+      buysInFlight.delete(key);
+      staleBuys.delete(key);
+      // Whatever happened above, a sell that landed mid-flight is applied now:
+      // the row it needs either exists or never will, and `closeOpen` handles
+      // both. Runs last so it sees the row `copyOnce` just recorded.
+      drainPendingExit(c, t.mint);
+    }
   }
 }
 
@@ -3892,7 +4968,7 @@ function prefilter(c: CopyConfig, t: WalletTrade): string | null {
   if (cap !== null) {
     const entered =
       trades.filter((r) => r.configId === c.id && r.mint === t.mint && r.kind !== 'exit' && r.state !== 'skipped').length +
-      (buysInFlight.has(flightKey(c.id, t.mint)) ? 1 : 0);
+      (buysInFlight.get(flightKey(c.id, t.mint))?.length ?? 0);
     if (entered >= cap) return cap === 1 ? 'already bought this token once — buy once is on' : `already bought this token ${cap} times — your cap`;
   }
   return null;
@@ -3954,7 +5030,7 @@ const oppositeVerb = (c: CopyConfig): string => (directionOf(c) === 'reverse' ? 
 /** What the entry is called on its record. */
 const entryNoun = (c: CopyConfig): string => (directionOf(c) === 'fomo' ? 'convergence entry' : directionOf(c));
 
-async function copyOnce(c: CopyConfig, t: WalletTrade, base: CopyTrade, h: CopyHost): Promise<void> {
+async function copyOnce(c: CopyConfig, t: WalletTrade, base: CopyTrade, h: CopyHost, me: BuyFlight): Promise<void> {
   // Where the time goes (2026-09-21). Measured on every copy, live and paper,
   // because a tester benchmarking the path needs the same numbers whether or
   // not they are spending. The stages start here; the delivery half arrived
@@ -4254,10 +5330,37 @@ async function copyOnce(c: CopyConfig, t: WalletTrade, base: CopyTrade, h: CopyH
   }
   // From here the transaction can reach the chain, so it can no longer be
   // abandoned — only followed by an exit.
-  const flight = buysInFlight.get(key);
-  if (flight) flight.submitted = true;
+  // On Solana that moment is now. On BNB and Robinhood a buy queues behind one
+  // lock per chain, and with no copy limits set it can wait a long time, so
+  // all of this is asked again when it reaches the head of the queue. Up to
+  // then a leader's sell can still abandon it.
+  const evmQueue = chainOf(c) !== 'solana';
+  const head = { why: null as string | null };
+  if (!evmQueue) me.submitted = true;
+  const headGuard = evmQueue
+    ? {
+        atHead: (): string | null => {
+          const blocked = h.liveBlockedReason(chainOf(c));
+          const late = ageOf(t);
+          head.why = blocked
+            ? `not executed — ${blocked}`
+            : staleBuys.has(key)
+              ? `not executed — they had already ${oppositeVerb(c)} before this ${entryNoun(c)} was sent`
+              : late > entryAgeLimit(c)
+                ? `not executed — their buy was ${ageText(late)} old by the time this copy could be sent`
+                : withdrawnReason(c, base);
+          if (!head.why) me.submitted = true;
+          return head.why;
+        },
+      }
+    : {};
   const sendStart = Date.now();
-  const res = await h.buy(t.mint, base.ourSol, { slippagePct: c.maxSlippagePct, walletId: c.walletId ?? undefined, chain: chainOf(c) });
+  const res = await h.buy(t.mint, base.ourSol, { ...headGuard, slippagePct: c.maxSlippagePct, walletId: c.walletId ?? undefined, chain: chainOf(c) });
+  // Stopped at the head of the queue: a decision, not a failed send.
+  if (head.why) {
+    record({ ...base, reason: head.why });
+    return;
+  }
   const sendMs = Date.now() - sendStart;
   const timing = timingFor(sendMs, res.timing);
   // Reported whatever the outcome: a copy that FAILED slowly is the most
@@ -4312,19 +5415,34 @@ async function copyOnce(c: CopyConfig, t: WalletTrade, base: CopyTrade, h: CopyH
       signature: res.signature ?? null,
       pending: unconfirmed,
     });
-    failStreak.delete(c.id);
+    if (!unconfirmed) {
+      clearStreaks(c.id);
+      c.rearmTries = 0;
+    } else {
+      // Sent is not landed: a route that only times out must still run out.
+      const sent = (unconfirmedStreak.get(c.id) ?? 0) + 1;
+      unconfirmedStreak.set(c.id, sent);
+      if (sent >= (host?.rearm?.().failsInARow ?? COPY_FAIL_PAUSE) * UNCONFIRMED_MULTIPLE) {
+        autoPause(c, `${sent} copies in a row were sent but never confirmed — the route may be down`, 'fails');
+      }
+    }
   } else if (curveMigrating(res.message)) {
     // Most often the leader's own buy emptied the curve: nothing trades
     // until the PumpSwap pool opens. A skip with its reason, not a failure.
     record({ ...base, reason: 'skipped — the coin is moving from pump’s curve to PumpSwap, and nothing can trade until it lands' });
     h.log('info', `copy: ${t.symbol || t.mint.slice(0, 8)} is migrating to PumpSwap — the buy was skipped, not failed`);
+  } else if (slippageFailed(res.message) && host?.rearm?.().slippagePauses !== true) {
+    // The coin moved past the slippage set. Nothing is broken, so this neither
+    // counts toward a pause nor clears a real failure's count.
+    record({ ...base, reason: res.message.slice(0, 160) });
+    h.toast('warn', `Copy failed, the price moved past your slippage: ${t.symbol || t.mint.slice(0, 8)}`);
   } else {
     record({ ...base, reason: res.message.slice(0, 160) });
     // Three sent-and-failed copies in a row pause the follow: the route, the
     // wallet or the venue is broken, and each further try costs fees.
     const n = (failStreak.get(c.id) ?? 0) + 1;
     failStreak.set(c.id, n);
-    if (n >= COPY_FAIL_PAUSE) autoPause(c, `${n} copies in a row failed to send — the last: ${res.message.slice(0, 120)}`);
+    if (n >= (host?.rearm?.().failsInARow ?? COPY_FAIL_PAUSE)) autoPause(c, failPauseReason(n, res.message), 'fails');
     else h.toast('error', `Copy failed: ${res.message}`);
   }
 }
@@ -4824,7 +5942,9 @@ function withdrawForProtective(c: CopyConfig, mint: string, rule: ExitRule): voi
  */
 export function checkMaxHolds(now = Date.now()): void {
   checkWalletStops();
+  checkRearms(now);
   retryMigrationWaits(now);
+  retryFailedSells(now);
   const seen = new Set<string>();
   for (const r of trades) {
     if (r.state !== 'open' || r.kind === 'exit') continue;
@@ -4848,7 +5968,7 @@ function checkOwnExits(mint: string, priceSol: number | null, chain: ChainKind |
     if (priceSol === null && x.maxHoldMin === null) continue;
     const key = flightKey(c.id, mint);
     const rows = trades.filter(
-      (r) => r.configId === c.id && r.mint === mint && r.state === 'open' && r.kind !== 'exit' && r.entryPriceSol !== null && r.entryPriceSol > 0,
+      (r) => r.configId === c.id && r.mint === mint && r.state === 'open' && r.kind !== 'exit' && !r.handedBack && r.entryPriceSol !== null && r.entryPriceSol > 0,
     );
     if (!rows.length) continue;
     const tag = directionOf(c);
@@ -5217,6 +6337,7 @@ function noteCrowdSell(c: CopyConfig, t: WalletTrade, f: ReturnType<typeof fomoR
 
 /** Test seam. */
 export function _reset(): void {
+  leaderLeftNoted.clear();
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = null;
   closing = false;
@@ -5232,7 +6353,11 @@ export function _reset(): void {
   crowdUnion = null;
   ownExiting.clear();
   failStreak.clear();
+  unconfirmedStreak.clear();
   migrationWaits.clear();
+  sellRetries.clear();
+  restoredNotice = null;
+  trimmedBook = {};
   dailyStopNoted.clear();
   notifiedAt.length = 0;
   configs = [];

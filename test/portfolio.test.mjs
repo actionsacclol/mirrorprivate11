@@ -6,6 +6,9 @@
 // confident lie. These cases pin that in every direction.
 
 import assert from 'node:assert';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 // Both come from ONE bundle — see test/portfolioentry.ts for why.
 import { ledger, portfolio } from './.portfolioentry.mjs';
 import { toCsv } from './.portfolioshared.mjs';
@@ -617,7 +620,7 @@ test('reconcilePending retries ONLY pending fills — terminal ones are never re
 
 test('a pending fill stays pending across rounds, then becomes terminal', async () => {
   fakeChain();
-  const f = fill({ state: 'pending', wallet: W1, attempts: 0 });
+  const f = fill({ state: 'pending', wallet: W1, attempts: 0, at: Date.now() - 600_000 });
   ledger._load([f]);
   await ledger.reconcilePending('http://fake.invalid', W1);
   assert.equal(f.state, 'pending', 'not on chain YET — a late-landing tx must keep being watched');
@@ -689,6 +692,146 @@ test('each fill reconciles against the wallet that MADE it, not the active one',
 });
 
 globalThis.fetch = realFetch;
+
+test('"it did not land" is proof only when the RPC answered, more than once, at the right age', async () => {
+  fakeChain();
+  const rounds = async (f, n = 12) => {
+    ledger._load([f]);
+    for (let i = 0; i < n; i += 1) await ledger.reconcilePending('http://fake.invalid', W1);
+    return f;
+  };
+  const dead = await rounds(fill({ state: 'pending', wallet: W1, attempts: 0, at: Date.now() - 600_000 }));
+  assert.equal(dead.state, 'unreconciled');
+  assert.equal(ledger.provedNotLanded(dead), true);
+
+  const old = await rounds(fill({ state: 'pending', wallet: W1, attempts: 0, at: Date.now() - 3 * 86_400_000 }));
+  assert.equal(old.state, 'unreconciled', 'read days late');
+  assert.equal(ledger.provedNotLanded(old), false, 'an RPC may simply have dropped it');
+
+  const fresh = await rounds(fill({ state: 'pending', wallet: W1, attempts: 0, at: Date.now() }));
+  assert.equal(fresh.state, 'pending', 'a page polling fast does not end it before it could be proved');
+
+  globalThis.fetch = async () => new Response('rate limited', { status: 429 });
+  const outage = await rounds(fill({ state: 'pending', wallet: W1, attempts: 0, at: Date.now() - 600_000 }));
+  assert.equal(outage.state, 'unreconciled');
+  assert.equal(ledger.provedNotLanded(outage), false, 'an outage burned the rounds');
+  globalThis.fetch = realFetch;
+  assert.equal(ledger.provedNotLanded({ state: 'pending', note: 'x it did not land', notFoundRounds: 6 }), false);
+});
+
+// ── Trimming fills (2026-11-04) ───────────────────────────────────────
+
+const HELD = 'Held1111111111111111111111111111111111111111';
+const TW = 'TrimWallet';
+const fillsForTrim = (trips) => {
+  const list = [fill({ id: 'heldbuy', wallet: TW, mint: HELD, side: 'buy', at: 1_000, solDeltaLamports: -2 * LAM, tokenDeltaRaw: '5000000', decimals: 6, feeLamports: 5_000 })];
+  for (let i = 0; i < trips; i += 1) {
+    const mint = `Trip${i}`;
+    list.push(fill({ id: `b${i}`, wallet: TW, mint, side: 'buy', at: 2_000 + i * 10, solDeltaLamports: -1 * LAM, tokenDeltaRaw: '1000000', decimals: 6, feeLamports: 5_000 }));
+    list.push(fill({ id: `s${i}`, wallet: TW, mint, side: 'sell', at: 2_005 + i * 10, solDeltaLamports: 1.5 * LAM, tokenDeltaRaw: '-1000000', decimals: 6, feeLamports: 5_000 }));
+  }
+  return list.reverse();
+};
+const noSig = { mint: 'New111', symbol: 'NEW', side: 'buy', requested: 1, signature: null };
+const noCtx = { httpUrl: '', owner: TW };
+const tripsOf = () => [...ledger.basisByMint().values()].reduce((a, b) => a + b.trips.length, 0);
+
+test('trim: the buy of a coin still held is never dropped; finished trips stay on the record', () => {
+  ledger._reset();
+  ledger._load(fillsForTrim(2_500));
+  assert.equal(ledger.all().length, 5_001);
+  const feesBefore = ledger.all().reduce((a, f) => a + (f.feeLamports ?? 0), 0);
+  ledger.recordFill(noSig, noCtx);
+  const rows = ledger.all();
+  assert.ok(rows.length <= 5_000, `trimmed to ${rows.length}`);
+  assert.ok(rows.some((f) => f.id === 'heldbuy'), 'the oldest fill is the one that still matters');
+  const held = ledger.basisByMint().get(HELD);
+  assert.equal(held.spentSol, 2, 'its cost basis is intact');
+  assert.equal(held.tokensBought, 5);
+  assert.equal(tripsOf(), 2_500, 'every round trip is still counted');
+  assert.ok(!rows.some((f) => f.id === 'b0'), 'the oldest finished trip is what went');
+  const old = ledger.basisByMint().get('Trip0');
+  assert.equal(old.lifetimeReceivedSol, 1.5, 'and its money is still known');
+  assert.equal(old.spentSol, 0, 'but it is no open position');
+  const fees = ledger.all().reduce((a, f) => a + (f.feeLamports ?? 0), 0) + ledger.trimmedFeeLamports();
+  assert.equal(fees, feesBefore, 'fees paid do not fall');
+});
+
+test('trim: half a round trip never goes, and a buy after a trimmed trip starts fresh', () => {
+  ledger._reset();
+  const list = fillsForTrim(2_500);
+  list.unshift(fill({ id: 'again', wallet: TW, mint: 'Trip0', side: 'buy', at: 9_000_000, solDeltaLamports: -3 * LAM, tokenDeltaRaw: '1000000', decimals: 6 }));
+  ledger._load(list);
+  ledger.recordFill(noSig, noCtx);
+  const b = ledger.basisByMint().get('Trip0');
+  assert.equal(b.spentSol, 3, 'the open position is priced by its own buy alone');
+  assert.equal(b.trips.length, 1, 'the earlier trip is still a trip');
+  assert.equal(ledger.all().filter((f) => f.id === 'b1' || f.id === 's1').length % 2, 0);
+});
+
+test('trim: a coin with a fill from before multi-wallet is left alone', () => {
+  ledger._reset();
+  const list = fillsForTrim(2_500);
+  list.push(fill({ id: 'legacy', mint: 'Trip0', side: 'buy', at: 1, wallet: null, solDeltaLamports: -9 * LAM, tokenDeltaRaw: '1000000', decimals: 6 }));
+  ledger._load(list);
+  const before = ledger.basisByMint(TW).get('Trip0');
+  ledger.recordFill(noSig, noCtx);
+  ledger.recordFill({ ...noSig, mint: 'New222' }, noCtx);
+  const rows = ledger.all();
+  assert.ok(['legacy', 'b0', 's0'].every((id) => rows.some((f) => f.id === id)), 'nothing of that coin goes');
+  assert.deepEqual(ledger.basisByMint(TW).get('Trip0').trips, before.trips);
+});
+
+test('trim: trips of one coin stay in order when an earlier one is still being read', () => {
+  ledger._reset();
+  const list = [
+    fill({ id: 'x1', wallet: TW, mint: 'Same', side: 'buy', at: 500, solDeltaLamports: -1 * LAM, tokenDeltaRaw: '1000000', decimals: 6 }),
+    fill({ id: 'x2', wallet: TW, mint: 'Same', side: 'sell', at: 501, solDeltaLamports: 1 * LAM, tokenDeltaRaw: '-1000000', decimals: 6 }),
+    fill({ id: 'x3', wallet: TW, mint: 'Same', side: 'buy', at: 502, state: 'pending' }),
+    fill({ id: 'x4', wallet: TW, mint: 'Same', side: 'buy', at: 503, solDeltaLamports: -1 * LAM, tokenDeltaRaw: '1000000', decimals: 6 }),
+    fill({ id: 'x5', wallet: TW, mint: 'Same', side: 'sell', at: 504, solDeltaLamports: 1 * LAM, tokenDeltaRaw: '-1000000', decimals: 6 }),
+    fill({ id: 'x6', wallet: TW, mint: 'Same', side: 'buy', at: 505, solDeltaLamports: -1 * LAM, tokenDeltaRaw: '1000000', decimals: 6 }),
+    fill({ id: 'x7', wallet: TW, mint: 'Same', side: 'sell', at: 506, solDeltaLamports: 1 * LAM, tokenDeltaRaw: '-1000000', decimals: 6 }),
+    ...fillsForTrim(2_500),
+  ];
+  ledger._load(list);
+  for (let i = 0; i < 12; i += 1) ledger.recordFill({ ...noSig, mint: `Nn${i}` }, noCtx);
+  const trips = ledger.basisByMint().get('Same').trips.map((t) => t.closedAt);
+  const rows = ledger.all();
+  assert.ok(!rows.some((f) => f.id === 'x1'), 'the finished trip before the unread buy went');
+  assert.ok(['x3', 'x4', 'x5', 'x6', 'x7'].every((id) => rows.some((f) => f.id === id)), 'the later trip does not go ahead of the unread one');
+  assert.equal(trips.length, 3);
+  assert.deepEqual(trips, [...trips].sort((a, b) => a - b), 'in the order they happened');
+});
+
+test('trim: when everything left is an open position the list grows rather than forgets', () => {
+  ledger._reset();
+  const list = Array.from({ length: 5_000 }, (_, i) => fill({ id: `h${i}`, wallet: TW, mint: `Open${i}`, side: 'buy', at: 1_000 + i, solDeltaLamports: -1 * LAM, tokenDeltaRaw: '1000000', decimals: 6 }));
+  ledger._load(list);
+  ledger.recordFill(noSig, noCtx);
+  assert.equal(ledger.all().length, 5_001);
+});
+
+test('trim: a send that failed on chain goes first, and what the trim kept survives a restart', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'krypt-fills-'));
+  ledger._reset();
+  ledger.init(dir);
+  const list = fillsForTrim(2_500);
+  list.push(fill({ id: 'failedsend', wallet: TW, mint: 'Dead', side: 'buy', at: 500, state: 'unreconciled', note: ledger.FAILED_ON_CHAIN_NOTE }));
+  ledger._load(list);
+  ledger.recordFill(noSig, noCtx);
+  ledger.recordFill({ ...noSig, mint: 'New222' }, noCtx);
+  ledger.recordFill({ ...noSig, mint: 'New333' }, noCtx);
+  assert.ok(!ledger.all().some((f) => f.id === 'failedsend'));
+  const trips = tripsOf();
+  assert.equal(trips, 2_500);
+  ledger.flushSync();
+  ledger._reset();
+  ledger.init(dir);
+  assert.equal(tripsOf(), trips, 'read back from the file');
+  assert.ok(ledger.trimmedFeeLamports() > 0);
+  ledger._reset();
+});
 
 async function run() {
   for (const c of cases) {

@@ -1,41 +1,41 @@
 WEBVTT
 
 1
-00:00:00.973 --> 00:00:09.677
-You only need a wallet to go live. Open Wallet and generate a dedicated hot wallet. Its key is encrypted by Windows and never leaves this computer.
+00:00:00.954 --> 00:00:10.668
+You only need a wallet to go live. Open Wallet and press Create wallet. This makes a new wallet just for this app. Its key is encrypted on this computer and never leaves it.
 
 2
-00:00:13.068 --> 00:00:20.415
-Back up the key before you fund it. Nobody, including Krypt, can recover it for you. Fund it with lunch money, never your main wallet.
+00:00:12.763 --> 00:00:21.614
+Back up the key before you add money. Nobody, including Krypt, can get it back for you. Only put in money you can afford to lose, and keep your main wallet out of it.
 
 3
-00:00:21.137 --> 00:00:27.095
-Send SOL to the deposit address. 0.1 to 0.5 SOL is plenty to test with.
+00:00:22.322 --> 00:00:31.133
+Send SOL to the deposit address. 0.1 to 0.5 SOL is plenty to test with. The Checklist guide shows how to buy SOL and send it.
 
 4
-00:00:28.709 --> 00:00:40.802
-Your balance on the bar opens the wallet switcher: every wallet, its balance and its pump.fun name. Follows set to Active wallet copy with the ticked one, and a switch waits until their live copies have closed.
+00:00:31.847 --> 00:00:45.749
+Your balance at the top right opens the wallet card: address, balance, refresh and send. From there, the switcher lists every wallet. Follows set to Active wallet copy with the ticked one, and a switch waits until their live copies have closed.
 
 5
-00:00:45.541 --> 00:00:53.826
-Safety rails cap every live copy: a maximum per trade, a balance cap, a session loss cap, and a stop after losses in a row.
+00:00:49.668 --> 00:00:57.825
+Safety rails are yours to set, and they all start off: a maximum per trade, a session loss cap, and a stop after losses in a row.
 
 6
-00:00:57.406 --> 00:01:02.486
+00:01:00.982 --> 00:01:06.061
 Going live is two switches. First the top bar, Paper to Live, which asks you to confirm.
 
 7
-00:01:07.377 --> 00:01:14.355
-Then the follow itself: on its card, switch it to Live and arm it. It asks first, and a size above your live cap is caught here.
+00:01:10.780 --> 00:01:18.406
+Then the follow itself: on its card, switch it to Live and arm it. It asks first, and if you set a live cap, a size above it is caught here.
 
 8
-00:01:21.219 --> 00:01:33.538
+00:01:24.528 --> 00:01:36.847
 If a safety rail trips, Live turns off, but open copies still sell on their exits, so nothing is stranded. If you switch to Paper yourself, exits stop too: the card says so, and you can sell from the Wallet page.
 
 9
-00:01:37.245 --> 00:01:45.051
+00:01:40.509 --> 00:01:48.314
 Live copies pay Krypt’s fee on every buy and every sell, on-chain in the same transaction. Start small; most memecoins go to zero.
 
 10
-00:01:46.191 --> 00:01:58.045
+00:01:49.355 --> 00:02:01.209
 pump.fun accounts are optional. New wallet plus account makes a fresh wallet with its own pump.fun account in one step. Live copies can call out what they buy, and pump pays callers USDC rewards.

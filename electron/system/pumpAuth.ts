@@ -479,6 +479,9 @@ export function renewSession(walletId: string, now = Date.now()): Promise<boolea
   const s = sessions.get(walletId);
   const known = s ? s.via === 'wallet' : lapsed.has(walletId);
   if (!known || now - (renewTriedAt.get(walletId) ?? 0) < RENEW_COOLDOWN_MS) return Promise.resolve(false);
+  // Nobody asked for this one: a savings wallet does not sign it, even in the
+  // moment a typed password has its key open.
+  if (!wallet.canSignUnattended(walletId)) return Promise.resolve(false);
   renewTriedAt.set(walletId, now);
   const before = s?.token;
   const run = signIn(walletId)
@@ -567,6 +570,9 @@ export async function refreshProfile(walletId: string): Promise<void> {
       signal: AbortSignal.timeout(12_000),
     });
     if (res.status === 401) {
+      // Locked, or a savings wallet: the login cannot be signed right now, and
+      // that says nothing about the account. Keep it for after the unlock.
+      if (s.via === 'wallet' && !wallet.canSignUnattended(walletId)) return;
       // Expired or revoked. A wallet's session is signed in again on the spot
       // (renewSession); only when that cannot be done is it dropped — showing
       // "signed in" over a dead session is worse than asking again.

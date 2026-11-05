@@ -98,6 +98,12 @@ function migrateUnsafe(s: AppSettings, fromRevision: number): boolean {
     // switched on is moved — a port someone chose and uses stays theirs.
     if (s.mcp && !s.mcp.enabled && s.mcp.port === 8787) s.mcp = { ...s.mcp, port: 8797 };
   }
+  if (fromRevision < 9) {
+    // 2026-11-04: onboarding runs once more for every existing install, so
+    // the new last screen (where the guides and the wallet are) reaches the people already using the app.
+    // Safe to replay for the reasons at revision 7.
+    s.onboarded = false;
+  }
 
   s.settingsRevision = SETTINGS_REVISION;
   return true;
@@ -218,6 +224,8 @@ function mergeState(loaded: Partial<AppSettings> | null): AppSettings {
     // deeper so a saved Robinhood key survives a new BNB default.
     evm: mergeEvm(loaded.evm),
     referrer: typeof loaded.referrer === 'string' ? loaded.referrer : d.referrer,
+    closeToTray: typeof loaded.closeToTray === 'boolean' ? loaded.closeToTray : d.closeToTray,
+    keepAwake: typeof loaded.keepAwake === 'boolean' ? loaded.keepAwake : d.keepAwake,
     onboarded: loaded.onboarded ?? d.onboarded,
     // Read field by field rather than spread: a stored acceptance carrying a
     // stale `version` must survive to BE compared, and fail the comparison,

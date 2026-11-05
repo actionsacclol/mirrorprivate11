@@ -37,6 +37,7 @@ const SPOKEN = [
   [/api\.jup\.ag/g, 'A P I dot jup dot A G'],
   [/portal\.jup\.ag/g, 'portal dot jup dot A G'],
   [/bds\.birdeye\.so/g, 'B D S dot birdeye dot S O'],
+  [/krypt\.cc\/mirror/g, 'krypt dot C C slash mirror'],
   [/krypt\.cc/g, 'krypt dot C C'],
   [/\bSOL\b/g, 'sol'],
   [/\bGIPHY\b/g, 'giphy'],

@@ -65,12 +65,12 @@ function LiveExecutionPanel({ armed, balanceSol }: { armed: boolean; balanceSol:
   };
 
   return (
-    <Section title="Live execution" description="Real trades via a maintained relayer; every transaction is simulated and loss-bounded before your key signs it.">
+    <Section title="Live trading" description="Limits for real trades, and a way to buy or sell by hand. Every trade is tested before your key signs it.">
       <Card className="space-y-4">
         {e.liveEnabled && armed && (
           <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 flex items-center gap-2 text-xs text-amber-200">
             <Zap className="h-4 w-4 flex-shrink-0" />
-            <span><span className="font-semibold">Real broadcast is ON.</span> Trades you place by hand spend exactly what you enter; the {e.maxLiveSol} SOL per-trade cap bounds advanced orders, copy trades and fan-out. Every follow you have armed on Live buys and sells on its own when the wallet it copies trades.</span>
+            <span><span className="font-semibold">Live is on: real money.</span> Trades you place by hand spend exactly what you enter; {e.maxLiveSol > 0 ? `every other trade is limited to ${e.maxLiveSol} SOL.` : 'no per-trade limit is set, so every other trade spends what it is set to.'} Every follow you have turned on for Live buys and sells by itself when the wallet it copies trades.</span>
           </div>
         )}
         <div className="grid lg:grid-cols-2 gap-3">
@@ -80,21 +80,24 @@ function LiveExecutionPanel({ armed, balanceSol }: { armed: boolean; balanceSol:
               value={e.maxLiveSol}
               onChange={(n) => void updateSettings({ execution: { ...e, maxLiveSol: n } })}
               suffix="SOL"
-              warn={(n) => (n <= 0 ? 'Must be greater than 0' : n > 1 ? 'Large per-trade cap — sure?' : null)}
+              warn={(n) => (n < 0 ? 'Must be 0 or more' : n > 1 ? 'Large per-trade cap — sure?' : null)}
             />
+            <p className="mt-1.5 text-body text-krypt-muted leading-relaxed">
+              The most one copy or advanced order may spend. 0 means no limit, which is the default.
+            </p>
           </div>
           {/* Open copies across every follow (2026-10-23). Copy trading only;
               a hand trade is never held back by it, and exits never are. */}
           <div className="rounded-xl border border-white/10 bg-black/20 px-4 py-3">
             <div className="text-sm font-semibold text-white mb-1">Max open copies</div>
             <NumberInput
-              value={e.maxOpenCopies ?? 5}
+              value={e.maxOpenCopies ?? 0}
               onChange={(n) => void updateSettings({ execution: { ...e, maxOpenCopies: Math.max(0, Math.round(n)) } })}
               warn={(n) => (n < 0 ? 'Must be 0 or more' : n > 100 ? 'Max 100' : null)}
             />
             <p className="mt-1.5 text-body text-krypt-muted leading-relaxed">
               Copies open at once across every wallet you follow, paper and live counted apart. A copy that would open one more is skipped and
-              recorded. Adding to a coin you already hold is not a new one. 0 = no limit.
+              recorded. Adding to a coin you already hold is not a new one. 0 means no limit, which is the default.
             </p>
           </div>
           <div className="rounded-xl border border-white/10 bg-black/20 px-4 py-3">
@@ -105,6 +108,9 @@ function LiveExecutionPanel({ armed, balanceSol }: { armed: boolean; balanceSol:
               suffix="%"
               warn={(n) => (n <= 0 ? 'Must be greater than 0' : n > 50 ? 'Very high slippage' : null)}
             />
+            <p className="mt-1.5 text-body text-krypt-muted leading-relaxed">
+              How far the price may move against you before a trade gives up.
+            </p>
           </div>
           {/* The two live breakers. Both OFF at 0 (the default since the
               terminal pivot: two ordinary losing trades used to flip a
@@ -119,7 +125,7 @@ function LiveExecutionPanel({ armed, balanceSol }: { armed: boolean; balanceSol:
               warn={(n) => (n < 0 ? 'Must be 0 or more' : n > 100 ? 'Max 100 SOL' : null)}
             />
             <p className="mt-1.5 text-body text-krypt-muted leading-relaxed">
-              Realised losses this session (from confirmed sells) past this pause live trading. 0 = off. Solana only — the EVM chains have no loss breaker yet.
+              Turns Live off once your sells have lost this much this session. 0 means off, which is the default. Solana only for now.
             </p>
           </div>
           <div className="rounded-xl border border-white/10 bg-black/20 px-4 py-3">
@@ -130,21 +136,21 @@ function LiveExecutionPanel({ armed, balanceSol }: { armed: boolean; balanceSol:
               warn={(n) => (n < 0 ? 'Must be 0 or more' : n > 50 ? 'Max 50' : null)}
             />
             <p className="mt-1.5 text-body text-krypt-muted leading-relaxed">
-              Consecutive realised losses that pause live trading. Whole number, 0 = off. Solana only — the EVM chains have no loss breaker yet.
+              Turns Live off after this many losing sells in a row. 0 means off, which is the default. Solana only for now.
             </p>
           </div>
         </div>
 
         <div className="rounded-xl border border-white/10 bg-black/30 p-4 space-y-3">
           <div className="flex items-center gap-2 text-sm font-semibold text-white">
-            <FlaskConical className="h-4 w-4 text-krypt-purple" /> Quick buy by mint
+            <FlaskConical className="h-4 w-4 text-krypt-purple" /> Buy a coin by its address
           </div>
           <p className="text-xs text-krypt-muted">
-            Paste a token mint and buy it. In <span className="text-emerald-300">Paper</span> mode it simulates; in{' '}
-            <span className="text-rose-300">Live</span> mode it spends real SOL. Switch modes in the top bar.
+            Paste a coin&apos;s address and buy it. On <span className="text-emerald-300">Paper</span> it is pretend; on{' '}
+            <span className="text-rose-300">Live</span> it spends real SOL. Switch in the top bar.
           </p>
           <div className="flex flex-wrap gap-2">
-            <input value={mint} onChange={(ev) => setMint(ev.target.value)} placeholder="Token mint address" spellCheck={false}
+            <input value={mint} onChange={(ev) => setMint(ev.target.value)} placeholder="Coin address" spellCheck={false}
               className="flex-1 min-w-[240px] rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-sm font-mono text-white placeholder-krypt-muted/40 outline-none focus:border-krypt-purple/60" />
             <input value={amount} onChange={(ev) => setAmount(ev.target.value)} inputMode="decimal"
               className="w-24 rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-sm font-mono text-white outline-none focus:border-krypt-purple/60" />
@@ -162,10 +168,10 @@ function LiveExecutionPanel({ armed, balanceSol }: { armed: boolean; balanceSol:
             </div>
           )}
           <div className="pt-2 border-t border-white/10 space-y-2">
-            <div className="text-xs font-semibold text-white">Sell a token (100%)</div>
-            <div className="text-body text-krypt-muted">Liquidate a leftover or dust position back to SOL. Needs real broadcast on.</div>
+            <div className="text-xs font-semibold text-white">Sell all of a coin</div>
+            <div className="text-body text-krypt-muted">Turn a leftover coin back into SOL. Needs Live on.</div>
             <div className="flex flex-wrap gap-2">
-              <input value={sellMint} onChange={(ev) => setSellMint(ev.target.value)} placeholder="Token mint to sell" spellCheck={false}
+              <input value={sellMint} onChange={(ev) => setSellMint(ev.target.value)} placeholder="Address of the coin to sell" spellCheck={false}
                 className="flex-1 min-w-[240px] rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-sm font-mono text-white placeholder-krypt-muted/40 outline-none focus:border-krypt-purple/60" />
               <GhostButton destructive onClick={() => void doSell()} disabled={busy !== null || !e.liveEnabled}>
                 {busy === 'sell' ? 'Selling…' : 'Sell 100%'}
@@ -173,7 +179,7 @@ function LiveExecutionPanel({ armed, balanceSol }: { armed: boolean; balanceSol:
             </div>
           </div>
           {balanceSol !== null && balanceSol < 0.02 && (
-            <div className="flex items-center gap-2 text-body text-amber-300"><AlertTriangle className="h-3.5 w-3.5" /> Low balance — fund the wallet before a real buy.</div>
+            <div className="flex items-center gap-2 text-body text-amber-300"><AlertTriangle className="h-3.5 w-3.5" /> Low balance: add SOL before a real buy.</div>
           )}
         </div>
       </Card>
@@ -214,7 +220,6 @@ function WithdrawPanel({
   unsavedHome: boolean;
 }) {
   const toast = useToast();
-  const modal = useModal();
   const [amount, setAmount] = useState(0);
   const [useMax, setUseMax] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -245,14 +250,7 @@ function WithdrawPanel({
   const doWithdraw = async (): Promise<void> => {
     if (reason || !home) return;
     const lamports: number | 'max' = useMax ? 'max' : Math.floor(effective * LAMPORTS_PER_SOL);
-    const shown = useMax ? `${(max ?? 0).toFixed(4)} SOL (max)` : `${effective.toFixed(4)} SOL`;
-    const yes = await modal.confirm({
-      title: 'Withdraw SOL',
-      message: `Send ${shown} from the active trading wallet to:\n\n${home}\n\nThis is the confirmed withdrawal address. The transfer cannot be recalled.`,
-      confirmLabel: 'Withdraw',
-      destructive: true,
-    });
-    if (!yes) return;
+    // The app asks in a system dialog that names the address and amount.
     setBusy(true);
     const r = await window.krypt.wallet.withdraw({ lamports });
     setBusy(false);
@@ -451,14 +449,7 @@ export function WalletPage() {
   };
 
   const doExport = async (): Promise<void> => {
-    const yes = await modal.confirm({
-      title: 'Export all wallets',
-      message:
-        'This writes the PRIVATE KEYS of every wallet to a plain text file so you can import them into Phantom or another wallet. Anyone who gets that file can spend your wallets. Save it somewhere offline and delete it when done. Continue?',
-      confirmLabel: 'Export private keys',
-      destructive: true,
-    });
-    if (!yes) return;
+    // The warning is a system dialog now, shown by the app itself.
     const r = await window.krypt.wallet.exportAll();
     if (r.ok) toast.success(`Exported ${r.data?.count ?? ''} wallet(s) — delete that file once imported`);
     else toast.warn(r.message);
@@ -488,15 +479,15 @@ export function WalletPage() {
 
   const saveCap = async (): Promise<void> => {
     const r = await window.krypt.wallet.setMaxBalance(Number(capInput));
-    if (r.ok && r.data) { setInfo(r.data); toast.success('Balance cap saved'); }
+    if (r.ok && r.data) { setInfo(r.data); toast.success(Number(capInput) === 0 ? 'Balance warning off' : 'Balance cap saved'); }
     else toast.error(r.message);
   };
 
-  const overCap = info?.balanceSol != null && info.balanceSol > info.maxBalanceSol;
+  const overCap = info?.balanceSol != null && info.maxBalanceSol > 0 && info.balanceSol > info.maxBalanceSol;
   const homeUnsaved = !!info?.exists && homeInput.trim() !== (info.homeAddress ?? '');
 
   return (
-    <Page title="Sol Wallet" subtitle="A dedicated hot Solana wallet for copy trading — generated here, encrypted by your OS, funded with lunch money.">
+    <Page title="Sol Wallet" subtitle="A wallet just for copy trading. Made here and encrypted on this computer. Only put in money you can afford to lose.">
       {/* The balance, plainly (2026-10-22): what is in the wallet live
           copies spend from, whether live trading is on, and what that means. */}
       <div className="mb-6 grid gap-4 md:grid-cols-[1.4fr_1fr]">
@@ -524,8 +515,8 @@ export function WalletPage() {
             {live?.armed ? 'Live — real SOL can move' : 'Off — paper only'}
           </div>
           <p className="mt-1 text-body leading-relaxed text-krypt-muted">
-            A follow spends real SOL only when the top bar is on Live AND that follow is switched to Live and armed on its card. Every trade is
-            simulated and loss-bounded before your key signs. Fund only what you can afford to lose.
+            A follow spends real SOL only when the top bar is on Live and that follow is on Live too, on its card. Every trade is tested before
+            your key signs it. Only put in money you can afford to lose.
           </p>
         </div>
       </div>
@@ -538,22 +529,22 @@ export function WalletPage() {
                 <WalletIcon className="h-5 w-5 text-krypt-purple" />
               </div>
               <div>
-                <div className="text-sm font-semibold text-white">Generate a dedicated hot wallet</div>
+                <div className="text-sm font-semibold text-white">Make a new wallet for this app</div>
                 <div className="text-xs text-krypt-muted mt-0.5">
-                  A brand-new keypair, stored encrypted by {info?.encryptionAvailable ? 'your OS keystore (DPAPI)' : 'your OS'}. Your main wallet is never involved.
+                  It is encrypted on this computer, and your main wallet is never involved.
                 </div>
               </div>
             </div>
             {!info?.encryptionAvailable && (
               <div className="flex items-center gap-2 text-xs text-rose-300">
-                <AlertTriangle className="h-4 w-4" /> OS secure storage is unavailable — generation is blocked to avoid storing a key unencrypted.
+                <AlertTriangle className="h-4 w-4" /> This computer has no safe place to keep a key, so making a wallet is blocked. A key is never stored unprotected.
               </div>
             )}
             <div className="flex items-center gap-2">
               <PrimaryButton onClick={() => void doGenerate()} disabled={busy || !info?.encryptionAvailable}>
-                <KeyRound className="h-4 w-4" /> Generate wallet
+                <KeyRound className="h-4 w-4" /> Create wallet
               </PrimaryButton>
-              <GhostButton onClick={() => setShowImport((v) => !v)}>Import existing key</GhostButton>
+              <GhostButton onClick={() => setShowImport((v) => !v)}>Use a key I already have</GhostButton>
             </div>
             {showImport && (
               <div className="space-y-2 pt-2 border-t border-white/10">
@@ -579,7 +570,7 @@ export function WalletPage() {
               make, but the "add" controls stay available at one wallet. */}
           <Section
             title="Your wallets"
-            description="Several trading wallets, one active at a time. Only the active wallet can sign, so switching is blocked while live execution is armed — switch the top bar to Paper first."
+            description="You can have several wallets. The active one is the one that trades. To switch, put the top bar on Paper first."
           >
             <Card>
               <div className="space-y-1.5">
@@ -690,17 +681,17 @@ export function WalletPage() {
                 </div>
                 {overCap && (
                   <div className="mt-3 flex items-center gap-2 text-xs text-amber-300">
-                    <AlertTriangle className="h-4 w-4" /> Above your {info.maxBalanceSol} SOL cap — sweep some out.
+                    <AlertTriangle className="h-4 w-4" /> Above your {info.maxBalanceSol} SOL cap. Withdraw some.
                   </div>
                 )}
                 {info.balanceCheckedAt && <div className="mt-2 text-body text-krypt-muted/60">checked {fmtClock(info.balanceCheckedAt)}</div>}
               </Card>
             </Section>
 
-            <Section title="Deposit address" description="Send SOL here from your main wallet or an exchange.">
+            <Section title="Deposit address" description="Send SOL to this address from another wallet or an exchange. The Checklist guide shows how.">
               <Card className="space-y-2">
                 <Copyable value={info.publicKey ?? ''} />
-                <div className="text-body text-krypt-muted/70">Only SOL on Solana mainnet. Start small — 0.1–0.5 SOL is plenty to test with.</div>
+                <div className="text-body text-krypt-muted/70">Send SOL on the Solana network only. Start small: 0.1 to 0.5 SOL is plenty to test with.</div>
               </Card>
             </Section>
           </div>
@@ -710,7 +701,7 @@ export function WalletPage() {
             <div className="grid lg:grid-cols-2 gap-3">
               <Card className="space-y-2">
                 <div className="text-sm font-semibold text-white">Max balance cap</div>
-                <div className="text-xs text-krypt-muted">Warn when the wallet holds more than this.</div>
+                <div className="text-xs text-krypt-muted">Warn when the wallet holds more than this. 0 is no warning.</div>
                 <div className="flex gap-2">
                   <input value={capInput} onChange={(e) => setCapInput(e.target.value)} inputMode="decimal"
                     className="w-28 rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-sm font-mono text-white outline-none focus:border-krypt-purple/60" />
@@ -719,7 +710,7 @@ export function WalletPage() {
               </Card>
               <Card className="space-y-2">
                 <div className="text-sm font-semibold text-white">Withdrawal address</div>
-                <div className="text-xs text-krypt-muted">Where a sweep sends funds (your safe wallet).</div>
+                <div className="text-xs text-krypt-muted">Where withdrawals and auto-cashout send your SOL, such as your main wallet.</div>
                 {homeUnsaved && (
                   <div className="text-xs text-amber-300/90">
                     Not saved — withdrawals still go to {info.homeAddress ? `${info.homeAddress.slice(0, 6)}…${info.homeAddress.slice(-4)}` : 'no address'} until you press Save and confirm.
@@ -756,14 +747,14 @@ export function WalletPage() {
                   label="Auto-cashout profits"
                   description={
                     info.homeAddress
-                      ? `Sweep live profits to ${info.homeAddress.slice(0, 6)}…${info.homeAddress.slice(-4)} once they reach the threshold`
-                      : 'Sweep live profits to your withdrawal address — set one above first'
+                      ? `Send live profits to ${info.homeAddress.slice(0, 6)}…${info.homeAddress.slice(-4)} once they reach the amount below`
+                      : 'Send live profits to your withdrawal address. Set one above first'
                   }
                 />
                 <div className="flex items-center justify-between gap-4 rounded-md border border-white/10 bg-black/20 px-4 py-3">
                   <div>
                     <div className="text-sm font-semibold text-white">Cashout threshold</div>
-                    <div className="text-xs text-krypt-muted mt-0.5">Sweep once unswept profit reaches this much</div>
+                    <div className="text-xs text-krypt-muted mt-0.5">Send once profit not yet sent reaches this much</div>
                   </div>
                   <NumberInput
                     value={settings.execution.cashoutThresholdSol}
@@ -781,12 +772,6 @@ export function WalletPage() {
                 </div>
               </div>
               <Switch
-                checked={settings.execution.rearmAfterVerifiedUpgrade !== false}
-                onChange={(v) => void updateSettings({ execution: { ...settings.execution, rearmAfterVerifiedUpgrade: v } })}
-                label="Re-arm after a checked pump upgrade"
-                description="When pump.fun upgrades its program, live switches off while the app re-checks it against real launches — usually within seconds. With this on, live switches back on by itself if the check passes and live was on before. A failed check never re-arms. You get a notification either way."
-              />
-              <Switch
                 checked={settings.execution.autoSwapUsdc !== false}
                 onChange={(v) => void updateSettings({ execution: { ...settings.execution, autoSwapUsdc: v } })}
                 label="Auto-swap USDC to SOL"
@@ -796,7 +781,7 @@ export function WalletPage() {
                 checked={settings.execution.autoSellOnExit}
                 onChange={(v) => void updateSettings({ execution: { ...settings.execution, autoSellOnExit: v } })}
                 label="Auto-sell on stop or crash"
-                description="DANGER: when the sniper stops or quits — or a previous run crashed holding tokens — market-sells EVERY SPL token in this wallet at up to 15% slippage, including tokens this app never bought. Off by default. Needs real broadcast on."
+                description="DANGER: when the app stops or quits, or crashed earlier while holding coins, this sells EVERY coin in this wallet at up to 15% slippage, including coins this app never bought. Off by default. Needs Live on."
               />
             </div>
           </Section>
@@ -825,12 +810,12 @@ export function WalletPage() {
           <Section title="Backup & removal">
             <Card className="flex flex-wrap items-center gap-2">
               <GhostButton onClick={() => void doBackup()}>
-                <Download className="h-4 w-4" /> Back up keypair
+                <Download className="h-4 w-4" /> Back up key file
               </GhostButton>
               <GhostButton onClick={() => void doExport()}>
                 <Download className="h-4 w-4" /> Export all (Phantom)
               </GhostButton>
-              <span className="text-xs text-krypt-muted">Keypair = a Solana CLI file. Export all = a plain text file of private keys for Phantom / Solflare / Backpack.</span>
+              <span className="text-xs text-krypt-muted">Export all saves a text file of your private keys, which you can paste into Phantom, Solflare or Backpack. Key file is the same key for Solana developer tools. Anyone with either file owns your wallet.</span>
               <div className="flex-1" />
               <GhostButton destructive onClick={() => void doRemove()}>
                 <Trash2 className="h-4 w-4" /> Remove wallet

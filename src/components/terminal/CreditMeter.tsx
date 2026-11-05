@@ -98,17 +98,16 @@ export function CreditMeter({
           />
           <span className="font-mono text-label text-krypt-muted">{(usage?.backtest ?? 0).toLocaleString()} used</span>
           <span className="text-label text-krypt-muted/70">
-            Copy replays and Scout scans read the chain first (seconds, ~10 credits a call), then pump&rsquo;s history (slow,
-            free) once this is spent. About 300 credits a replay. 0 = always the slow way.
+            Replays and scans read the chain first, which takes seconds and about 300 credits a replay. Once this is spent they use
+            pump.fun&rsquo;s free history, which is slow. 0 means always the slow way.
           </span>
         </div>
       )}
 
       {limit > 0 && (
         <p className="mt-1.5 text-label leading-relaxed text-krypt-muted/60">
-          At the measured firehose rate (~780,000 pushes/hour, sampled 2026-08-24) this ceiling covers about{' '}
-          <span className="text-white/80">{firehoseHoursFor(limit).toFixed(1)} hours</span> of feed-socket runtime. The
-          socket switches itself off when the ceiling is reached.
+          Only matters if you turn on the Helius feed socket under Advanced. At about 780,000 messages an hour, this ceiling lasts about{' '}
+          <span className="text-white/80">{firehoseHoursFor(limit).toFixed(1)} hours</span>, and the socket turns itself off when it is reached.
         </p>
       )}
     </div>

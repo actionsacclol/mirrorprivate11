@@ -103,7 +103,7 @@ export const ko: Catalogue = {
   'settings.dataCollection': '데이터 수집',
   'settings.creatorBlocklist': '생성자 차단 목록',
   'settings.feesAndReferral': '수수료 및 추천',
-  'settings.subtitle': '시세 데이터 제공자, RPC 엔드포인트.',
+  'settings.subtitle': '기본 설정은 위에 있습니다. 나머지는 맨 아래 Advanced에 있습니다.',
 
   'settings.theme': '테마',
   'settings.themeHint': '룩(글꼴, 표면, 모서리, 효과)을 고른 뒤 강조 색상을 선택하세요. 상승의 초록, 하락의 빨강, 자금 관련 금색은 그대로 유지됩니다.',

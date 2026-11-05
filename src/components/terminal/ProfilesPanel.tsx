@@ -169,7 +169,7 @@ export function ProfilesPanel() {
             )}
             {!p.isDefault && !p.isCurrent && (
               <GhostButton destructive disabled={busy || locked || p.running} onClick={() => void remove(p.id, p.name, p.hasWallets)} className="!py-1 !px-2 text-note">
-                <span className="inline-flex items-center gap-1" title={p.running ? 'Close its window first' : 'Move its folder to the Recycle Bin'}>
+                <span className="inline-flex items-center gap-1" title={p.running ? 'Quit it first' : 'Move its folder to the Recycle Bin'}>
                   <Trash2 className="h-3.5 w-3.5" /> Delete
                 </span>
               </GhostButton>

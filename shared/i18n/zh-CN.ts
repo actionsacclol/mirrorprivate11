@@ -103,7 +103,7 @@ export const zhCN: Catalogue = {
   'settings.dataCollection': '数据采集',
   'settings.creatorBlocklist': '创建者黑名单',
   'settings.feesAndReferral': '费用与推荐',
-  'settings.subtitle': '行情数据源、RPC 节点。',
+  'settings.subtitle': '基础设置在上方。其余内容都在页面底部的 Advanced 中。',
 
   'settings.theme': '主题',
   'settings.themeHint': '先选一种外观（字体、面板、圆角、效果），再选强调色。上涨的绿色、下跌的红色，以及与资金相关的金色均保持不变。',

@@ -224,7 +224,7 @@ test('migrateLegacy keeps a zero createdAt from becoming epoch zero', () => {
     'id1',
   );
   assert.equal(f.wallets[0].createdAt, 777);
-  assert.equal(f.wallets[0].maxBalanceSol, 2, 'a zero cap falls back to the default, never to zero');
+  assert.equal(f.wallets[0].maxBalanceSol, 0, 'no cap: off by default');
 });
 
 test('a malformed entry is skipped without discarding the other wallets', () => {

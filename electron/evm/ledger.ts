@@ -201,10 +201,38 @@ export function recordFill(input: {
     attempts: 0,
   };
   state.fills.push(fill);
-  if (state.fills.length > MAX_FILLS) state.fills = state.fills.slice(-MAX_FILLS);
+  if (state.fills.length > MAX_FILLS) trimFills();
   persist();
   void reconcile(fill);
   return fill;
+}
+
+/** Back to MAX_FILLS, oldest first, never a fill of a token this wallet may still
+ *  hold (its cost basis lives here) or one still being read. Grows past the cap
+ *  rather than forget a position. */
+function trimFills(): void {
+  let excess = state.fills.length - MAX_FILLS;
+  if (excess <= 0) return;
+  const keyOf = (f: EvmFill): string => `${f.chain}:${f.wallet}:${f.token}`;
+  const net = new Map<string, bigint>();
+  const unsure = new Set<string>();
+  for (const f of state.fills) {
+    if (f.state === 'pending') unsure.add(keyOf(f));
+    if (f.state !== 'reconciled' || f.tokenDeltaRaw === null) continue;
+    // Floored at zero, in order: a sell whose buy was trimmed earlier must not
+    // cancel out a later buy of the coin.
+    const after = (net.get(keyOf(f)) ?? 0n) + BigInt(f.tokenDeltaRaw);
+    net.set(keyOf(f), after > 0n ? after : 0n);
+  }
+  const drop = new Set<EvmFill>();
+  for (const f of state.fills) {
+    if (excess <= 0) break;
+    const k = keyOf(f);
+    if (f.state === 'pending' || unsure.has(k) || (net.get(k) ?? 0n) > 0n) continue;
+    drop.add(f);
+    excess -= 1;
+  }
+  if (drop.size) state.fills = state.fills.filter((f) => !drop.has(f));
 }
 
 /** Read the receipt and the balance diff. Retries a few times: the receipt

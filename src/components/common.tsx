@@ -375,6 +375,16 @@ export function NumberInput({
   useEffect(() => {
     if (!focused.current) setText(fmt(value));
   }, [value]);
+  // A save that was refused or cancelled: back to what is really stored.
+  const stored = useRef(value);
+  stored.current = value;
+  useEffect(() => {
+    const revert = (): void => {
+      if (!focused.current) setText(fmt(stored.current));
+    };
+    window.addEventListener('krypt:settings-refused', revert);
+    return () => window.removeEventListener('krypt:settings-refused', revert);
+  }, []);
 
   // No clamping — the user's number is accepted as typed. Commit on blur/Enter
   // so intermediate states ("0.", "1e") never fight the keystrokes, and never

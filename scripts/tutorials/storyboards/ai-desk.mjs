@@ -104,6 +104,7 @@ export default {
         await ui.point({ text: '^Follow ceiling', sel: 'div', within: AI }, { hold: 1600, glow: 1800 });
         await ui.hover(field('Max per copy'), { hold: 1400 });
         await ui.hover(field('Max loss a day'), { hold: 1400 });
+        await ui.hover(field('Max copies a day'), { hold: 1400 });
         await opt(ui.point({ text: '^A live follow the AI switches on', sel: 'p', within: AI }, { hold: 2600 }));
       },
     },

@@ -266,7 +266,7 @@ export function AiPage() {
                   A follow’s copies keep the follow’s own size and limits: below Full control the AI can only shrink or skip them. Sells are never capped — getting out is the point.
                 </p>
                 <div className="mt-4 mb-1.5 text-label uppercase tracking-label text-krypt-muted">Follow ceiling (Full control)</div>
-                <div className="grid grid-cols-2 gap-3" data-testid="ai-follow-ceiling">
+                <div className="grid grid-cols-3 gap-3" data-testid="ai-follow-ceiling">
                   <NumberField
                     label="Max per copy"
                     hint="SOL"
@@ -279,9 +279,15 @@ export function AiPage() {
                     value={s.budget.followDailyLossSol}
                     onSave={(v) => void apply(() => window.krypt.mcp.setBudget({ ...s.budget, followDailyLossSol: v }))}
                   />
+                  <NumberField
+                    label="Max copies a day"
+                    hint="1–1000"
+                    value={s.budget.followDailyCopies}
+                    onSave={(v) => void apply(() => window.krypt.mcp.setBudget({ ...s.budget, followDailyCopies: v }))}
+                  />
                 </div>
                 <p className="mt-2 text-body leading-relaxed text-krypt-muted">
-                  A live follow the AI switches on or widens must copy at most this much a trade and stop for the day at a loss no bigger than this. Follows you arm yourself are not bound by it.
+                  A live follow the AI switches on or widens must copy at most this much a trade, at most this many times a day, and stop for the day at a loss no bigger than this. A loss counts once a copy closes, so the most it can put out in a day is per copy times copies. Follows you arm yourself are not bound by it, and switching the whole app to Live also starts those, whatever their limits.
                 </p>
               </Panel>
             )}

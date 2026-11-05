@@ -82,6 +82,8 @@ export function arm(chain: EvmChainKind): { ok: boolean; message: string } {
   const meta = EVM_CHAIN_META[chain];
   if (!enabled(chain)) return { ok: false, message: `${meta.name} is turned off in Settings` };
   if (!evmWallet.exists(chain)) return { ok: false, message: 'Create or import an EVM wallet first' };
+  const locked = evmWallet.lockReason(chain);
+  if (locked) return { ok: false, message: locked };
   if (live[chain].armed) return { ok: true, message: `Already live on ${meta.name}` };
   live[chain] = { chain, armed: true, armedAt: Date.now(), lastDisarmReason: null };
   logger.warn(`evm rail ${chain}: LIVE — trades spend real ${meta.nativeSymbol} from ${evmWallet.address(chain)}`);
@@ -329,6 +331,10 @@ export interface TradeOpts {
   expectVenue?: EvmVenue;
   /** Sign as this wallet instead of the chain's active one (copy trading, 2026-09-11). */
   walletId?: string;
+  /** Asked again when a buy reaches the head of the chain's queue. */
+  atHead?: () => string | null;
+  /** Native a buy must leave behind to pay for selling it again. */
+  keepNative?: number;
 }
 
 /** The slippage a sell actually carries: never under the floor. */
@@ -366,6 +372,10 @@ export async function buy(chain: EvmChainKind, token: string, amountNative: numb
     token: token as Address,
     amountNative,
     simulateOnly: sim,
+    // Asked again at the head of the queue: Paper or the kill switch may have
+    // landed while this buy waited.
+    atHead: () => opts.atHead?.() ?? (!sim && !live[chain].armed ? `${EVM_CHAIN_META[chain].name} went to Paper while this buy waited, so it was not sent` : null),
+    ...(opts.keepNative ? { keepNative: opts.keepNative } : {}),
     slippagePct: opts.slippagePct ?? s.slippagePct,
     expectVenue: opts.expectVenue,
     walletId: opts.walletId,

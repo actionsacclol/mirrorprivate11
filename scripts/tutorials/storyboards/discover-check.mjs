@@ -1,6 +1,8 @@
 // Discover, Check and the wallet profile. The checked wallet is the board's
 // first ranked one on the day of the take; its replay runs for real
-// (chain-priced, nothing traded), so the take waits for it.
+// (chain-priced, nothing traded). Without a key that can take minutes, so it
+// runs in prepare, before the camera starts, and the Check page picks up the
+// finished result instead of filming a spinner in silence.
 
 import { addressOnProfile, btn, go, heading, opt } from './_app.mjs';
 
@@ -18,6 +20,10 @@ export default {
     await ui.waitFor({ expr: `document.querySelectorAll('[data-testid=scout-row]').length > 0` }, 30_000);
     await ui.click('[data-testid=scout-row]');
     address = await addressOnProfile(ui);
+    const a = JSON.stringify(address);
+    await ui.evaluate(`(()=>{window.__replayDone=false;void window.krypt.scout.replay(${a},{checks:true,week:false});window.__replayPoll=setInterval(()=>void window.krypt.scout.replayStatus(${a}).then(r=>{if(r.ok&&r.data&&!r.data.running&&r.data.finishedAt)window.__replayDone=true}),1500)})()`);
+    await opt(ui.waitFor({ expr: 'window.__replayDone===true' }, 240_000));
+    await ui.evaluate('clearInterval(window.__replayPoll)');
     await go(ui, 'home', /Good (morning|afternoon|evening)/);
   },
   steps: [
@@ -96,11 +102,8 @@ export default {
       line: 7,
       do: async (ui) => {
         await opt(ui.hover({ testid: 'profile-replay-status' }, { hold: 600 }));
-        // Until the replay is priced, then its figures. With a Helius key in
-        // the tutorial profile that is seconds; without one the public RPC
-        // rate-limits the read, so the take moves on after a short wait
-        // rather than filming a spinner.
-        await opt(ui.waitFor({ expr: `!!document.querySelector('[data-testid=profile-replay-trips]') || /no trades|nothing to replay|0 trades/i.test(document.querySelector('[data-testid=profile-replay-status]')?.textContent || '')` }, 25_000));
+        // Normally already priced (see prepare); a short wait only in case.
+        await opt(ui.waitFor({ expr: `!!document.querySelector('[data-testid=profile-replay-trips]') || /no trades|nothing to replay|0 trades/i.test(document.querySelector('[data-testid=profile-replay-status]')?.textContent || '')` }, 6000));
         await opt(ui.point({ testid: 'profile-replay-status' }, { hold: 2000, glow: 2000 }));
         await opt(ui.point({ testid: 'profile-replay-trips' }, { hold: 1400 }));
       },
@@ -108,8 +111,8 @@ export default {
     {
       line: 8,
       do: async (ui) => {
-        await opt(ui.waitFor({ testid: 'replay-week-verdict' }, 20_000));
-        await opt(ui.point({ testid: 'replay-week-verdict' }, { hold: 3600, glow: 3800 }));
+        await opt(ui.waitFor({ testid: 'replay-week-verdict' }, 3000));
+        await opt(ui.point({ testid: 'replay-week-verdict' }, { hold: 3000, glow: 3200 }));
       },
     },
     {

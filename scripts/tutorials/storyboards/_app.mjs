@@ -2,6 +2,31 @@
 
 export const MAIN = `document.querySelector('main')`;
 
+/** Open the Advanced fold on Settings, if it is closed. */
+export async function openAdvanced(ui) {
+  if (!(await ui.exists({ testid: 'settings-advanced-body' }))) await ui.click({ testid: 'settings-advanced' });
+  await ui.waitFor({ testid: 'settings-advanced-body' }, 5000);
+}
+
+/** Close it, so the next take opens Settings as a new user does. */
+export async function closeAdvanced(ui) {
+  if (await ui.exists({ testid: 'settings-advanced-body' })) await ui.click({ testid: 'settings-advanced' });
+}
+
+const CARD_LAYER = '__guide-card';
+
+/**
+ * A full-screen card over the app, for what happens outside it: an installer's
+ * warning, an exchange's form. These are plain drawings and say so on screen.
+ */
+export const showCard = (ui, html) =>
+  ui.evaluate(`(()=>{
+    let d=document.getElementById('${CARD_LAYER}');
+    if(!d){d=document.createElement('div');d.id='${CARD_LAYER}';d.style.cssText='position:fixed;inset:0;z-index:2147483000;display:flex;align-items:center;justify-content:center;background:#0b0e14;color:#e8ecf3;font-family:Inter,system-ui,sans-serif';document.body.appendChild(d);}
+    d.innerHTML=${JSON.stringify(html)};
+  })()`);
+export const hideCard = (ui) => ui.evaluate(`document.getElementById('${CARD_LAYER}')?.remove()`);
+
 /** waitFor spec: the main area's text matches `re` (a RegExp). */
 export const mainSays = (re) => ({ expr: `${re}.test((${MAIN})?.textContent || '')` });
 

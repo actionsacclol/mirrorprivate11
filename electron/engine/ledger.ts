@@ -35,6 +35,9 @@ let reconcileDelayMs = 2_500;
  * of on every one of them forever.
  */
 const MAX_RECONCILE_ROUNDS = 6;
+const NOT_LANDED_READ_FROM_MS = 120_000;
+const NOT_LANDED_READ_UNTIL_MS = 24 * 3_600_000;
+const NOT_LANDED_TERMINAL_MS = 180_000;
 /** Fills touched per reconcilePending pass. */
 const RECONCILE_BATCH = 10;
 
@@ -78,12 +81,30 @@ export interface Fill {
   wallet: string | null;
   /** Reconcile rounds spent so far. Absent on fills from before the counter. */
   attempts?: number;
+  /** Rounds where the RPC answered and had no such transaction, read when that means
+   *  something: after its blockhash died, and while any RPC still keeps it. A round
+   *  where the RPC failed proves nothing, though it still uses up `attempts`. */
+  notFoundRounds?: number;
   /** The slot the transaction landed in, once reconciled. Absent on fills
    *  from before 2026-10-22 and on a reply that did not carry it. */
   slot?: number | null;
 }
 
 let fills: Fill[] = [];
+/**
+ * What trimmed fills leave behind: the round trips they added up to, and the
+ * network fees they paid. The Portfolio's closed trades, win rate and fee total
+ * read these and the fills together (2026-11-04).
+ */
+export interface ArchivedTrip {
+  wallet: string | null;
+  mint: string;
+  symbol: string;
+  trip: ClosedTrip;
+}
+const MAX_ARCHIVED_TRIPS = 20_000;
+let archivedTrips: ArchivedTrip[] = [];
+let archivedFeeLamports = 0;
 /** Fired when a fill reaches a terminal state (reconciled/unreconciled). */
 const listeners = new Set<(fill: Fill) => void>();
 
@@ -143,6 +164,8 @@ let loadFailure: string | null = null;
 export function init(userDataDir: string): void {
   filePath = path.join(userDataDir, FILE);
   loadFailure = null;
+  archivedTrips = [];
+  archivedFeeLamports = 0;
   let text: string;
   try {
     text = fs.readFileSync(filePath, 'utf8');
@@ -155,8 +178,10 @@ export function init(userDataDir: string): void {
     return;
   }
   try {
-    const raw = JSON.parse(text) as { version: 1; fills: Fill[] };
+    const raw = JSON.parse(text) as { version: 1; fills: Fill[]; archivedTrips?: ArchivedTrip[]; archivedFeeLamports?: number };
     fills = Array.isArray(raw?.fills) ? raw.fills : [];
+    archivedTrips = Array.isArray(raw?.archivedTrips) ? raw.archivedTrips.filter((a) => typeof a?.mint === 'string' && a.trip) : [];
+    archivedFeeLamports = typeof raw?.archivedFeeLamports === 'number' ? raw.archivedFeeLamports : 0;
   } catch (e) {
     fills = [];
     loadFailure = `${filePath} is corrupt (${(e as Error).message})`;
@@ -173,7 +198,7 @@ function writeNow(): void {
   if (!filePath || loadFailure) return;
   try {
     const tmp = `${filePath}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ version: 1, fills }, null, 2), 'utf8');
+    fs.writeFileSync(tmp, JSON.stringify({ version: 1, fills, archivedTrips, archivedFeeLamports }, null, 2), 'utf8');
     fs.renameSync(tmp, filePath);
   } catch {
     /* memory stays authoritative this session */
@@ -234,7 +259,7 @@ export function recordFill(
     attempts: 0,
   };
   fills.unshift(fill);
-  if (fills.length > MAX_FILLS) fills.length = MAX_FILLS;
+  if (fills.length > MAX_FILLS) trimFills();
   persist();
 
   if (input.signature && ctx.owner) {
@@ -245,6 +270,120 @@ export function recordFill(
     persist();
   }
   return fill;
+}
+
+/**
+ * Bring the list back to MAX_FILLS without forgetting a position.
+ *
+ * It used to cut the oldest fills whatever they were, and about 25 days at 200
+ * fills a day that was the buy of a coin still held: its cost basis, and every
+ * order anchored on it, gone. Now the walk finds where each position stands, the
+ * same way `basisByMint` does, and only what can no longer matter goes: failed
+ * sends and unread fills of finished positions first, then sells with no buy,
+ * then whole finished round trips, oldest first, leaving their trip behind. A
+ * coin with a fill from before multi-wallet is left alone: `basisByMint` reads such
+ * a fill as whichever wallet is asked about, so no walk here can say where its
+ * round trips end. When everything left belongs to an open position the list grows
+ * past the cap.
+ */
+function trimFills(): void {
+  let excess = fills.length - MAX_FILLS;
+  if (excess <= 0) return;
+  interface Episode {
+    fills: Fill[];
+    mint: string;
+    wallet: string | null;
+    symbol: string;
+    spentSol: number;
+    receivedSol: number;
+    tokensBought: number;
+    tokensSold: number;
+    buys: number;
+    sells: number;
+    firstAt: number;
+  }
+  const fresh = (f: Fill): Episode => ({ fills: [], mint: f.mint, wallet: f.wallet, symbol: f.symbol, spentSol: 0, receivedSol: 0, tokensBought: 0, tokensSold: 0, buys: 0, sells: 0, firstAt: f.at });
+  const current = new Map<string, Episode>();
+  const running = new Map<string, number>();
+  const finished: Array<{ ep: Episode; closedAt: number; key: string }> = [];
+  const legacy = new Set(fills.filter((f) => !f.wallet).map((f) => f.mint));
+  for (const f of [...fills].sort((a, b) => a.at - b.at)) {
+    if (legacy.has(f.mint)) continue;
+    const key = `${f.wallet}:${f.mint}`;
+    let ep = current.get(key);
+    if (!ep) {
+      ep = fresh(f);
+      current.set(key, ep);
+    }
+    ep.fills.push(f);
+    if (f.state !== 'reconciled' || f.solDeltaLamports === null) continue;
+    const sol = f.solDeltaLamports / LAMPORTS;
+    const tokens = f.tokenDeltaRaw !== null && f.decimals !== null ? Number(BigInt(f.tokenDeltaRaw)) / 10 ** f.decimals : 0;
+    if (f.side === 'buy') {
+      ep.buys += 1;
+      ep.spentSol += Math.max(0, -sol);
+      ep.tokensBought += Math.max(0, tokens);
+      running.set(key, (running.get(key) ?? 0) + Math.max(0, tokens));
+      continue;
+    }
+    ep.sells += 1;
+    ep.receivedSol += Math.max(0, sol);
+    ep.tokensSold += Math.max(0, -tokens);
+    const left = (running.get(key) ?? 0) - Math.max(0, -tokens);
+    running.set(key, Math.max(0, left));
+    if (ep.tokensBought > 0 && left <= ep.tokensBought * FLAT_DUST_FRACTION) {
+      finished.push({ ep, closedAt: f.at, key });
+      current.delete(key);
+      running.set(key, 0);
+    }
+  }
+
+  const drop = new Set<Fill>();
+  const take = (f: Fill): void => {
+    if (excess <= 0 || drop.has(f)) return;
+    drop.add(f);
+    archivedFeeLamports += f.feeLamports ?? 0;
+    excess -= 1;
+  };
+  // Sends that never landed hold no money, wherever they sit.
+  for (const f of [...fills].reverse()) if (f.state === 'unreconciled' && f.note === FAILED_ON_CHAIN_NOTE && !legacy.has(f.mint)) take(f);
+  // Unread fills of a finished position can no longer change what is held.
+  for (const { ep } of finished) for (const f of ep.fills) if (f.state === 'unreconciled') take(f);
+  // Sells of something these fills never bought.
+  for (const ep of current.values()) {
+    if (ep.tokensBought > 0 || ep.fills.some((f) => f.state !== 'reconciled')) continue;
+    for (const f of ep.fills) take(f);
+  }
+  // Whole round trips. Half of one would misstate what is left of it, and a
+  // later trip of a coin never goes ahead of an earlier one still being read:
+  // the trips of a coin stay in the order they happened.
+  const waiting = new Set<string>();
+  for (const { ep, closedAt, key } of finished) {
+    if (excess <= 0) break;
+    if (waiting.has(key) || ep.fills.some((f) => f.state === 'pending')) {
+      waiting.add(key);
+      continue;
+    }
+    archivedTrips.push({
+      wallet: ep.wallet,
+      mint: ep.mint,
+      symbol: ep.symbol,
+      trip: { openedAt: ep.firstAt, closedAt, spentSol: ep.spentSol, receivedSol: ep.receivedSol, tokensBought: ep.tokensBought, tokensSold: ep.tokensSold, buys: ep.buys, sells: ep.sells },
+    });
+    for (const f of ep.fills) {
+      if (drop.has(f)) continue;
+      drop.add(f);
+      archivedFeeLamports += f.feeLamports ?? 0;
+      excess -= 1;
+    }
+  }
+  if (archivedTrips.length > MAX_ARCHIVED_TRIPS) archivedTrips = archivedTrips.slice(-MAX_ARCHIVED_TRIPS);
+  if (drop.size) fills = fills.filter((f) => !drop.has(f));
+}
+
+/** Network fees paid by fills that have been trimmed. */
+export function trimmedFeeLamports(): number {
+  return archivedFeeLamports;
 }
 
 /** The note on a fill the chain PROVES did not land (meta.err). Krypto
@@ -263,9 +402,11 @@ async function reconcile(fill: Fill, httpUrl: string, owner: string): Promise<vo
 
 async function reconcileOnce(fill: Fill, httpUrl: string, owner: string): Promise<void> {
   fill.attempts = (fill.attempts ?? 0) + 1;
+  let notFound = false;
   for (let attempt = 1; attempt <= RECONCILE_ATTEMPTS; attempt++) {
     await new Promise((r) => setTimeout(r, reconcileDelayMs));
     const res = await getTransaction(httpUrl, fill.signature as string);
+    if (res.ok && !res.data) notFound = true;
     if (!res.ok || !res.data) continue;
 
     const tx = res.data;
@@ -319,11 +460,14 @@ async function reconcileOnce(fill: Fill, httpUrl: string, owner: string): Promis
     settled(fill);
     return;
   }
+  const age = Date.now() - fill.at;
+  if (notFound && age >= NOT_LANDED_READ_FROM_MS && age <= NOT_LANDED_READ_UNTIL_MS) fill.notFoundRounds = (fill.notFoundRounds ?? 0) + 1;
   // Not readable yet. A tx that was broadcast but not confirmed when we
   // recorded it (a `pending` trade result) can still land minutes later, so
   // the fill STAYS pending for later passes — up to a bounded number of
-  // rounds, after which it is terminal and never polled again.
-  if ((fill.attempts ?? 0) < MAX_RECONCILE_ROUNDS) {
+  // rounds, after which it is terminal and never polled again. A page polling fast
+  // does not get to end it before anything could be proved.
+  if ((fill.attempts ?? 0) < MAX_RECONCILE_ROUNDS || age < NOT_LANDED_TERMINAL_MS) {
     fill.note = `Not on chain yet (round ${fill.attempts})`;
     persist();
     return;
@@ -360,6 +504,13 @@ export function rentLockedFor(
     if (pre === 0 && post > 0) rent += post;
   }
   return rent;
+}
+
+/** Enough to send a SHARE again: the RPC itself said so, more than once, after the
+ *  transaction's blockhash died. Rounds used up by a failed RPC do not count, and nor
+ *  do reads long after, when an RPC may simply have dropped it. */
+export function provedNotLanded(f: Fill): boolean {
+  return f.state === 'unreconciled' && /it did not land/.test(f.note ?? '') && (f.notFoundRounds ?? 0) >= 2;
 }
 
 let reconcileInFlight = false;
@@ -504,6 +655,35 @@ export function basisByMint(
   stopBefore?: Fill,
 ): Map<string, MintBasis> {
   const out = new Map<string, MintBasis>();
+  const blank = (mint: string, symbol: string): MintBasis => ({
+    mint, symbol, spentSol: 0, entrySpentSol: 0, receivedSol: 0,
+    tokensBought: 0, tokensSold: 0, buys: 0, sells: 0,
+    firstAt: null, lastAt: null, unreconciled: 0,
+    lifetimeSpentSol: 0, lifetimeReceivedSol: 0,
+    lifetimeTokensBought: 0, lifetimeTokensSold: 0,
+    lifetimeBuys: 0, lifetimeSells: 0,
+    firstEverAt: null, roundTrips: 0, trips: [],
+  });
+  // Round trips whose fills were trimmed: finished, older than any fill of the
+  // same position, and nothing in the current episode.
+  for (const a of archivedTrips) {
+    if (wallet && (a.wallet ?? wallet) !== wallet) continue;
+    let b = out.get(a.mint);
+    if (!b) {
+      b = blank(a.mint, a.symbol);
+      out.set(a.mint, b);
+    }
+    b.trips.push({ ...a.trip });
+    b.roundTrips += 1;
+    b.lifetimeSpentSol += a.trip.spentSol;
+    b.lifetimeReceivedSol += a.trip.receivedSol;
+    b.lifetimeTokensBought += a.trip.tokensBought;
+    b.lifetimeTokensSold += a.trip.tokensSold;
+    b.lifetimeBuys += a.trip.buys;
+    b.lifetimeSells += a.trip.sells;
+    b.firstEverAt = b.firstEverAt === null ? a.trip.openedAt : Math.min(b.firstEverAt, a.trip.openedAt);
+    b.lastAt = b.lastAt === null ? a.trip.closedAt : Math.max(b.lastAt, a.trip.closedAt);
+  }
   // Episode detection needs the fills in the order they happened; the array
   // is append-on-arrival and a late reconcile can leave it out of order.
   const ordered = [...fills].sort((a, b) => a.at - b.at);
@@ -522,15 +702,7 @@ export function basisByMint(
     if (wallet && (f.wallet ?? wallet) !== wallet) continue;
     let b = out.get(f.mint);
     if (!b) {
-      b = {
-        mint: f.mint, symbol: f.symbol, spentSol: 0, entrySpentSol: 0, receivedSol: 0,
-        tokensBought: 0, tokensSold: 0, buys: 0, sells: 0,
-        firstAt: null, lastAt: null, unreconciled: 0,
-        lifetimeSpentSol: 0, lifetimeReceivedSol: 0,
-        lifetimeTokensBought: 0, lifetimeTokensSold: 0,
-        lifetimeBuys: 0, lifetimeSells: 0,
-        firstEverAt: null, roundTrips: 0, trips: [],
-      };
+      b = blank(f.mint, f.symbol);
       out.set(f.mint, b);
     }
     if (f.symbol && !b.symbol) b.symbol = f.symbol;
@@ -680,6 +852,8 @@ export function stats(): { total: number; reconciled: number; unreconciled: numb
 /** Test seam. */
 export function _reset(): void {
   fills = [];
+  archivedTrips = [];
+  archivedFeeLamports = 0;
   filePath = '';
   announced.clear();
   reconciling.clear();

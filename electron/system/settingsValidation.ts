@@ -71,7 +71,8 @@ const BOUNDS: Record<string, { min: number; max: number; int?: boolean }> = {
   'mcp.budget.maxTradesPerMinute': { min: 1, max: 60, int: true },
   'mcp.budget.followMaxCopySol': { min: 0.000001, max: 25 },
   'mcp.budget.followDailyLossSol': { min: 0.000001, max: 100 },
-  'execution.maxLiveSol': { min: 0.000001, max: 25 },
+  'mcp.budget.followDailyCopies': { min: 1, max: 1000, int: true },
+  'execution.maxLiveSol': { min: 0, max: 25 },
   'execution.liveSlippagePct': { min: 0, max: 50 },
   // Both live breakers are OFF at 0 (the shipped default since revision 3;
   // liveBreakers.ts checks `> 0`). Until 2026-09-08 the streak bound started
@@ -83,6 +84,9 @@ const BOUNDS: Record<string, { min: number; max: number; int?: boolean }> = {
   'execution.maxLiveSessionLossSol': { min: 0, max: 100 },
   'execution.maxLiveConsecutiveLosses': { min: 0, max: 50, int: true },
   'execution.maxOpenCopies': { min: 0, max: 100, int: true },
+  'execution.rearm.failsInARow': { min: 1, max: 50, int: true },
+  'execution.rearm.firstWaitMin': { min: 1, max: 60, int: true },
+  'execution.rearm.maxInARow': { min: 0, max: 1000, int: true },
   'execution.cashoutThresholdSol': { min: 0.000001, max: 100 },
   'execution.computeUnitLimit': { min: 10_000, max: 1_400_000, int: true },
   // Below $5 Relay refuses (and its fixed cost is most of it); above $1,000
@@ -112,8 +116,8 @@ const BOUNDS: Record<string, { min: number; max: number; int?: boolean }> = {
   // Robinhood Chain. Pons charges 1 % + a creator tax per fill, so a few
   // percent is the working floor; 50 matches the Solana cap.
   'evm.slippagePct': { min: 0, max: 50 },
-  'evm.robinhood.maxLiveNative': { min: 0.000001, max: 100 },
-  'evm.bnb.maxLiveNative': { min: 0.000001, max: 1_000 },
+  'evm.robinhood.maxLiveNative': { min: 0, max: 100 },
+  'evm.bnb.maxLiveNative': { min: 0, max: 1_000 },
 };
 
 /**

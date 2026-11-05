@@ -10,6 +10,7 @@
 // Unchanged rules: switching to Live disarms the follow, arming it asks
 // first, and pausing stops ENTRIES only — open copies are still followed out.
 
+import { rearmClock } from '@shared/rearm';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { BookUser, MoreHorizontal, Pause, Play, Plus, Trash2, UserRound, Users } from 'lucide-react';
 import { EVM_CHAIN_META, nativeSymbolOf, type ChainKind, type EvmWalletSummary } from '@shared/evm';
@@ -89,7 +90,15 @@ export function FollowingPage() {
           (isFomo(c)
             ? `Every time ${fomoRuleOf(c).minWallets} of ${crowdNoun(c)} buy the same coin within ${fomoRuleOf(c).windowSec} s, real ${sym} will be spent, `
             : `Every ${directionOf(c) === 'reverse' ? 'sell' : 'buy'} by ${c.label || short(c.wallet)} will spend real ${sym} on ${chainName(chainOf(c))}, `) +
-          `up to ${c.maxTradeSol} per trade, until you lose ${c.dailyLossLimitSol} ${sym} in a day. ` +
+          `up to ${c.maxTradeSol} per trade` +
+          (c.dailyLossLimitSol > 0
+            ? `, until you lose ${c.dailyLossLimitSol} ${sym} in a day. `
+            : c.dailyTradeLimit > 0
+              ? `. It has no daily loss limit, so losing money does not stop it for the day: up to ${c.dailyTradeLimit} copies a day at that size. `
+              : c.walletLossStopSol != null
+                ? '. It has no daily limits. '
+                : `. It has no daily loss limit and no daily copy limit, so it keeps spending for as long as they keep trading and the wallet has funds. `) +
+          (c.walletLossStopSol != null ? `It pauses after losing ${c.walletLossStopSol} ${sym} in all. ` : '') +
           (directionOf(c) === 'reverse' ? 'Reverse copying bets the coin keeps going after they leave; nothing has measured that bet. ' : '') +
           'Measured over two periods, copying memecoin wallets loses money on average — run it on paper first if you have not.',
         confirmLabel: 'Arm live copying',
@@ -191,7 +200,7 @@ export function FollowingPage() {
 
         {snap?.loadFailure && (
           <div className="mt-6 rounded-xl border border-down/30 bg-down/10 px-4 py-3 text-note text-white">
-            Your copy-trading file could not be read — nothing was overwritten, and nothing is being saved this session. {snap.loadFailure} Close the app,
+            Your copy-trading file could not be read — nothing was overwritten, and nothing is being saved this session. {snap.loadFailure} Quit the app,
             copy that file somewhere safe, and check it before continuing.
           </div>
         )}
@@ -334,7 +343,7 @@ function FollowCard({
 
   // Paused by the app (2026-10-23): a per-wallet stop or failed copies.
   // Said in full until the user switches it back on.
-  const auto = !c.enabled && c.pausedReason ? `Paused by the app ${c.pausedAt ? fmtAgo(c.pausedAt) : ''} — ${c.pausedReason}` : null;
+  const auto = !c.enabled && c.pausedReason ? `Paused by the app ${c.pausedAt ? fmtAgo(c.pausedAt) : ''} — ${c.pausedReason}${c.rearmAt ? ` · back on by itself ${c.rearmAt <= Date.now() ? 'as soon as Live is on' : `at ${rearmClock(c.rearmAt)}`}` : ''}` : null;
   const status = !c.enabled
     ? auto
       ? `${auto}${open > 0 ? ` · still following ${open} open cop${open === 1 ? 'y' : 'ies'} out` : ''}`
@@ -369,7 +378,8 @@ function FollowCard({
     c.onePositionPerCoin ? 'one position per coin across follows' : null,
     c.ai && (c.ai.entries || c.ai.exits) ? `your AI decides ${c.ai.entries && c.ai.exits ? 'buys and sells' : c.ai.entries ? 'buys' : 'sells'}` : null,
     win ? `copies ${fmtClock(win.fromMin)}–${fmtClock(win.toMin)} only` : null,
-    `stops after −${c.dailyLossLimitSol} ${sym} a day`,
+    c.dailyLossLimitSol > 0 ? `stops after −${c.dailyLossLimitSol} ${sym} a day` : 'no daily loss limit',
+    c.dailyTradeLimit > 0 ? `at most ${c.dailyTradeLimit} copies a day` : 'no daily copy limit',
     c.walletLossStopSol ? `pauses after −${c.walletLossStopSol} ${sym} in all` : null,
     c.delayMs > 0 ? `${(c.delayMs / 1000).toFixed(1)} s delay` : null,
     c.minLiquidityUsd !== null ? `liquidity ≥ $${c.minLiquidityUsd.toLocaleString()}` : null,
@@ -401,6 +411,11 @@ function FollowCard({
               <span className={auto ? 'text-warn' : undefined} data-testid={auto ? 'follow-autopaused' : undefined}>
                 {status}
               </span>
+              {!c.enabled && c.rearmAt != null && (
+                <button type="button" className="underline hover:text-white" data-testid="follow-keep-off" onClick={() => void window.krypt.rearm.cancel('follow', c.id)}>
+                  Keep it off
+                </button>
+              )}
             </span>
             {signer && <span>signs with {signer}</span>}
           </div>

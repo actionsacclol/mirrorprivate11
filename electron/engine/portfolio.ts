@@ -147,6 +147,11 @@ export function build(inputs: PortfolioInputs): PortfolioSummary {
       hasFees = true;
     }
   }
+  const trimmedFees = ledger.trimmedFeeLamports();
+  if (trimmedFees > 0) {
+    feesPaid += trimmedFees / LAMPORTS;
+    hasFees = true;
+  }
   out.feesPaidSol = hasFees ? feesPaid : null;
 
   // ONE ROW PER ROUND TRIP, not per mint.

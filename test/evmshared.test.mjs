@@ -211,18 +211,18 @@ ok('default settings: shared slippage + referrer, one enabled block per chain, n
       // anywhere would be a default that posts your flags somewhere.
       // Krypto Mirror: runner alerts ship OFF (no Runners page), and both EVM
       // chains ship switched OFF — Solana first; Settings › Other chains
-      // turns them on (2026-10-22). Each ships with an automatic per-trade
-      // cap (2026-10-24), so a chain switched on later is never uncapped.
+      // turns them on (2026-10-22). No per-trade cap unless the user sets one
+      // (the owner's call, 2026-11-04: every limit starts off).
       {
         enabled: false,
         rpcUrl: '',
         apiKey: '',
         runnerAlerts: { enabled: false, minBucket: 11, maxPerHour: 12, requireBeatsBase: true, webhookUrl: '' },
-        maxLiveNative: chain === 'robinhood' ? 0.003 : 0.02,
+        maxLiveNative: 0,
       },
       chain,
     );
-    assert.equal(evmMaxLive(cs), cs.maxLiveNative);
+    assert.equal(evmMaxLive(cs), null, 'no per-trade cap unless set');
     assert.equal(resolveEvmRpcUrl(chain, cs), EVM_CHAIN_META[chain].publicRpc, `${chain} default resolves to the public endpoint`);
   }
   assert.deepEqual(Object.keys(DEFAULT_EVM_SETTINGS).sort(), ['bnb', 'referrer', 'robinhood', 'slippagePct']);

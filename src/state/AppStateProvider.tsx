@@ -275,6 +275,9 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       toastRef.current.success('Settings saved');
     } else {
       toastRef.current.error(r.message);
+      // Nothing was saved, so a field showing what was typed would be showing a
+      // limit that is not in force.
+      window.dispatchEvent(new Event('krypt:settings-refused'));
     }
   }, []);
 

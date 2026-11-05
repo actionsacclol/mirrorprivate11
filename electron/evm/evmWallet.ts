@@ -16,6 +16,8 @@ import path from 'node:path';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { getAddress, type Address, type Hex } from 'viem';
 import { logger } from '../system/logger';
+import { writeDurable } from '../system/durableFile';
+import * as vault from '../system/vault';
 import { client } from './client';
 import { CHAINS } from './chains';
 import { checkEvmTx, type EvmPolicy } from './policy';
@@ -28,13 +30,14 @@ import {
   emptyFile,
   nextLabel,
   parseFile,
+  eligibleOn,
   removeWallet as removeFromStore,
   renameWallet as renameInStore,
   selectWallet,
   type EvmStoredWallet,
   type EvmWalletsFile,
 } from './evmWalletStore';
-import { EVM_CHAIN_META, ROBINHOOD_CHAIN_ID, weiToEth, type EvmChainKind, type EvmWalletInfo, type EvmWalletSummary } from '@shared/evm';
+import { EVM_CHAIN_META, EVM_CHAINS, ROBINHOOD_CHAIN_ID, weiToEth, type EvmChainKind, type EvmWalletInfo, type EvmWalletSummary } from '@shared/evm';
 
 const FILE = 'evm-wallets.json';
 
@@ -44,6 +47,8 @@ let cache: EvmWalletsFile | null = null;
 let balances = new Map<string, { wei: bigint; at: number }>();
 const balKey = (chain: EvmChainKind, addr: string): string => `${chain}:${addr.toLowerCase()}`;
 let loadFailure: string | null = null;
+
+vault.registerStore(() => loadFile().wallets.map((w) => ({ family: 'evm', id: w.id, address: w.address, enc: w.secretEnc })));
 
 function file(): string {
   return path.join(app.getPath('userData'), FILE);
@@ -109,17 +114,13 @@ function persist(next: EvmWalletsFile): void {
     logger.warn(`evm wallet: not saving — ${loadFailure}`);
     throw new Error(`Wallet file is read-only this session: ${loadFailure}`);
   }
-  const p = file();
-  const tmp = `${p}.tmp`;
-  fs.mkdirSync(path.dirname(p), { recursive: true });
   // `activeId` is written alongside `active` for one reason: yesterday's
   // build reads ONLY `activeId`, and a file without it makes that build heal
   // to the OLDEST wallet — silently changing who signs after a rollback. One
   // redundant key keeps a downgrade honest. Robinhood's choice is the one
   // mirrored, because that is the chain the single-signer build served.
   const onDisk = { ...next, activeId: next.active.robinhood };
-  fs.writeFileSync(tmp, JSON.stringify(onDisk, null, 2), { encoding: 'utf8', mode: 0o600 });
-  fs.renameSync(tmp, p);
+  writeDurable(file(), JSON.stringify(onDisk, null, 2), { backup: true });
   // Only a wallet that is on disk may be listed (or become the active
   // signer). If the write above throws, memory stays as it was, so a key that
   // exists nowhere but RAM is never shown as something the user can fund.
@@ -146,13 +147,104 @@ function load(chain: EvmChainKind): EvmStoredWallet | null {
 const toHex = (b: Uint8Array): string => Buffer.from(b).toString('hex');
 
 function decryptSecret(w: EvmStoredWallet): Hex {
-  const buf = Buffer.from(w.secretEnc, 'base64');
-  const hex = safeStorage.decryptString(buf);
+  if (vault.isSealed(w.secretEnc)) return `0x${vault.open('evm', w.id, w.address, w.secretEnc).toString('hex')}` as Hex;
+  const refused = vault.cannotOpen(w.secretEnc);
+  if (refused) throw new Error(refused);
+  const hex = safeStorage.decryptString(Buffer.from(w.secretEnc, 'base64'));
   return `0x${hex.replace(/^0x/, '')}` as Hex;
 }
 
-function encryptSecret(pk: Hex): string {
+function encryptForOs(pk: Hex): string {
   return safeStorage.encryptString(pk.replace(/^0x/, '')).toString('base64');
+}
+
+/** The stored form of a new wallet's key, under the password when it is on. */
+function encryptSecret(pk: Hex, id: string, address: string): string {
+  if (!vault.sealsNewRecords()) return encryptForOs(pk);
+  return vault.seal('evm', id, address, 'hot', Buffer.from(pk.replace(/^0x/, ''), 'hex'));
+}
+
+/** Why a new key cannot be stored right now, or null. */
+function cannotStore(): string | null {
+  if (!encAvailable()) return 'OS secure storage is unavailable — refusing to store a key unencrypted.';
+  if (vault.isLocked()) return 'Your wallet is locked. Unlock it first.';
+  return null;
+}
+
+/** Why this chain's signing wallet cannot sign, in the user's words, or null. */
+export function lockReason(chain: EvmChainKind): string | null {
+  const w = load(chain);
+  if (!w) return vault.isLocked() ? 'Your wallet is locked. Type your wallet password to trade or send.' : null;
+  return vault.cannotSignUnattended(w.secretEnc);
+}
+
+/** Labels of the wallets whose key cannot be opened and matched to its address. */
+export function unreadable(): string[] {
+  return loadFile()
+    .wallets.filter((w) => {
+      try {
+        return getAddress(privateKeyToAccount(decryptSecret(w)).address) !== getAddress(w.address);
+      } catch {
+        return true;
+      }
+    })
+    .map((w) => w.label);
+}
+
+/** One row per wallet, for the password settings. */
+export function vaultRows(): { id: string; label: string; address: string; enc: string; active: boolean }[] {
+  const f = loadFile();
+  const signers = new Set(f.active ? Object.values(f.active) : []);
+  return f.wallets.map((w) => ({ id: w.id, label: w.label, address: w.address, enc: w.secretEnc, active: signers.has(w.id) }));
+}
+
+/** Write a re-encrypted store, checking every key back from the disk before the
+ *  old file goes, and leave no copy of the old form in the .bak. */
+function writeRewrapped(next: EvmWalletsFile): void {
+  const text = JSON.stringify({ ...next, activeId: next.active.robinhood }, null, 2);
+  writeDurable(file(), text, {
+    verify: (written) => {
+      const parsed = parseFile(JSON.parse(written), ROBINHOOD_CHAIN_ID);
+      if (!parsed || parsed.wallets.length !== next.wallets.length) throw new Error('the rewritten EVM wallet file did not read back');
+      for (const w of parsed.wallets) {
+        if (getAddress(privateKeyToAccount(decryptSecret(w)).address) !== getAddress(w.address)) throw new Error(`${w.label}: the rewritten key does not match its address`);
+      }
+    },
+  });
+  writeDurable(`${file()}.bak`, text);
+  cache = next;
+}
+
+/** Move every key to the password (or back to the OS store). Records already in
+ *  the right form are left alone, so an interrupted run resumes. */
+export function rewrapAll(to: 'sealed' | 'os'): number {
+  const blocked = blockedByFailure();
+  if (blocked) throw new Error(blocked.message);
+  const f = loadFile();
+  let changedCount = 0;
+  const wallets = f.wallets.map((w) => {
+    const sealed = vault.isSealed(w.secretEnc);
+    if ((to === 'sealed') === sealed) return w;
+    const pk = decryptSecret(w);
+    if (getAddress(privateKeyToAccount(pk).address) !== getAddress(w.address)) throw new Error(`${w.label}: the stored key does not match its address`);
+    changedCount += 1;
+    return { ...w, secretEnc: to === 'os' ? encryptForOs(pk) : vault.seal('evm', w.id, w.address, 'hot', Buffer.from(pk.replace(/^0x/, ''), 'hex')) };
+  });
+  writeRewrapped({ ...f, wallets });
+  return changedCount;
+}
+
+/** Make a wallet hot or cold. The caller holds the cold key. */
+export function setScope(id: string, scope: 'hot' | 'cold'): void {
+  const f = loadFile();
+  const wallets = f.wallets.map((w) => {
+    if (w.id !== id) return w;
+    return { ...w, secretEnc: vault.seal('evm', w.id, w.address, scope, Buffer.from(decryptSecret(w).replace(/^0x/, ''), 'hex')) };
+  });
+  const next = { ...f, wallets };
+  // The copy first: a crash in between must not leave a hot copy of a savings key.
+  writeDurable(`${file()}.bak`, JSON.stringify(next, null, 2));
+  writeRewrapped(next);
 }
 
 // ── Public reads ──────────────────────────────────────────────────────
@@ -233,12 +325,14 @@ export function balanceWei(chain: EvmChainKind, addr: Address): bigint | null {
 export function generate(label = '', forChain?: EvmChainKind, allowSwitch = true): { ok: boolean; message: string; address?: string } {
   const blocked = blockedByFailure();
   if (blocked) return blocked;
-  if (!encAvailable()) return { ok: false, message: 'OS secure storage is unavailable — refusing to store a key unencrypted.' };
+  const cannot = cannotStore();
+  if (cannot) return { ok: false, message: cannot };
   const f = loadFile();
   const pk = generatePrivateKey();
   const account = privateKeyToAccount(pk);
   const name = label ? cleanLabel(label, f.wallets.length + 1) : nextLabel(f, forChain);
-  const record = { id: newId(), label: name, address: account.address, secretEnc: encryptSecret(pk), createdAt: Date.now() };
+  const id = newId();
+  const record = { id, label: name, address: account.address, secretEnc: encryptSecret(pk, id, account.address), createdAt: Date.now() };
   const res = addRecord(f, record, forChain, allowSwitch);
   if (!res.ok) return { ok: false, message: res.message };
   persist(res.file);
@@ -256,7 +350,8 @@ function addRecord(f: ReturnType<typeof loadFile>, record: Parameters<typeof add
 export function importSecret(input: string, label = '', forChain?: EvmChainKind, allowSwitch = true): { ok: boolean; message: string; address?: string } {
   const blocked = blockedByFailure();
   if (blocked) return blocked;
-  if (!encAvailable()) return { ok: false, message: 'OS secure storage is unavailable.' };
+  const cannot = cannotStore();
+  if (cannot) return { ok: false, message: cannot };
   const trimmed = (input ?? '').trim();
   const bare = trimmed.replace(/^0x/i, '');
   if (!/^[0-9a-fA-F]{64}$/.test(bare)) return { ok: false, message: 'Expect a 32-byte private key as 64 hex characters (0x…).' };
@@ -269,7 +364,8 @@ export function importSecret(input: string, label = '', forChain?: EvmChainKind,
   }
   const f = loadFile();
   const name = label ? cleanLabel(label, f.wallets.length + 1) : nextLabel(f, forChain);
-  const record = { id: newId(), label: name, address: account.address, secretEnc: encryptSecret(pk), createdAt: Date.now() };
+  const id = newId();
+  const record = { id, label: name, address: account.address, secretEnc: encryptSecret(pk, id, account.address), createdAt: Date.now() };
   const res = addRecord(f, record, forChain, allowSwitch);
   if (!res.ok) return { ok: false, message: res.message };
   persist(res.file);
@@ -288,14 +384,16 @@ export function importSecret(input: string, label = '', forChain?: EvmChainKind,
 export function ensureFromPrivateKey(key: Uint8Array, label: string): { ok: boolean; message: string; id?: string; address?: string; existed?: boolean } {
   const blocked = blockedByFailure();
   if (blocked) return blocked;
-  if (!encAvailable()) return { ok: false, message: 'OS secure storage is unavailable — refusing to store a key unencrypted.' };
+  const cannot = cannotStore();
+  if (cannot) return { ok: false, message: cannot };
   if (key.length !== 32) return { ok: false, message: 'internal: an EVM private key is 32 bytes' };
   const pk = `0x${Buffer.from(key).toString('hex')}` as Hex;
   const account = privateKeyToAccount(pk);
   const f = loadFile();
   const held = f.wallets.find((w) => w.address.toLowerCase() === account.address.toLowerCase());
   if (held) return { ok: true, message: `${held.label} is already in your wallet list`, id: held.id, address: held.address, existed: true };
-  const record = { id: newId(), label: cleanLabel(label, f.wallets.length + 1), address: account.address, secretEnc: encryptSecret(pk), createdAt: Date.now() };
+  const id = newId();
+  const record = { id, label: cleanLabel(label, f.wallets.length + 1), address: account.address, secretEnc: encryptSecret(pk, id, account.address), createdAt: Date.now() };
   const res = addWallet(f, record);
   if (!res.ok) return { ok: false, message: res.message };
   persist(res.file);
@@ -315,6 +413,11 @@ export function assign(chain: EvmChainKind, id: string): { ok: boolean; message:
 export function select(chain: EvmChainKind, id: string): { ok: boolean; message: string } {
   const blocked = blockedByFailure();
   if (blocked) return blocked;
+  // The signer on a chain signs unattended, so it cannot need typing for.
+  const target = loadFile().wallets.find((w) => w.id === id);
+  if (target && vault.isSealed(target.secretEnc) && vault.scopeOf(target.secretEnc) === 'cold') {
+    return { ok: false, message: `${target.label} is a savings wallet. Turn on "Can auto-trade" for it in Settings first.` };
+  }
   const res = selectWallet(loadFile(), chain, id);
   if (!res.ok) return res;
   persist(res.file);
@@ -342,7 +445,18 @@ export function remove(id?: string): { ok: boolean; message: string } {
   const target = f.wallets.find((w) => w.id === targetId);
   const res = removeFromStore(f, targetId);
   if (!res.ok) return { ok: false, message: res.message };
+  // A chain's signer signs unattended, so it should not fall to a savings wallet
+  // while another wallet could do it.
+  const isCold = (w: { secretEnc: string }): boolean => vault.scopeOf(w.secretEnc) === 'cold';
+  for (const c of EVM_CHAINS) {
+    const active = res.file.wallets.find((w) => w.id === res.file.active?.[c]);
+    if (!active || !isCold(active)) continue;
+    const hot = res.file.wallets.filter((w) => !isCold(w) && eligibleOn(w, c)).sort((a, b) => a.createdAt - b.createdAt)[0];
+    if (hot && res.file.active) res.file.active[c] = hot.id;
+  }
   persist(res.file);
+  // Removed means removed: the backup copy just taken still holds this key.
+  writeDurable(`${file()}.bak`, fs.readFileSync(file(), 'utf8'));
   if (target) for (const k of [...balances.keys()]) if (k.endsWith(`:${target.address.toLowerCase()}`)) balances.delete(k);
   if (!res.file.wallets.length) balances = new Map();
   return { ok: true, message: res.message };
@@ -486,6 +600,8 @@ async function signWith(chain: EvmChainKind, w: EvmStoredWallet, tx: UnsignedTx,
   // chain it was asked to. They must agree, or a tx built for one chain
   // could be replayed on the other with the same key.
   if (policy.chainId !== chainId) return { ok: false, message: `Policy is for chain ${policy.chainId}, signing for ${chainId} — refusing` };
+  const refused = vault.cannotOpen(w.secretEnc);
+  if (refused) return { ok: false, message: refused };
   let pk: Hex | null = null;
   try {
     pk = decryptSecret(w);

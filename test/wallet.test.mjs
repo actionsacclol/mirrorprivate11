@@ -184,7 +184,7 @@ test('per-wallet settings do not leak between wallets', async () => {
   const activeId = w.info().id;
   const other = w.list().find((x) => x.id !== activeId);
   assert.equal(w.list().find((x) => x.id === activeId).maxBalanceSol, 7);
-  assert.equal(other.maxBalanceSol, 2, 'the other wallet keeps its own cap');
+  assert.equal(other.maxBalanceSol, 0, 'the other wallet keeps its own: none');
 });
 
 test('signing is refused when no wallet is held', async () => {

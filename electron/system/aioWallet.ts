@@ -20,6 +20,8 @@ import { Keypair } from '@solana/web3.js';
 import * as wallet from './wallet';
 import * as evmWallet from '../evm/evmWallet';
 import { logger } from './logger';
+import { writeDurable } from './durableFile';
+import * as vault from './vault';
 import { evmPrivateKeyAtPath, newSeedPhrase, normaliseSeedPhrase, seedPhraseProblem, solanaSeedAtPath } from './seedPhrase';
 import {
   aioFileBody,
@@ -35,6 +37,14 @@ import {
 
 let cache: AioRecord | null | undefined;
 let loadFailure: string | null = null;
+
+// The phrase opens every chain, so under the password it is always cold.
+const PHRASE_ID = 'phrase';
+
+vault.registerStore(() => {
+  const rec = load();
+  return rec ? [{ family: 'aio', id: PHRASE_ID, address: rec.solanaAddress, enc: rec.phraseEnc }] : [];
+});
 
 function file(): string {
   return path.join(app.getPath('userData'), 'aio-wallet.json');
@@ -83,11 +93,70 @@ function load(): AioRecord | null {
 
 function persist(rec: AioRecord | null): void {
   if (loadFailure) throw new Error(`refusing to write aio-wallet.json — ${loadFailure}`);
-  const tmp = `${file()}.tmp`;
-  // Owner-only, like the other key stores (evm-wallets.json).
-  fs.writeFileSync(tmp, JSON.stringify(aioFileBody(rec), null, 2), { encoding: 'utf8', mode: 0o600 });
-  fs.renameSync(tmp, file());
+  // This file holds the only copy of the phrase: same care as the key stores.
+  writeDurable(file(), JSON.stringify(aioFileBody(rec), null, 2), { backup: true });
   cache = rec;
+}
+
+function openPhrase(rec: AioRecord): string {
+  if (vault.isSealed(rec.phraseEnc)) return vault.open('aio', PHRASE_ID, rec.solanaAddress, rec.phraseEnc).toString('utf8');
+  const refused = vault.cannotOpen(rec.phraseEnc);
+  if (refused) throw new Error(refused);
+  return safeStorage.decryptString(Buffer.from(rec.phraseEnc, 'base64'));
+}
+
+function protectPhrase(phrase: string, solanaAddress: string): string {
+  if (!vault.sealsNewRecords()) return safeStorage.encryptString(phrase).toString('base64');
+  return vault.seal('aio', PHRASE_ID, solanaAddress, 'cold', Buffer.from(phrase, 'utf8'));
+}
+
+/** Move the phrase to the password (or back to the OS store). The caller holds
+ *  the cold key. Checked back from the disk before the old file goes. */
+export function rewrapAll(to: 'sealed' | 'os'): number {
+  const b = blocked();
+  if (b) throw new Error(b.message);
+  const rec = load();
+  if (!rec) return 0;
+  if ((to === 'sealed') === vault.isSealed(rec.phraseEnc)) {
+    // A crash after the file and before its copy: bring the copy along too, or
+    // the old form of the phrase stays in it.
+    writeDurable(`${file()}.bak`, JSON.stringify(aioFileBody(rec), null, 2));
+    return 0;
+  }
+  const phrase = openPhrase(rec);
+  const next: AioRecord = {
+    ...rec,
+    phraseEnc: to === 'os' ? safeStorage.encryptString(phrase).toString('base64') : vault.seal('aio', PHRASE_ID, rec.solanaAddress, 'cold', Buffer.from(phrase, 'utf8')),
+  };
+  const text = JSON.stringify(aioFileBody(next), null, 2);
+  writeDurable(file(), text, {
+    verify: (written) => {
+      const parsed = parseAioFile(JSON.parse(written));
+      if (!parsed || parsed === 'invalid' || openPhrase(parsed) !== phrase) throw new Error('the rewritten recovery phrase did not read back');
+    },
+  });
+  writeDurable(`${file()}.bak`, text);
+  cache = next;
+  return 1;
+}
+
+/** The phrase, if it cannot be opened right now. */
+export function unreadable(): string[] {
+  const rec = load();
+  if (!rec) return [];
+  try {
+    openPhrase(rec);
+    return [];
+  } catch {
+    return ['the All-in-One recovery phrase'];
+  }
+}
+
+/** Turning the password on when the phrase was never confirmed backed up would
+ *  put the only copy behind a new secret. */
+export function needsBackupFirst(): boolean {
+  const rec = load();
+  return Boolean(rec && rec.backedUpAt === null);
 }
 
 function blocked(): { ok: false; message: string } | null {
@@ -147,6 +216,8 @@ function setUp(phrase: string, labelIn: unknown, fresh: boolean, paths?: { solan
   const b = blocked();
   if (b) return b;
   if (!encAvailable()) return { ok: false, message: 'OS secure storage is unavailable — refusing to store a recovery phrase unencrypted.' };
+  if (vault.isLocked()) return { ok: false, message: 'Your wallet is locked. Unlock it first.' };
+  if (vault.sealsNewRecords() && !vault.coldIsOpen()) return { ok: false, message: 'Type your wallet password to do this.' };
   if (load()) return { ok: false, message: 'There is already an All-in-One wallet. Remove it first to set up a different one.' };
   const problem = seedPhraseProblem(phrase);
   if (problem) return { ok: false, message: problem };
@@ -168,7 +239,7 @@ function setUp(phrase: string, labelIn: unknown, fresh: boolean, paths?: { solan
     evmAddress,
     solanaWalletId: null,
     evmWalletId: null,
-    phraseEnc: safeStorage.encryptString(clean).toString('base64'),
+    phraseEnc: protectPhrase(clean, solanaAddress),
     createdAt: Date.now(),
     // An imported phrase is one the user already holds somewhere.
     backedUpAt: fresh ? null : Date.now(),
@@ -211,7 +282,7 @@ export function reveal(): { ok: boolean; message: string; phrase?: string } {
   const rec = load();
   if (!rec) return { ok: false, message: 'No All-in-One wallet.' };
   try {
-    return { ok: true, message: 'ok', phrase: safeStorage.decryptString(Buffer.from(rec.phraseEnc, 'base64')) };
+    return { ok: true, message: 'ok', phrase: openPhrase(rec) };
   } catch (err) {
     return { ok: false, message: `The recovery phrase could not be decrypted on this machine (${(err as Error).message}).` };
   }
@@ -257,6 +328,8 @@ export function forget(): { ok: boolean; message: string } {
   if (b) return b;
   if (!load()) return { ok: false, message: 'No All-in-One wallet.' };
   persist(null);
+  // Removed means removed: the backup copy just taken still holds the phrase.
+  writeDurable(`${file()}.bak`, fs.readFileSync(file(), 'utf8'));
   logger.warn('aio wallet: removed');
   return { ok: true, message: 'All-in-One wallet removed' };
 }

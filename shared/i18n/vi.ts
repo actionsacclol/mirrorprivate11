@@ -102,7 +102,7 @@ export const vi: Catalogue = {
   'settings.dataCollection': 'Thu thập dữ liệu',
   'settings.creatorBlocklist': 'Danh sách chặn người tạo',
   'settings.feesAndReferral': 'Phí và giới thiệu',
-  'settings.subtitle': 'Nguồn dữ liệu, điểm cuối RPC.',
+  'settings.subtitle': 'Phần cơ bản ở trên cùng. Mọi thứ khác nằm trong Advanced ở cuối trang.',
 
   'settings.theme': 'Giao diện',
   'settings.themeHint': 'Chọn một diện mạo — phông chữ, bề mặt, góc bo, hiệu ứng — rồi chọn màu nhấn. Màu xanh cho tăng, đỏ cho giảm và vàng cho mọi thứ liên quan đến tiền vẫn giữ nguyên.',

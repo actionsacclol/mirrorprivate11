@@ -1,57 +1,57 @@
 WEBVTT
 
 1
-00:00:00.963 --> 00:00:12.013
+00:00:00.965 --> 00:00:12.016
 The AI page connects an AI app you already use, such as Claude Code, Codex or Cursor, over MCP. It can research wallets, trade on paper, and, if you allow it, run your live follows.
 
 2
-00:00:13.770 --> 00:00:18.569
+00:00:13.750 --> 00:00:18.550
 Switch the connection on. It opens a port on this computer only, and starts read only.
 
 3
-00:00:22.800 --> 00:00:35.819
+00:00:22.726 --> 00:00:35.746
 Choose how far it reaches. Read only already runs the research tools: Scout scans, wallet checks, replays and backtests. Paper trading adds simulated trades, and live trading spends real funds within your limits.
 
 4
-00:00:38.054 --> 00:00:46.967
+00:00:37.943 --> 00:00:46.857
 Full control goes further. The AI can switch live follows on and widen them, delete follows, sell everything, and switch the app between paper and live.
 
 5
-00:00:52.687 --> 00:01:01.479
+00:00:52.571 --> 00:01:01.363
 Pick your AI app, then copy the command or the config into it. It carries a token, a password for this app, so the screen masks it. Never paste it into a chat.
 
 6
-00:01:09.638 --> 00:01:22.573
+00:01:09.394 --> 00:01:22.330
 Then paste this prompt into the AI app. It starts the loop that hears your follows and answers their questions, and between them it can research wallets for you. The AI app has to keep running, and each event it reads costs its own tokens.
 
 7
-00:01:23.302 --> 00:01:32.931
+00:01:23.056 --> 00:01:32.685
 Limits cap what the AI may spend on its own buys. Below full control, a follow’s copies keep their own size: the AI can only shrink or skip them. Sells are never capped.
 
 8
-00:01:34.539 --> 00:01:43.374
-With full control, the follow ceiling bounds every live follow the AI switches on or widens: the most per copy, and the most it may lose in a day.
+00:01:34.241 --> 00:01:44.653
+With full control, the follow ceiling bounds every live follow the AI switches on or widens: the most per copy, the most copies a day, and the loss that stops it for the day.
 
 9
-00:01:48.177 --> 00:01:58.520
+00:01:49.650 --> 00:01:59.993
 Whatever you allow, the AI can never touch the fee, see or move your keys, send funds anywhere, or change its own access and limits. It asks; the app checks and builds every trade.
 
 10
-00:01:59.555 --> 00:02:05.910
+00:02:01.036 --> 00:02:07.391
 Choose which follows it decides on the Follow page, under Advanced: Your AI decides each buy, each sell, or both.
 
 11
-00:02:11.737 --> 00:02:18.782
+00:02:13.041 --> 00:02:20.086
 Set how long it has to answer. Past that, the follow’s own rule decides, and for a buy you choose: skip it, or copy anyway.
 
 12
-00:02:24.326 --> 00:02:31.351
+00:02:25.586 --> 00:02:32.612
 Stop-losses do not wait for the AI unless you say so. An AI that is thinking, or offline, never holds you in a falling coin.
 
 13
-00:02:35.869 --> 00:02:43.398
+00:02:37.114 --> 00:02:44.643
 Back on the AI page: the follows it decides, the questions waiting on it, and every decision, with the answer and how long it took.
 
 14
-00:02:53.267 --> 00:02:59.235
+00:02:54.498 --> 00:03:00.466
 Start it on paper trading, and read its decisions for a week before you give an AI live trading or full control.

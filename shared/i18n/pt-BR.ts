@@ -102,7 +102,7 @@ export const ptBR: Catalogue = {
   'settings.dataCollection': 'Coleta de dados',
   'settings.creatorBlocklist': 'Lista de bloqueio de criadores',
   'settings.feesAndReferral': 'Taxas e indicações',
-  'settings.subtitle': 'Provedores de dados, endpoints RPC.',
+  'settings.subtitle': 'O básico fica no topo. Todo o resto está em Advanced, no final.',
 
   'settings.theme': 'Tema',
   'settings.themeHint': 'Escolha um visual — fontes, superfícies, cantos, efeitos — e depois uma cor de destaque. O verde de alta, o vermelho de baixa e o dourado do dinheiro continuam iguais.',

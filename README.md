@@ -60,8 +60,9 @@ and every skipped copy recorded with its reason.
 
 - A config starts on paper. Switching it to Live disarms it; arming is a separate,
   confirmed act, and the top bar must be on Live too.
-- A live config never comes back armed after a restart.
+- By default a live config comes back from a restart disarmed. The App restarts switch in Settings, Auto re-arm, changes that.
 - An exit is never blocked by a fee, a breaker or anti-tamper.
+- Auto re-arm (Settings): a follow paused by failed copies comes back by itself, waiting longer each time. Loss limits and restarts stay off unless you ask otherwise. Your own switch to Paper, locking your wallets and the kill switch always win.
 - A budget is a refusal, not a clamp.
 
 ## Data and keys
@@ -70,7 +71,8 @@ Everything lives in `%APPDATA%\Krypto Mirror` (its own folder: Krypto Mirror nev
 Krypto Bot's data or wallets, so both apps can run side by side). An install that ran under
 the app's earlier name keeps using `%APPDATA%\Krypto Copy` in place: the app finds its
 wallet or settings there and never copies or moves them. Keys are encrypted with the OS key
-store. A Helius key is the biggest single speed upgrade; it never leaves this machine.
+store, and an optional wallet password (Settings) encrypts them under a password as well: any
+program running as you can read an OS-store key, but not one under a password it does not have. A Helius key is the biggest single speed upgrade; it never leaves this machine.
 
 ## Building
 
@@ -82,7 +84,7 @@ npm test               # offline suites (scripts/test-steps.json)
 npm run dist           # installer in release/
 ```
 
-Electron is pinned exactly (43.4.1): the main process ships as V8 bytecode compiled for
+Electron is pinned exactly (43.8.7): the main process ships as V8 bytecode compiled for
 that runtime.
 
 ## Legal

@@ -126,7 +126,7 @@ export function GifPicker({ onPick, onClose }: { onPick: (dataUrl: string) => vo
             {needsKey && (
               <>
                 {' '}
-                Both providers give one away free. Paste it into Settings → Data.{' '}
+                Both providers give one away free. Paste it into Settings, under API keys, More keys.{' '}
                 <a
                   href={KEY_URL[provider]}
                   target="_blank"

@@ -99,7 +99,7 @@ export async function fundWallets(
 ): Promise<FundOutcome> {
   const owner = fromWalletId ? wallet.publicKeyOf(fromWalletId) : wallet.publicKey();
   if (!owner) return { ok: false, message: fromWalletId ? 'No such wallet to fund from' : 'No active wallet', sentLamports: 0, count: 0 };
-  const own = new Set(wallet.list().map((w) => w.publicKey));
+  const own = new Set(wallet.list().map((w) => w.publicKey).filter((k) => wallet.isTrusted(k)));
   for (const t of targets) {
     if (!own.has(t.publicKey)) return { ok: false, message: `${t.publicKey.slice(0, 8)}… is not one of this install's wallets`, sentLamports: 0, count: 0 };
     if (t.publicKey === owner) return { ok: false, message: 'The source wallet cannot fund itself', sentLamports: 0, count: 0 };

@@ -224,6 +224,12 @@ export function stop(): void {
   stopFills();
 }
 
+/** Back after a sleep. stop() keeps the list and watch() skips a known coin, so
+ *  held coins would otherwise stay off this socket until a new one came along. */
+export function resume(): void {
+  if (wanted.size || accounts.size) start();
+}
+
 function start(): void {
   if (running || !host) return;
   const url = host.wssUrl();
@@ -511,6 +517,9 @@ function scheduleReconnect(why: string): void {
   if (reconnectTimer) clearTimeout(reconnectTimer);
   reconnectTimer = null;
   if (!running) return;
+  accountPending.clear();
+  accountBySub.clear();
+  for (const sub of accounts.values()) sub.id = null;
   attempts += 1;
   if (attempts === 1) host?.log('warn', `priority feed: ${why}; reconnecting`);
   reconnectTimer = setTimeout(connect, reconnectDelayMs(attempts));

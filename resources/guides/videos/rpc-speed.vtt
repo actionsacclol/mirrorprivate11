@@ -1,49 +1,49 @@
 WEBVTT
 
 1
-00:00:00.966 --> 00:00:07.735
-A copy is only as fast as the endpoints behind it. Every one of them is set here: Settings, under Solana RPC.
+00:00:00.947 --> 00:00:10.231
+Most people never need this guide. A copy is only as fast as the endpoints behind it, and they are set in Settings, under Advanced, in Solana RPC.
 
 2
-00:00:11.359 --> 00:00:21.886
+00:00:16.386 --> 00:00:26.913
 Out of the box it all runs on free public endpoints. They work, but they are shared with everyone and rate limited, and one public socket loses about a fifth of its events under load.
 
 3
-00:00:22.611 --> 00:00:32.418
+00:00:27.621 --> 00:00:37.428
 This WebSocket hears the wallets you follow. Without a Helius key, every copy starts with a message on this socket, so a private one from your provider is the first upgrade.
 
 4
-00:00:33.124 --> 00:00:41.078
+00:00:38.144 --> 00:00:46.098
 Extra WebSockets race it on the launch feed. They all subscribe at once and the first to arrive wins, so every free one you add cuts the loss.
 
 5
-00:00:41.803 --> 00:00:50.800
+00:00:46.808 --> 00:00:55.805
 The HTTP endpoint does the bulk reads: mint checks, balances and holders. Lots of calls, none of them on the clock, so a free one is usually fine.
 
 6
-00:00:51.521 --> 00:01:01.874
+00:00:56.516 --> 00:01:06.868
 The one that matters most is the execution endpoint. Live buys and sells, their confirmations, fee estimates, and reading back each trade a followed wallet makes all go here.
 
 7
-00:01:02.577 --> 00:01:11.770
+00:01:07.585 --> 00:01:16.778
 Paste any paid provider: QuickNode, Triton, Shyft, or your own validator. Set, it wins over a Helius key, and the bulk reads stay on the cheaper endpoint.
 
 8
-00:01:12.479 --> 00:01:19.035
+00:01:17.491 --> 00:01:24.047
 Save, then press Measure. It makes five round trips to each saved endpoint, and the median is what an order will meet.
 
 9
-00:01:22.401 --> 00:01:32.450
+00:01:27.200 --> 00:01:37.249
 Read the line under each one. An endpoint that is fast only because it is behind the chain says how many slots behind, so a quick, stale answer cannot pass for a good one.
 
 10
-00:01:33.175 --> 00:01:45.289
+00:01:37.953 --> 00:01:50.067
 With a Helius key, Parsed Streams hears your followed wallets about 120 milliseconds sooner, with pump buys already decoded. It is free on every plan, at one credit per transaction they make.
 
 11
-00:01:45.995 --> 00:01:57.068
+00:01:50.792 --> 00:02:01.865
 The Helius feed socket joins the race, and came first 92 percent of the time when measured. At firehose rates it costs about 800 thousand credits a day, so it is for paid plans.
 
 12
-00:01:57.794 --> 00:02:08.714
+00:02:02.580 --> 00:02:13.500
 Changes apply the next time the engine starts. And speed narrows the gap behind the wallet you copy, it never closes it: a copy still fills after their trade, at the price that is left.

@@ -13,7 +13,7 @@
 // so before that happens.
 
 import { useState, type ReactNode } from 'react';
-import { CheckCircle2, ExternalLink, MinusCircle } from 'lucide-react';
+import { CheckCircle2, ChevronDown, ExternalLink, MinusCircle } from 'lucide-react';
 import type { AppSettings } from '@shared/types';
 import { DEFAULT_BACKTEST_CREDITS } from '@shared/credits';
 import { Card, GhostButton, PrimaryButton, Section } from '../common';
@@ -201,6 +201,8 @@ export function ApiKeysSection({
   updateSettings: (patch: Partial<AppSettings>) => Promise<void>;
 }) {
   const term = useTerminal();
+  /** The optional keys stay folded, so the two worth having are what you see. */
+  const [more, setMore] = useState(false);
   const jup = term.providers.find((p) => p.id === 'jupiter');
   const be = term.providers.find((p) => p.id === 'birdeye');
   const helius = (settings.rpc.heliusApiKey ?? '').trim();
@@ -233,7 +235,7 @@ export function ApiKeysSection({
   return (
     <Section
       title="API keys"
-      description="Every key the app can use, what each one unlocks, and whether it is set. None is needed to start. Helius and Jupiter are free and worth having; the rest are optional."
+      description="An API key is a free pass to a data service. The app works without any. Helius and Jupiter are free and worth having; the rest are optional."
     >
       <Card className="space-y-3">
         <KeyRow
@@ -249,13 +251,11 @@ export function ApiKeysSection({
           link={{ label: 'Get a free key at helius.dev', url: 'https://dashboard.helius.dev' }}
           unlocks={
             <>
-              Used where it matters: live trade simulation, sending, confirmation and send-time fee estimates; the holder and token-account reads the
-              public RPC refuses with HTTP 429; Parsed Streams for followed wallets (about 120 ms ahead of the standard feed); reading a wallet&rsquo;s last
-              30 days from the chain in seconds; and the chain-priced copy replays and board checks, inside the backtest allowance below. Launch
-              scanning and plain account reads stay on the free public endpoints, which measured as fast for that work.
+              Hears the wallets you follow sooner, about 120 ms ahead of the free feed, and makes live trades more reliable. It also reads a
+              wallet&rsquo;s last 30 days in seconds, for replays and checks.
             </>
           }
-          cost="Free plan: 1,000,000 credits a month and about ten requests a second. The app paces itself under that and counts every credit below; the feed socket switches itself off at the ceiling you set."
+          cost="The free plan gives 1,000,000 credits a month. The app stays under that and counts every credit below."
           onSave={async (key) => {
             await updateSettings({ rpc: { ...settings.rpc, heliusApiKey: key } });
           }}
@@ -271,7 +271,7 @@ export function ApiKeysSection({
             />
           </div>
           <p className="text-label leading-relaxed text-krypt-muted/70">
-            The feed switches that spend credits — the Helius feed socket, Parsed Streams, Helius only — are under Solana RPC below.
+            The feed switches that spend credits are under Advanced, in Solana RPC.
           </p>
         </KeyRow>
 
@@ -286,13 +286,12 @@ export function ApiKeysSection({
           link={{ label: 'Get a free key at portal.jup.ag', url: 'https://portal.jup.ag' }}
           unlocks={
             <>
-              No new data — every price and swap quote is keyless today. What the key buys is the <span className="text-white/80">host</span>: without one
-              the app uses <span className="font-mono">lite-api.jup.ag</span>, Jupiter&rsquo;s most-called host here and the one it is throttling &ldquo;until it is
-              fully retired&rdquo; (this app has measured its 429s). A key moves every Jupiter call, buy and sell quotes included, to{' '}
+              Jupiter gives the prices for your buys and sells. Without a key the app uses Jupiter&rsquo;s old address,{' '}
+              <span className="font-mono">lite-api.jup.ag</span>, which is being shut down and often refuses calls. A key moves everything to the new one,{' '}
               <span className="font-mono">api.jup.ag</span>.
             </>
           }
-          cost="Free. api.jup.ag publishes 1 request a second for a free key; the app slows Jupiter to match, so bursts take longer and the endpoint does not disappear underneath you."
+          cost="Free. A free key allows 1 request a second, and the app slows itself to match."
           onSave={(key) => saveData({ jupiterApiKey: key })}
           onCheck={() => checkProvider('jupiter')}
           status={
@@ -306,6 +305,21 @@ export function ApiKeysSection({
           }
         />
 
+        <button
+          onClick={() => setMore((m) => !m)}
+          aria-expanded={more}
+          className="flex w-full items-center justify-between rounded-lg border border-white/10 bg-black/20 px-4 py-3 text-left"
+          data-testid="apikey-more"
+        >
+          <span>
+            <span className="block text-value font-semibold text-white">More keys</span>
+            <span className="block text-note text-krypt-muted">Birdeye, GIPHY, Tenor and Robinhood Chain. All optional.</span>
+          </span>
+          <ChevronDown className={cls('h-5 w-5 flex-shrink-0 text-krypt-muted transition', more && 'rotate-180')} />
+        </button>
+
+        {more && (
+        <>
         <KeyRow
           testId="apikey-birdeye"
           title="Birdeye"
@@ -368,16 +382,17 @@ export function ApiKeysSection({
             <span className="ml-auto font-mono text-label text-krypt-muted">{alchemy ? `set · ends …${alchemy.slice(-4)}` : 'not set'}</span>
           </div>
           <p className="mt-1.5 text-body leading-relaxed text-krypt-muted">
-            A free Alchemy key gives Robinhood Chain its own endpoint instead of the public one. It is set under <span className="text-white/80">EVM chains</span>{' '}
-            below, beside that chain&rsquo;s RPC URL, because the two decide the endpoint together. BNB needs no key: its public endpoints are generous, and a
+            A free Alchemy key gives Robinhood Chain its own endpoint instead of the public one. It is set in <span className="text-white/80">EVM chains</span>{' '}
+            under Advanced, beside that chain&rsquo;s RPC URL, because the two decide the endpoint together. BNB needs no key: its public endpoints are generous, and a
             URL of your own goes in the same place.
           </p>
         </div>
+        </>
+        )}
 
         <p className="text-label leading-relaxed text-krypt-muted/70">
-          Keys stay in this computer&rsquo;s settings file. Each one travels only to its own provider, in a request header, never in a URL. They are removed
-          from the log, from recordings and from exported diagnostics, and there is no Krypt server to send them to. A key with a space or a line break in it
-          is refused when saved.
+          Keys stay on this computer. Each one goes only to its own service, never to Krypt, and they are removed from logs, recordings and exported
+          diagnostics. A key with a space or a line break in it is refused when saved.
         </p>
       </Card>
     </Section>

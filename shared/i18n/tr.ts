@@ -102,7 +102,7 @@ export const tr: Catalogue = {
   'settings.dataCollection': 'Veri toplama',
   'settings.creatorBlocklist': 'Oluşturucu kara listesi',
   'settings.feesAndReferral': 'Ücretler ve referans',
-  'settings.subtitle': 'Veri sağlayıcıları, RPC uç noktaları.',
+  'settings.subtitle': 'Temel ayarlar üstte. Geri kalan her şey en altta, Advanced bölümünde.',
 
   'settings.theme': 'Tema',
   'settings.themeHint': 'Bir görünüm seçin — yazı tipleri, yüzeyler, köşeler, efektler — sonra bir vurgu rengi. Yükseliş yeşili, düşüş kırmızısı ve paraya dair altın rengi aynı kalır.',

@@ -437,6 +437,9 @@ export interface ExecutionSettings {
    * every buy for eight hours.
    */
   rearmAfterVerifiedUpgrade: boolean;
+  /** What comes back on by itself after something stops live (shared/rearm.ts).
+   *  Read through readRearm: an older save has none. */
+  rearm: RearmSettings;
   /**
    * Swap any USDC that lands in a Solana wallet to SOL, by itself, while live
    * is armed (2026-09-27). pump.fun pays callout rewards in USDC and this is
@@ -475,8 +478,9 @@ export interface WalletHolding {
  *  Saved settings are merged OVER defaults, so changing a default alone never
  *  reaches a user who already has the old value on disk — see
  *  `settings-store.ts` migrateUnsafe(). */
-export const SETTINGS_REVISION = 8;
+export const SETTINGS_REVISION = 9;
 
+import { DEFAULT_REARM, type RearmSettings } from './rearm';
 import { defaultBotSettings, type BotSettings } from './bots';
 import { DEFAULT_MCP_SETTINGS, type McpSettings } from './mcp';
 import { DEFAULT_EVM_SETTINGS, type EvmSettings } from './evm';
@@ -517,6 +521,11 @@ export interface AppSettings {
    * each trade. Empty means nobody was named.
    */
   referrer: string;
+  /** Windows: the window's X hides to the system tray and says so, rather
+   *  than quitting. See shared/trayClose.ts. */
+  closeToTray: boolean;
+  /** While a follow or Live is running, the computer does not sleep by itself. */
+  keepAwake: boolean;
   /** True once the first-run flow has been shown, so it is never shown twice.
    *  Separate from `referrer` because declining to name one is a real answer. */
   onboarded: boolean;
@@ -1062,6 +1071,8 @@ export type EngineEvent =
   | { kind: 'walletSwitched'; publicKey: string | null }
   /** The All-in-One wallet was created, imported, switched to or removed. */
   | { kind: 'aioChanged' }
+  /** The wallet password was set, changed or removed, or the app locked or unlocked. */
+  | { kind: 'vaultChanged' }
   /**
    * A live trade on a mint the terminal has open (tape-subscribed). Priced
    * in SOL per token — the renderer converts to the chart's unit, and drops
@@ -1204,8 +1215,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
     // puts the whole app in Live. The user switches to Live in the top bar,
     // on purpose. Krypto Bot keeps Live as its default (08-29).
     liveEnabled: false,
-    maxLiveSol: 0.05,
-    maxOpenCopies: 5,
+    // Off by default (2026-11-04): limits are the user's to set. 0 = no cap. A
+    // follow still has its own most per copy, an order its own amount.
+    maxLiveSol: 0,
+    maxOpenCopies: 0,
     mevMode: 'fast',
     feeLane: 'fast',
     liveSlippagePct: 12,
@@ -1217,6 +1230,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
     // separately.
     autoSellOnExit: false,
     rearmAfterVerifiedUpgrade: true,
+    rearm: { ...DEFAULT_REARM },
     autoSwapUsdc: true,
     autoCashout: false,
     cashoutThresholdSol: 0.05,
@@ -1229,6 +1243,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   ai: DEFAULT_AI_SETTINGS,
   evm: { ...DEFAULT_EVM_SETTINGS },
   referrer: '',
+  closeToTray: true,
+  keepAwake: true,
   onboarded: false,
   // Never accepted. Every multi-wallet path refuses until it is. 0 rather
   // than null on purpose — see MultiWalletConsent for why a null default

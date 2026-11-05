@@ -511,6 +511,8 @@ export interface BroadcastResult {
   landed: boolean;
   /** True when the chain executed the tx but it errored (definitive). */
   chainErr: boolean;
+  /** What the chain said, when it did: the only way to tell slippage from the rest. */
+  chainError?: unknown;
   /**
    * True only when the chain's block height passed the tx's
    * lastValidBlockHeight without a confirmation — the tx can NEVER land.
@@ -661,7 +663,7 @@ export async function broadcastAndConfirm(opts: {
     ]);
     if (wsOutcome) {
       // The socket answered: definitive either way.
-      if (wsOutcome.err) return done({ landed: false, chainErr: true, laneNotes, expired: false });
+      if (wsOutcome.err) return done({ landed: false, chainErr: true, chainError: wsOutcome.err, laneNotes, expired: false });
       noteProcessed();
       return done({ landed: true, chainErr: false, laneNotes, expired: false });
     }
@@ -671,7 +673,7 @@ export async function broadcastAndConfirm(opts: {
     pollPenaltyMs = !st.ok && /429/.test(st.message) ? Math.min(3_000, pollPenaltyMs ? pollPenaltyMs * 2 : 1_000) : 0;
     if (st.ok && st.data) {
       const s = st.data[0];
-      if (s?.err) return done({ landed: false, chainErr: true, laneNotes, expired: false });
+      if (s?.err) return done({ landed: false, chainErr: true, chainError: s.err, laneNotes, expired: false });
       if (s?.confirmationStatus) noteProcessed();
       if (s?.confirmationStatus === 'confirmed' || s?.confirmationStatus === 'finalized') {
         return done({ landed: true, chainErr: false, laneNotes, expired: false });
@@ -701,7 +703,7 @@ export async function broadcastAndConfirm(opts: {
           noteProcessed();
           return done({ landed: true, chainErr: false, laneNotes, expired: false });
         }
-        if (s?.err) return done({ landed: false, chainErr: true, laneNotes, expired: false });
+        if (s?.err) return done({ landed: false, chainErr: true, chainError: s.err, laneNotes, expired: false });
         // Seen at processed but not confirmed yet: still in flight.
         if (s) continue;
         return done({ landed: false, chainErr: false, laneNotes, expired: true });

@@ -109,7 +109,7 @@ const notification = (sub, sig) =>
     sock = ws;
     ws.on('message', (raw) => {
       const req = JSON.parse(String(raw));
-      received.push(req);
+      if (req.method !== 'slotSubscribe') received.push(req);
       if (req.method === 'logsSubscribe') ws.send(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: 5 }));
       if (req.method === 'logsUnsubscribe') ws.send(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: true }));
     });
@@ -364,7 +364,7 @@ const notification = (sub, sig) =>
     sock = ws;
     ws.on('message', (raw) => {
       const req = JSON.parse(String(raw));
-      received.push(req);
+      if (req.method !== 'slotSubscribe') received.push(req);
       if (req.method === 'transactionSubscribe') ws.send(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: 9 }));
       if (req.method === 'transactionUnsubscribe') ws.send(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: true }));
     });
@@ -423,7 +423,7 @@ const notification = (sub, sig) =>
     sock = ws;
     ws.on('message', (raw) => {
       const req = JSON.parse(String(raw));
-      received.push(req);
+      if (req.method !== 'slotSubscribe') received.push(req);
       if (req.method === 'transactionSubscribe') ws.send(JSON.stringify({ jsonrpc: '2.0', id: req.id, error: { code: -32601, message: 'Method not found' } }));
       if (req.method === 'logsSubscribe') ws.send(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: 11 + received.length }));
     });
@@ -550,7 +550,7 @@ async function twoHosts({ refuseTx = false, refuseParsed = false } = {}) {
     rpc.sock = ws;
     ws.on('message', (raw) => {
       const req = JSON.parse(String(raw));
-      rpc.received.push(req);
+      if (req.method !== 'slotSubscribe') rpc.received.push(req);
       if (req.method === 'transactionSubscribe' && refuseTx) ws.send(JSON.stringify({ jsonrpc: '2.0', id: req.id, error: { code: -32601, message: 'Method not found' } }));
       if (req.method === 'logsSubscribe') ws.send(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: 21 }));
     });
@@ -834,6 +834,202 @@ const sigOf = (init) => {
   watcher._reset();
   await s.close();
   console.log('ok  a busy leader fills only its own queue — a quiet leader is still read at once');
+}
+
+// ── days of running: sleep, a refused subscribe, a refused ceiling ───────
+{
+  const W = 'Sleepy111111111111111111111111111111111111';
+  let conns = 0;
+  const s = await server((ws) => {
+    conns += 1;
+    ws.on('message', (raw) => {
+      const req = JSON.parse(String(raw));
+      if (req.method === 'logsSubscribe') ws.send(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: 40 + conns }));
+    });
+  });
+  watcher._reset();
+  watcher.attach({ wssUrl: () => s.url, httpUrl: () => 'https://rpc.test/', onSwap: () => {}, log: () => {} });
+  watcher.setWallets([W]);
+  assert.ok(await waitFor(() => watcher.status()[W]?.state === 'watching'), 'watching before the sleep');
+  // What the computer going to sleep does, then what waking it does.
+  watcher.stop();
+  assert.equal(watcher.status()[W]?.state, 'off', 'the socket is down for the sleep');
+  watcher.setWallets([W]);
+  assert.ok(await waitFor(() => watcher.status()[W]?.state === 'watching'), 'the same list brings it back after a sleep');
+  assert.equal(conns, 2, 'on a new socket');
+  watcher._reset();
+  await s.close();
+  console.log('ok  waking from sleep brings the watcher back, with no follow touched');
+}
+{
+  const W = 'Refused11111111111111111111111111111111111';
+  const answers = ['some passing error'];
+  let asked = 0;
+  const s = await server((ws) => {
+    ws.on('message', (raw) => {
+      const req = JSON.parse(String(raw));
+      if (req.method !== 'logsSubscribe') return;
+      asked += 1;
+      const no = answers.shift();
+      ws.send(JSON.stringify(no ? { jsonrpc: '2.0', id: req.id, error: { code: -32000, message: no } } : { jsonrpc: '2.0', id: req.id, result: 77 }));
+    });
+  });
+  watcher._reset();
+  watcher.attach({ wssUrl: () => s.url, httpUrl: () => 'https://rpc.test/', onSwap: () => {}, log: () => {} });
+  watcher.setWallets([W]);
+  assert.ok(await waitFor(() => asked === 1), 'asked once');
+  await sleep(50);
+  assert.equal(watcher.status()[W]?.state, 'connecting', 'refused, and the socket stayed up');
+  watcher._recoverTick();
+  assert.ok(await waitFor(() => watcher.status()[W]?.state === 'watching'), 'the minute check asks again');
+  assert.equal(asked, 2);
+  watcher._recoverTick();
+  await sleep(50);
+  assert.equal(asked, 2, 'a watched wallet is not asked for twice');
+  watcher._reset();
+  await s.close();
+  console.log('ok  a refused subscribe is asked again, not left unwatched until the socket drops');
+}
+{
+  const W = 'Ceiling11111111111111111111111111111111111';
+  const answers = ['rate limit exceeded'];
+  let asked = 0;
+  const s = await server((ws) => {
+    ws.on('message', (raw) => {
+      const req = JSON.parse(String(raw));
+      if (req.method !== 'logsSubscribe') return;
+      asked += 1;
+      const no = answers.shift();
+      ws.send(JSON.stringify(no ? { jsonrpc: '2.0', id: req.id, error: { code: -32005, message: no } } : { jsonrpc: '2.0', id: req.id, result: 78 }));
+    });
+  });
+  watcher._reset();
+  watcher.attach({ wssUrl: () => s.url, httpUrl: () => 'https://rpc.test/', onSwap: () => {}, log: () => {} });
+  watcher.setWallets([W]);
+  assert.ok(await waitFor(() => watcher.status()[W]?.state === 'over-cap'), 'read as a ceiling');
+  watcher._recoverTick(Date.now() + 60_000);
+  await sleep(50);
+  assert.equal(asked, 1, 'not hammered every minute');
+  watcher._recoverTick(Date.now() + 11 * 60_000);
+  assert.ok(await waitFor(() => watcher.status()[W]?.state === 'watching'), 'asked again after ten minutes, and the ceiling was not for ever');
+  watcher._reset();
+  await s.close();
+  console.log('ok  a refusal that reads like a ceiling is tried again, not believed for days');
+}
+
+// ── A socket that answers pings and delivers nothing (2026-11-04) ─────
+
+const slotFrame = (sub) => JSON.stringify({ jsonrpc: '2.0', method: 'slotNotification', params: { subscription: sub, result: { slot: 1, parent: 0, root: 0 } } });
+
+/** A host that takes subscriptions. `onSlot` decides what a slot request gets. */
+const pulseServer = async (onSlot) => {
+  const state = { conns: 0, slotAsks: 0, frames: [] };
+  state.s = await server((ws, n) => {
+    state.conns = n;
+    ws.on('message', (raw) => {
+      const req = JSON.parse(String(raw));
+      state.frames.push(req.method);
+      if (req.method === 'logsSubscribe') ws.send(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: 7 }));
+      if (req.method === 'slotSubscribe') {
+        state.slotAsks += 1;
+        onSlot(ws, req, n);
+      }
+    });
+  });
+  return state;
+};
+const startPulse = (url, logs = []) => {
+  watcher._reset();
+  watcher.attach({ wssUrl: () => url, httpUrl: () => 'https://rpc.test/', onSwap: () => {}, log: (_l, line) => logs.push(line) });
+  watcher._setPulseTimes(60, 20);
+  watcher.setWallets(['Pulse111111111111111111111111111111111111111']);
+};
+
+{
+  const logs = [];
+  const st = await pulseServer((ws, req, n) => {
+    ws.send(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: 9 }));
+    ws.send(slotFrame(9));
+    // The first socket goes quiet, pongs and all still answering. The second keeps talking.
+    if (n > 1) {
+      const t = setInterval(() => (ws.readyState === 1 ? ws.send(slotFrame(9)) : clearInterval(t)), 10);
+    }
+  });
+  startPulse(st.s.url, logs);
+  assert.ok(await waitFor(() => st.conns >= 2, 4000), 'a silent stream on an open socket is replaced');
+  assert.ok(logs.some((l) => /answers but nothing has arrived/.test(l)), 'and the log says why');
+  const c = st.conns;
+  await sleep(300);
+  assert.equal(st.conns, c, 'a socket whose stream is alive is left alone');
+  watcher._reset();
+  await st.s.close();
+  console.log('ok  an open socket that stops streaming is replaced within the pulse window');
+}
+{
+  // Never answers, then refuses: neither proves the stream is dead.
+  const quiet = await pulseServer(() => {});
+  startPulse(quiet.s.url);
+  assert.ok(await waitFor(() => quiet.slotAsks === 1));
+  await sleep(250);
+  assert.equal(quiet.conns, 1, 'no slot was ever heard, so silence means nothing');
+  watcher._reset();
+  await quiet.s.close();
+  const refused = await pulseServer((ws, req) => ws.send(JSON.stringify({ jsonrpc: '2.0', id: req.id, error: { code: -32601, message: 'Method not found' } })));
+  const logs = [];
+  startPulse(refused.s.url, logs);
+  assert.ok(await waitFor(() => refused.slotAsks === 1));
+  await sleep(250);
+  assert.equal(refused.conns, 1, 'a host that does not serve slots keeps its socket');
+  assert.ok(!logs.some((l) => /subscribe rejected/.test(l)), 'and it is not reported as a wallet problem');
+  watcher._reset();
+  await refused.s.close();
+  console.log('ok  a host without a slot stream is not reconnected over it');
+}
+{
+  // Every socket says one slot then nothing: reconnecting does not help.
+  const logs = [];
+  const st = await pulseServer((ws, req) => {
+    ws.send(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: 9 }));
+    ws.send(slotFrame(9));
+  });
+  startPulse(st.s.url, logs);
+  assert.ok(await waitFor(() => logs.some((l) => /keeps stopping/.test(l)), 6000), 'it stops believing the pulse');
+  const c = st.conns;
+  assert.ok(c <= 3, `at most three sockets: ${c}`);
+  await sleep(300);
+  assert.equal(st.conns, c, 'and stops reconnecting');
+  watcher._reset();
+  await st.s.close();
+  console.log('ok  a slot stream that keeps stopping cannot cause a reconnect loop');
+}
+{
+  // The routine catch-up finds what the live subscription never delivered.
+  const logs = [];
+  const st = await pulseServer(() => {});
+  startPulse(st.s.url, logs);
+  watcher._setMissGraceMs(-5_000);
+  const W = 'Pulse111111111111111111111111111111111111111';
+  assert.ok(await waitFor(() => watcher.status()[W]?.state === 'watching'));
+  // From before this subscription: not its to deliver.
+  sigList = [{ signature: 'beforeSub', err: null, blockTime: Math.floor(Date.now() / 1000) - 60 }];
+  watcher._recoverTick(Date.now());
+  await sleep(150);
+  assert.equal(st.conns, 1, 'older than the subscription proves nothing');
+  // Landed while it was up.
+  sigList = [{ signature: 'missedLive', err: null, blockTime: Math.ceil(Date.now() / 1000) + 1 }];
+  watcher._recoverTick(Date.now() + 6 * 60_000);
+  assert.ok(await waitFor(() => st.conns === 2, 2000), 'every wallet is resubscribed');
+  assert.ok(logs.some((l) => /live feed missed a transaction/.test(l)));
+  assert.ok(await waitFor(() => watcher.status()[W]?.state === 'watching'));
+  sigList = [{ signature: 'missedLive2', err: null, blockTime: Math.ceil(Date.now() / 1000) + 1 }];
+  watcher._recoverTick(Date.now() + 12 * 60_000);
+  await sleep(150);
+  assert.equal(st.conns, 2, 'at most once in five minutes');
+  assert.ok(logs.filter((l) => /live feed missed/.test(l)).length === 1);
+  sigList = [];
+  watcher._reset();
+  await st.s.close();
+  console.log('ok  a catch-up that proves the feed missed a trade resubscribes everyone');
 }
 
 console.log('\nwalletwatcher: all tests passed');

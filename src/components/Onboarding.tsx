@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   ArrowLeft,
   ArrowRight,
+  BookOpen,
   Check,
   Compass,
   ExternalLink,
@@ -205,6 +206,8 @@ export function Onboarding({
   const [reading, setReading] = useState(false);
   const [agreed, setAgreed] = useState(false);
   const [busy, setBusy] = useState(false);
+  /** Set up a wallet goes through the last screen too, so nobody misses it. */
+  const [thenWallet, setThenWallet] = useState(false);
 
   const [addr, setAddr] = useState('');
   const [touched, setTouched] = useState(false);
@@ -414,7 +417,7 @@ export function Onboarding({
           </>
         )}
 
-        {/* ── 2. Cost + referral ────────────────────────────────────── */}
+        {/* ── 3. Cost + referral ────────────────────────────────────── */}
         {step === 'referral' && (
           <>
             <div className="px-6 py-6 space-y-3">
@@ -438,6 +441,9 @@ export function Onboarding({
               {problem && <p className="text-body text-rose-300">{problem}</p>}
             </div>
             <div className="px-6 py-4 border-t border-white/10 flex items-center gap-2">
+              <GhostButton onClick={() => setStep('language')} disabled={busy}>
+                <ArrowLeft className="h-3.5 w-3.5" /> Back
+              </GhostButton>
               <span className="text-label text-krypt-muted/60">You can add this later in Settings.</span>
               <div className="flex-1" />
               <PrimaryButton onClick={() => void goFromFee()} disabled={!!problem || busy}>
@@ -448,18 +454,18 @@ export function Onboarding({
           </>
         )}
 
-        {/* ── 3. API keys ───────────────────────────────────────────── */}
+        {/* ── 4. API keys ───────────────────────────────────────────── */}
         {step === 'keys' && (
           <>
             <div className="px-6 py-5 space-y-3 max-h-[56vh] overflow-y-auto">
               <div className="flex items-center gap-2 text-white text-note font-semibold">
                 <KeyRound className="h-3.5 w-3.5 text-krypt-purple" />
-                Connect your data (optional)
+                Free API keys (optional)
               </div>
               <p className="text-body leading-relaxed text-krypt-muted">
-                <span className="text-white">Krypto Mirror works right now with no keys at all.</span> It races several free
-                public Solana endpoints for the launch feed. These three are free upgrades — paste them here, or skip
-                and add them any time under Settings.
+                <span className="text-white">Krypto Mirror works right now with no keys.</span> An API key is a free pass to a
+                data service, and these make the app faster and more reliable. Paste them here, or skip and add them
+                later in Settings.
               </p>
 
               {/* The recorded keys guide (Settings › Guides), played right here. */}
@@ -467,13 +473,13 @@ export function Onboarding({
 
               <Field
                 label="Helius API key"
-                hint="Free tier. Used where it matters — trade simulation, sending, confirmation, fee estimates, and the holder reads the public RPC refuses with 429. Launch scanning stays on public endpoints. Paste the key or the whole URL."
+                hint="Recommended and free. Hears the wallets you follow sooner and makes live trades more reliable. Paste the key or the whole link."
                 value={helius}
                 onChange={(v) => {
                   setHelius(v);
                   setSavedHelius(false);
                 }}
-                placeholder="Helius API key, or paste the full https://…?api-key=… URL"
+                placeholder="Helius key, or the whole https://…?api-key=… link"
                 saved={savedHelius || !!settings.rpc.heliusApiKey}
                 link="Get a free key"
                 onLink={() => void window.krypt.app.openExternal('https://dashboard.helius.dev')}
@@ -481,7 +487,7 @@ export function Onboarding({
 
               <Field
                 label="Birdeye API key"
-                hint="Optional. Adds sub-minute price candles for charts. Everything else works without it."
+                hint="Optional. Adds charts shorter than one minute. Everything else works without it."
                 value={birdeye}
                 onChange={(v) => {
                   setBirdeye(v);
@@ -495,7 +501,7 @@ export function Onboarding({
 
               <Field
                 label="Jupiter API key"
-                hint="Optional and free. It unlocks no extra data — it moves every Jupiter call, buy and sell quotes included, off lite-api.jup.ag, which Jupiter is retiring, onto api.jup.ag at its published 1 request a second."
+                hint="Recommended and free. Jupiter gives the prices for your buys and sells. Without a key the app uses Jupiter's old address, which is being shut down."
                 value={jupiter}
                 onChange={(v) => {
                   setJupiter(v);
@@ -508,8 +514,7 @@ export function Onboarding({
               />
 
               <p className="text-label leading-relaxed text-krypt-muted/60">
-                Keys are stored on this machine only and are stripped from recordings. They are never sent to Krypt —
-                there is no Krypt server to send them to.
+                Keys stay on this computer. Each one goes only to its own service, never to Krypt.
               </p>
             </div>
             <div className="px-6 py-4 border-t border-white/10 flex items-center gap-2">
@@ -538,7 +543,7 @@ export function Onboarding({
           </>
         )}
 
-        {/* ── 4. Wallet ─────────────────────────────────────────────── */}
+        {/* ── 5. Wallet ─────────────────────────────────────────────── */}
         {step === 'wallet' && (
           <>
             <div className="px-6 py-5 space-y-3 max-h-[56vh] overflow-y-auto">
@@ -547,30 +552,27 @@ export function Onboarding({
                 Your trading wallet
               </div>
               <p className="text-body leading-relaxed text-krypt-muted">
-                Krypto Mirror can find, check and paper-follow wallets with no wallet of your own. You only need one to copy live.
+                You can find, check and practice-follow traders with no wallet of your own. You only need one to copy with real money.
               </p>
               <div className="rounded-md border border-white/10 bg-black/25 px-3 py-2.5 space-y-1.5">
                 <p className="text-body leading-relaxed text-krypt-muted">
-                  <span className="text-white">Use a dedicated hot wallet.</span> Generate a fresh one under Wallet, or
-                  import an existing key. Fund it with an amount you would not mind losing entirely — not your main
-                  wallet.
+                  <span className="text-white">Make a new wallet just for this app,</span> not your main one. Only put in
+                  money you can afford to lose.
                 </p>
                 <p className="text-body leading-relaxed text-krypt-muted">
-                  <span className="text-white">Your key is encrypted by your system’s key store</span> (Windows, the macOS
-                  Keychain or your Linux keyring) and never leaves this machine. If it cannot be stored securely, Krypto
-                  Mirror refuses to store it at all rather than leave it in the clear.
+                  <span className="text-white">Your private key is the secret that controls the wallet.</span> It is encrypted
+                  on this computer and never leaves it. If your computer cannot keep it safe, the app will not store it.
                 </p>
                 <p className="text-body leading-relaxed text-krypt-muted">
-                  <span className="text-white">The app stays in Paper after this wallet is made</span> — nothing spends real
-                  SOL until you switch to Live in the top bar and arm a copy yourself. Nothing trades on its own: on
-                  Solana there is a per-trade cap, a balance cap and a kill switch, and the scanner only flags tokens. The
-                  EVM chains (Robinhood, BNB) start in Paper and are armed by hand, each on its own.
+                  <span className="text-white">Nothing spends real money until you say so.</span> Paper means practice:
+                  pretend money at real prices. The app stays on Paper until you switch the top bar to Live and turn on
+                  Live for a follow. Any limits are yours to set.
                 </p>
               </div>
               <div className="rounded-md border border-arc-gold/25 bg-arc-gold/[0.06] px-3 py-2">
                 <p className="text-body leading-relaxed text-krypt-muted">
                   <AlertTriangle className="inline h-3.5 w-3.5 text-arc-gold mr-1 -mt-0.5" />
-                  Back up your key somewhere safe before you fund it. Nobody — including Krypt — can recover it for you.
+                  Save your key somewhere safe before you put money in. Nobody can get it back for you, not even Krypt.
                 </p>
               </div>
             </div>
@@ -579,17 +581,29 @@ export function Onboarding({
                 <ArrowLeft className="h-3.5 w-3.5" /> Back
               </GhostButton>
               <div className="flex-1" />
-              <GhostButton onClick={() => setStep('ready')} disabled={busy}>
+              <GhostButton
+                onClick={() => {
+                  setThenWallet(false);
+                  setStep('ready');
+                }}
+                disabled={busy}
+              >
                 Later
               </GhostButton>
-              <PrimaryButton onClick={() => jump('wallet')} disabled={busy}>
+              <PrimaryButton
+                onClick={() => {
+                  setThenWallet(true);
+                  setStep('ready');
+                }}
+                disabled={busy}
+              >
                 <WalletIcon className="h-3.5 w-3.5" /> Set up a wallet
               </PrimaryButton>
             </div>
           </>
         )}
 
-        {/* ── 5. Ready ──────────────────────────────────────────────── */}
+        {/* ── 6. Ready ──────────────────────────────────────────────── */}
         {step === 'ready' && (
           <>
             <div className="px-6 py-5 space-y-3 max-h-[56vh] overflow-y-auto">
@@ -600,30 +614,41 @@ export function Onboarding({
               <div className="space-y-2">
                 {[
                   {
+                    icon: BookOpen,
+                    title: 'Stuck? Press the book button, top right',
+                    detail: 'It opens the Guides: short videos and written steps for everything, from getting SOL to going live. They are there any time.',
+                    key: true,
+                  },
+                  {
+                    icon: WalletIcon,
+                    title: 'Press your balance, top right, to see your wallet',
+                    detail: 'It shows your address, your balance, a refresh button and Send / Withdraw. It says No wallet until you make one, and pressing it then takes you to set one up.',
+                    key: true,
+                  },
+                  {
                     icon: Compass,
                     title: 'Find someone worth following',
                     detail:
-                      'Find wallets ranks traders by what a FOLLOWER would have kept — two seconds late and paying fees — not by what they made. Measured over two periods, copying loses on average; the score ranks the least bad.',
+                      'Discover ranks traders by what someone copying them would have kept, after the delay and the fees. Measured over two periods, copying loses on average, so the list ranks the least bad, not a sure thing.',
                   },
                   {
                     icon: ShieldAlert,
                     title: 'Paper first, always',
                     detail:
-                      'Every follow starts on paper: fills at the price after your delay, with fees, so a flat round trip loses. Watch the record before any real money moves.',
+                      'Paper means practice: pretend money at real prices, with every fee counted. Every follow starts on Paper. Watch how it does before any real money moves.',
                   },
                   {
                     icon: Zap,
                     title: 'Going live',
-                    detail: `Switch the top bar to Live, then switch a follow to Live and confirm it. Each copy is sized and capped by you, with a daily loss limit. Krypt takes ${feePctLabel()} of every buy and every sell, charged on-chain in the same transaction.`,
+                    detail: `When you are ready, switch the top bar to Live, then switch a follow to Live and confirm. You choose the size of each copy and any loss limit. Krypt takes ${feePctLabel()} of every buy and every sell, inside the same trade.`,
                   },
                   {
                     icon: KeyRound,
-                    title: 'Everything is under Settings',
-                    detail:
-                      'Your RPC endpoints and a Measure button to time them, market-data keys, the fee details and your referrer — all there at any time.',
+                    title: 'Settings: the gear, top right',
+                    detail: 'The simple settings are on top. Everything else is folded under Advanced, and you can leave it alone.',
                   },
                 ].map((row) => (
-                  <div key={row.title} className="rounded-md border border-white/10 bg-black/25 px-3 py-2">
+                  <div key={row.title} className={cls('rounded-md border px-3 py-2', row.key ? 'border-krypt-purple/40 bg-krypt-purple/10' : 'border-white/10 bg-black/25')}>
                     <div className="flex items-center gap-1.5 text-body font-semibold text-white">
                       <row.icon className="h-3.5 w-3.5 text-krypt-purple flex-shrink-0" />
                       {row.title}
@@ -645,10 +670,17 @@ export function Onboarding({
                 <ArrowLeft className="h-3.5 w-3.5" /> Back
               </GhostButton>
               <div className="flex-1" />
-              <PrimaryButton onClick={() => void finish()} disabled={busy}>
-                {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Compass className="h-3.5 w-3.5" />}
-                Start following
-              </PrimaryButton>
+              {thenWallet ? (
+                <PrimaryButton onClick={() => jump('wallet')} disabled={busy}>
+                  {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <WalletIcon className="h-3.5 w-3.5" />}
+                  Set up my wallet
+                </PrimaryButton>
+              ) : (
+                <PrimaryButton onClick={() => void finish()} disabled={busy}>
+                  {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Compass className="h-3.5 w-3.5" />}
+                  Start following
+                </PrimaryButton>
+              )}
             </div>
           </>
         )}

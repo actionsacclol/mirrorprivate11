@@ -144,6 +144,17 @@ const api = {
     exportAll: () => ipcRenderer.invoke('wallet:export'),
     remove: (id?: string) => ipcRenderer.invoke('wallet:remove', id),
   },
+  // The wallet password. No call here carries a password: main opens its own
+  // window to ask for one (electron/system/passwordPrompt.ts).
+  vault: {
+    status: () => ipcRenderer.invoke('vault:status'),
+    unlock: () => ipcRenderer.invoke('vault:unlock'),
+    turnOn: () => ipcRenderer.invoke('vault:turnOn'),
+    turnOff: () => ipcRenderer.invoke('vault:turnOff'),
+    change: () => ipcRenderer.invoke('vault:change'),
+    stopAndLock: () => ipcRenderer.invoke('vault:stopAndLock'),
+    setAutoTrade: (family: 'solana' | 'evm', id: string, on: boolean) => ipcRenderer.invoke('vault:setAutoTrade', family, id, on),
+  },
   // The All-in-One wallet (2026-10-01): one recovery phrase, every chain.
   aio: {
     info: () => ipcRenderer.invoke('aio:info'),
@@ -253,6 +264,10 @@ const api = {
     /** Pick a .js file; its text comes back as a draft, never a path. */
     openFile: () => ipcRenderer.invoke('automation:openFile'),
   },
+  rearm: {
+    pending: () => ipcRenderer.invoke('rearm:pending'),
+    cancel: (kind: string, id: string) => ipcRenderer.invoke('rearm:cancel', kind, id),
+  },
   copy: {
     list: () => ipcRenderer.invoke('copy:list'),
     save: (config: Partial<CopyConfig>) => ipcRenderer.invoke('copy:save', config),
@@ -332,7 +347,7 @@ const api = {
     setAccess: (level: string) => ipcRenderer.invoke('mcp:setAccess', level),
     newToken: () => ipcRenderer.invoke('mcp:newToken'),
     setPort: (port: number) => ipcRenderer.invoke('mcp:setPort', port),
-    setBudget: (budget: { maxBuySol: number; hourlyCapSol: number; maxTradesPerMinute: number; followMaxCopySol?: number; followDailyLossSol?: number }) =>
+    setBudget: (budget: { maxBuySol: number; hourlyCapSol: number; maxTradesPerMinute: number; followMaxCopySol?: number; followDailyLossSol?: number; followDailyCopies?: number }) =>
       ipcRenderer.invoke('mcp:setBudget', budget),
   },
   // The AI desk (2026-10-28): what the connected AI is deciding.
@@ -362,6 +377,7 @@ const api = {
   update: {
     status: () => ipcRenderer.invoke('app:updateStatus'),
     check: () => ipcRenderer.invoke('app:checkForUpdate'),
+    verify: () => ipcRenderer.invoke('app:verifyBuild'),
   },
 
   // Splitting a buy across your own wallets, spaced over time. The renderer

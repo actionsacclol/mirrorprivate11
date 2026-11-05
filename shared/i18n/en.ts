@@ -122,7 +122,7 @@ export const en = {
   'settings.dataCollection': 'Data collection',
   'settings.creatorBlocklist': 'Creator blocklist',
   'settings.feesAndReferral': 'Fees and referral',
-  'settings.subtitle': 'Market data providers, RPC endpoints, fee, EVM chains, logs.',
+  'settings.subtitle': 'The basics are on top. Everything else is under Advanced, at the bottom.',
 
   // ── appearance + replay ────────────────────────────────────────────
   'settings.theme': 'Theme',

@@ -26,14 +26,13 @@
 // is told they are current, by an app that never actually asked, is worse off
 // than one who is told nothing: they stop checking.
 //
-// ─── Off for the private beta (2026-10-25) ───────────────────────────────
+// ─── Off (2026-11-04) ────────────────────────────────────────────────────
 //
-// There is no version document to check against, and a private beta among
-// friends is not worth hosting one for. With this false, main never schedules
-// the check, About hides the Version box, and the sidebar notice stays silent
-// — the network is never touched. Flip it to true (and publish a JSON file at
-// the URL in updateCheck.ts) to turn the whole feature back on for a real
-// release; nothing below was removed.
+// The owner ships often and does not want to upload a version document with
+// every build, and without one every answer is "could not check". So nothing
+// asks: no request at start, none on a timer, no notice, no card on About, and
+// the Privacy Policy says so. Turning this on again needs that upload, a place
+// on screen for the answer, and the policy changed back.
 export const UPDATE_CHECK_ENABLED = false;
 
 /** A parsed semantic version. Pre-release and build metadata are ignored. */
@@ -130,6 +129,8 @@ export interface VersionDoc {
   important?: boolean;
   /** Optional: one line about the release. Never HTML, never a link. */
   note?: string;
+  /** Optional: SHA-256 of the released app.asar, by `${platform}-${arch}`. */
+  builds?: Record<string, string>;
 }
 
 /** The longest a `note` may be before it is dropped rather than shown. */
@@ -147,6 +148,16 @@ export function readVersionDoc(raw: unknown): VersionDoc | null {
   const o = raw as Record<string, unknown>;
   if (parseVersion(o.version) === null) return null;
   const note = typeof o.note === 'string' ? o.note.trim() : '';
+  // Only well-formed fingerprints survive: one that is not a SHA-256 could
+  // never match, and would call a genuine install a fake.
+  const builds: Record<string, string> = {};
+  if (o.builds && typeof o.builds === 'object' && !Array.isArray(o.builds)) {
+    for (const [key, value] of Object.entries(o.builds as Record<string, unknown>)) {
+      if (/^[a-z0-9]+-[a-z0-9]+$/.test(key) && typeof value === 'string' && /^[0-9a-f]{64}$/i.test(value.trim())) {
+        builds[key] = value.trim().toLowerCase();
+      }
+    }
+  }
   return {
     version: (o.version as string).trim(),
     important: o.important === true,
@@ -155,7 +166,103 @@ export function readVersionDoc(raw: unknown): VersionDoc | null {
     // …and one that carries a link is dropped too: a compromised host must
     // not be able to put "download from <url>" in our own voice.
     note: note && note.length <= MAX_NOTE_LENGTH && !/[<>]/.test(note) && !/https?:|:\/\/|www\./i.test(note) ? note : undefined,
+    builds: Object.keys(builds).length ? builds : undefined,
   };
+}
+
+// ─── "Is this the right app?" ────────────────────────────────────────────
+//
+// What this can and cannot prove is the point. It catches an old version, a
+// damaged install and a repackaged copy that kept the original checks. It
+// cannot catch a fake built to lie, because a fake can draw this same answer.
+// So the screen always also points at the official download page, and only an
+// actual match of the files is ever allowed to read as a pass.
+
+export type BuildVerdict =
+  /** Same version, and the files match the published fingerprint. */
+  | 'official'
+  /** Same version, but no fingerprint could be compared. */
+  | 'version-only'
+  /** An older version than the published one. Not suspicious, just old. */
+  | 'outdated'
+  /** Same version, DIFFERENT files. The one alarming answer. */
+  | 'different'
+  /** Could not find out, or a version krypt.cc has never published. */
+  | 'unknown'
+  /** Running from source: there is no release to compare with. */
+  | 'dev';
+
+export interface BuildCheck {
+  verdict: BuildVerdict;
+  current: string;
+  latest: string | null;
+  title: string;
+  detail: string;
+}
+
+/** Decide the verdict. Pure, so every answer is pinned by a test. */
+export function judgeBuild(input: {
+  current: string;
+  doc: VersionDoc | null;
+  failure: string | null;
+  packaged: boolean;
+  /** `${process.platform}-${process.arch}` */
+  platform: string;
+  /** SHA-256 of this install's app.asar, or null if it could not be read. */
+  ownHash: string | null;
+}): BuildCheck {
+  const { current, doc, failure, packaged, platform, ownHash } = input;
+  const base = { current, latest: doc?.version ?? null };
+  if (!packaged) {
+    return { ...base, verdict: 'dev', title: 'Development build', detail: 'Running from source, so there is no release to compare it with.' };
+  }
+  const cur = parseVersion(current);
+  if (!doc || cur === null) {
+    return {
+      ...base,
+      verdict: 'unknown',
+      title: 'Could not check right now',
+      detail: `${failure ? `${failure}. ` : ''}This does not mean anything is wrong, only that nothing was compared. Try again when you are online.`,
+    };
+  }
+  const cmp = compareVersions(cur, parseVersion(doc.version)!);
+  if (cmp < 0) {
+    return {
+      ...base,
+      verdict: 'outdated',
+      title: `Version ${doc.version} is out`,
+      detail: `You have ${current}. Download the newest version from krypt.cc/mirror.`,
+    };
+  }
+  if (cmp > 0) {
+    // Never a pass: "a version nobody has heard of" is what a fake would claim.
+    return {
+      ...base,
+      verdict: 'unknown',
+      title: 'This version is not published yet',
+      detail: `You have ${current}, and krypt.cc lists ${doc.version} as the newest. If you did not get this build from Krypt directly, reinstall from krypt.cc/mirror.`,
+    };
+  }
+  const expected = doc.builds?.[platform];
+  if (!expected || !ownHash) {
+    return {
+      ...base,
+      verdict: 'version-only',
+      title: `You have the latest version (${current})`,
+      detail: !expected
+        ? 'krypt.cc has no file fingerprint for this system, so only the version number was compared.'
+        : 'The files of this install could not be read, so only the version number was compared.',
+    };
+  }
+  if (expected !== ownHash.toLowerCase()) {
+    return {
+      ...base,
+      verdict: 'different',
+      title: `These files do not match the official ${current}`,
+      detail: 'The version number is right, but the files are not the ones Krypt published. Do not put money in a wallet here. Uninstall it and reinstall from krypt.cc/mirror.',
+    };
+  }
+  return { ...base, verdict: 'official', title: `This is the official Krypto Mirror ${current}`, detail: 'Its files match the fingerprint published on krypt.cc.' };
 }
 
 /**

@@ -151,7 +151,7 @@ export function HomePage() {
     { done: !!settings.rpc.heliusApiKey?.trim(), title: 'Add a free Helius key (recommended)', body: 'The biggest speed upgrade: trades are heard sooner and copies land faster. Free at helius.dev.', action: <button className={btn.secondary} onClick={() => nav.go('settings')}>Settings</button> },
     { done: (walletCount ?? 0) > 0, title: 'Create a wallet for live copies', body: 'Only needed to go live. The key is encrypted on this computer and never leaves it.', action: <button className={btn.secondary} onClick={() => nav.go('wallet')}>Wallet</button> },
     { done: (pumpAccounts ?? 0) > 0, title: 'Make a pump.fun account (optional)', body: 'Live copies then call out what they buy on pump.fun, and pump pays callers USDC rewards. Wallet › pump.fun.', action: <button className={btn.secondary} onClick={() => nav.go('wallet', { walletTab: 'pump' })}>pump.fun</button> },
-    { done: liveFollows.length > 0, title: 'Go live — only when the paper record earns it', body: 'Switch a follow to Live on its card. It asks before arming, and it is capped per trade and per day.', action: null },
+    { done: liveFollows.length > 0, title: 'Go live — only when the paper record earns it', body: 'Switch a follow to Live on its card. It asks before arming and tells you which limits it has. Limits are off unless you set them.', action: null },
   ];
   const firstOpen = steps.findIndex((s) => !s.done);
   const coreDone = steps[0].done && steps[1].done;

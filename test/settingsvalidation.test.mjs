@@ -52,6 +52,7 @@ import { DEFAULT_SETTINGS, resolveRpc } from './.types.mjs';
 {
   assert.equal(v({ execution: { maxLiveSol: 1_000_000 } }).ok, false);
   assert.equal(v({ execution: { maxLiveSol: -1 } }).ok, false);
+  assert.equal(v({ execution: { maxLiveSol: 0 } }).ok, true, '0 is no cap');
   assert.equal(v({ execution: { maxLiveSol: NaN } }).ok, false);
   assert.equal(v({ execution: { maxLiveSol: Infinity } }).ok, false);
   assert.equal(v({ execution: { liveSlippagePct: 100 } }).ok, false);
@@ -218,7 +219,11 @@ console.log('settingsvalidation: all tests passed');
   // on off Krypto Bot's port 8787, so both apps can listen on one machine.
   assert.ok(src.includes('if (fromRevision < 8) {'), 'revision-8 step exists');
   assert.ok(src.includes('if (s.mcp && !s.mcp.enabled && s.mcp.port === 8787) s.mcp = { ...s.mcp, port: 8797 };'), 'only an unused 8787 moves');
-  assert.match(types, /SETTINGS_REVISION = 8;/);
+  // Revision 9 (2026-11-04) replays onboarding again, for the new last screen.
+  const rev9 = src.slice(src.indexOf('if (fromRevision < 9) {'));
+  assert.ok(src.includes('if (fromRevision < 9) {'), 'revision-9 step exists');
+  assert.ok(rev9.slice(0, rev9.indexOf('}')).includes('s.onboarded = false;'), 'revision 9 replays onboarding');
+  assert.match(types, /SETTINGS_REVISION = 9;/);
   assert.match(types, /discordRpcEnabled: true,/, 'presence is the default');
   assert.match(types, /localTxBuild: true,/, 'local builder is the default');
   console.log('ok  revision-3 migration disables only the old breaker defaults, gated by revision');

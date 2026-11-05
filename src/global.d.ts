@@ -206,6 +206,16 @@ declare global {
         exportAll: () => Promise<IpcResult<{ count: number }>>;
         remove: (id?: string) => Promise<IpcResult<WalletInfo>>;
       };
+      /** The wallet password (shared/vault.ts). Nothing here carries a password. */
+      vault: {
+        status: () => Promise<import('@shared/vault').VaultStatus>;
+        unlock: () => Promise<{ ok: boolean; message: string }>;
+        turnOn: () => Promise<{ ok: boolean; message: string }>;
+        turnOff: () => Promise<{ ok: boolean; message: string }>;
+        change: () => Promise<{ ok: boolean; message: string }>;
+        stopAndLock: () => Promise<{ ok: boolean; message: string }>;
+        setAutoTrade: (family: 'solana' | 'evm', id: string, on: boolean) => Promise<{ ok: boolean; message: string }>;
+      };
       /** The All-in-One wallet: one recovery phrase, every chain (shared/aio.ts). */
       aio: {
         info: () => Promise<IpcResult<import('@shared/aio').AioWalletInfo>>;
@@ -421,6 +431,10 @@ declare global {
         mute: (id: string, muted: boolean) => Promise<IpcResult<AlertsSnapshot>>;
         clearFired: () => Promise<IpcResult<AlertsSnapshot>>;
       };
+      rearm: {
+        pending: () => Promise<import('@shared/rearm').RearmPending[]>;
+        cancel: (kind: string, id: string) => Promise<IpcResult<unknown>>;
+      };
       copy: {
         list: () => Promise<IpcResult<CopySnapshot>>;
         save: (config: Partial<CopyConfig>) => Promise<IpcResult<CopySnapshot>>;
@@ -575,6 +589,8 @@ declare global {
         status: () => Promise<IpcResult<UpdateStatus>>;
         /** Ask krypt.cc now. Downloads nothing, installs nothing. */
         check: () => Promise<IpcResult<UpdateStatus>>;
+        /** Is this the right app? Compares this install with what krypt.cc publishes. */
+        verify: () => Promise<IpcResult<import('@shared/version').BuildCheck>>;
       };
       launch: {
         /** Open the app's own file dialog. The renderer never names a path. */

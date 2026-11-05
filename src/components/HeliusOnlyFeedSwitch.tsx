@@ -23,7 +23,7 @@ export function HeliusOnlyFeedSwitch() {
       description={
         hasKey
           ? 'Runs the launch feed and every token watcher on your Helius socket alone: the public WebSockets and the publicnode block standby are not opened. For a VPN or shared IP where the free endpoints refuse connections. Every push is billed to your key (~800k credits a day at firehose rates — a paid-plan switch); the credit ceiling above turns it back off. Account lookups (HTTP) are unchanged. Takes effect the next time the scanner starts.'
-          : 'Needs a Helius API key (Settings → Solana RPC).'
+          : 'Needs a Helius API key (Settings, under API keys).'
       }
     />
   );

@@ -102,7 +102,7 @@ export const ru: Catalogue = {
   'settings.dataCollection': 'Сбор данных',
   'settings.creatorBlocklist': 'Чёрный список создателей',
   'settings.feesAndReferral': 'Комиссии и рефералы',
-  'settings.subtitle': 'Источники данных, RPC-узлы.',
+  'settings.subtitle': 'Основное вверху. Всё остальное — в разделе Advanced внизу.',
 
   'settings.theme': 'Тема',
   'settings.themeHint': 'Выберите стиль — шрифты, поверхности, углы, эффекты — затем акцентный цвет. Зелёный для роста, красный для падения и золотой для всего, что касается денег, остаются на месте.',

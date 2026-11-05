@@ -252,6 +252,25 @@ function vttCues(text) {
   assert.match(home, /data-testid="home-quickstart"/, 'Home offers the quickstart');
   assert.match(home, /v\.id === QUICKSTART_VIDEO && isReady\(v\)/, 'only once it is recorded');
   const ob = read('src/components/Onboarding.tsx');
+  // Everyone reaches the last screen, whichever way they leave the wallet step,
+  // and it says where the guides and the wallet are.
+  assert.ok(!/VerifyBuild|'verify'/.test(ob), 'setup has no version check step');
+  assert.ok(!/VerifyBuild|Check your copy/.test(read('src/pages/About.tsx')), 'nor does About');
+  assert.match(read('shared/version.ts'), /UPDATE_CHECK_ENABLED = false;/, 'the app asks krypt.cc nothing on its own');
+  assert.match(ob, /Press the book button, top right/, 'setup says where the guides are');
+  assert.match(ob, /Press your balance, top right, to see your wallet/, 'setup says the balance opens the wallet');
+  const walletStep = ob.slice(ob.indexOf("{step === 'wallet' && ("), ob.indexOf("{step === 'ready' && ("));
+  assert.ok(!/jump\('wallet'\)/.test(walletStep), 'Set up a wallet does not skip the last screen');
+  assert.match(walletStep, /setThenWallet\(true\);\s*setStep\('ready'\);/, 'it goes there first, then to the wallet');
+  assert.ok(ob.slice(ob.indexOf("{step === 'ready' && (")).includes("jump('wallet')"), 'the last screen carries on to the wallet');
+  // Basics on top, the rest folded, nothing dropped. The checklist is a guide and only a guide.
+  const st = read('src/pages/Settings.tsx');
+  const fold = st.indexOf('<AdvancedSettings>');
+  assert.ok(fold > 0, 'Settings has the Advanced fold');
+  for (const basic of ['<VaultSection />', '<PaperBankrollSection />', '<ApiKeysSection ', 'settings.feesAndReferral', '<LogsPanel />']) assert.ok(st.indexOf(basic) > 0 && st.indexOf(basic) < fold, `${basic} is a basic`);
+  for (const adv of ['<RearmSection ', '<MarketDataSettings ', 'settings.solanaRpc', '<EvmSettingsCard ', 'settings.general', 'settings.display']) assert.ok(st.indexOf(adv) > fold, `${adv} is under Advanced`);
+  assert.ok(GUIDE_VIDEOS.some((v) => v.id === 'checklist' && /optional/i.test(v.lines[0])), 'the checklist says it is optional');
+  assert.ok(!/checklist/i.test(ob.replace(/\/\/.*|\{\/\*[\s\S]*?\*\/\}/g, '')), 'setup does not ask for the checklist');
   assert.match(ob, /<InlineGuide id="api-keys"/, 'the keys step plays the keys guide in place');
   assert.match(ob, /<InlineGuide id="quickstart"/, 'the last step plays the quickstart in place');
   assert.ok(!/openExternal\((API_KEYS_VIDEO_URL|APP_WALKTHROUGH_URL)\)/.test(ob), 'no more YouTube hand-offs');

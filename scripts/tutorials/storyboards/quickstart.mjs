@@ -43,7 +43,7 @@ export default {
       do: async (ui) => {
         await ui.hover(`${OB} input`, { hold: 1600 });
         await ui.click(btn('Continue', OB));
-        await ui.waitFor({ text: 'Connect your data', sel: 'div', within: OB }, 8000);
+        await ui.waitFor({ text: 'Free API keys', sel: 'div', within: OB }, 8000);
       },
     },
     {
@@ -58,7 +58,7 @@ export default {
     {
       line: 4,
       do: async (ui) => {
-        await ui.hover({ text: 'Use a dedicated hot wallet', sel: 'span, p', within: OB }, { hold: 2000 });
+        await ui.hover({ text: 'Make a new wallet just for this app', sel: 'span, p', within: OB }, { hold: 2000 });
         await ui.click(btn('Later', OB));
         await ui.waitFor({ text: 'Paper first, always', sel: 'div', within: OB }, 8000);
       },
@@ -66,7 +66,9 @@ export default {
     {
       line: 5,
       do: async (ui) => {
-        await ui.point({ text: 'Paper first, always', sel: 'div', within: OB }, { hold: 2200, glow: 2200 });
+        await ui.point({ text: 'Stuck\\? Press the book button', sel: 'div', within: OB }, { hold: 2000, glow: 2000 });
+        await ui.point({ text: 'Press your balance', sel: 'div', within: OB }, { hold: 1800, glow: 1800 });
+        await ui.point({ text: 'Paper first, always', sel: 'div', within: OB }, { hold: 1200, glow: 1200 });
         await ui.click(btn('Start following', OB));
         await ui.waitFor({ expr: `!document.querySelector('${OB}')` }, 8000);
       },

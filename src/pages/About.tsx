@@ -1,5 +1,4 @@
 import { useEffect, useState } from 'react';
-import { UPDATE_CHECK_ENABLED, type UpdateStatus } from '@shared/version';
 import { VIDEO_CREDIT } from '@shared/guides/videos';
 import { ExternalLink, FolderOpen, RotateCcw, ShieldAlert } from 'lucide-react';
 import { Card, GhostButton, Page, Section } from '../components/common';
@@ -18,8 +17,6 @@ export function About() {
   const toast = useToast();
   const [version, setVersion] = useState('…');
   const [paths, setPaths] = useState<{ logs: string | null; crashes: string | null }>({ logs: null, crashes: null });
-  const [update, setUpdate] = useState<UpdateStatus | null>(null);
-  const [checking, setChecking] = useState(false);
   useEffect(() => {
     void window.krypt.app.version().then((r) => {
       if (r.ok && r.data) setVersion(r.data);
@@ -27,25 +24,7 @@ export function About() {
     void window.krypt.app.logPaths().then((r) => {
       if (r.ok && r.data) setPaths(r.data);
     });
-    if (UPDATE_CHECK_ENABLED) {
-      void window.krypt.update.status().then((r) => {
-        if (r.ok && r.data) setUpdate(r.data);
-      });
-    }
   }, []);
-
-  // The only place in the app that can force a check. Everywhere else reads
-  // what main already knows.
-  const checkForUpdate = async (): Promise<void> => {
-    setChecking(true);
-    try {
-      const r = await window.krypt.update.check();
-      if (r.ok && r.data) setUpdate(r.data);
-      else toast.error(r.message);
-    } finally {
-      setChecking(false);
-    }
-  };
 
   const openLogs = async (): Promise<void> => {
     const r = await window.krypt.app.openLogs();
@@ -88,47 +67,6 @@ export function About() {
           </p>
         </Card>
       </Section>
-
-      {UPDATE_CHECK_ENABLED && (
-      <Section title="Version">
-        <Card>
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="min-w-0">
-              {/* Four states, and three of them are not "you are fine".
-                  "Could not check" must never read as "up to date" — a user
-                  told they are current by an app that never asked stops
-                  checking. See shared/version.ts. */}
-              <div className="text-sm text-white/90">
-                {update === null ? 'Reading…' : update.detail}
-              </div>
-              <div className="mt-0.5 text-xs text-krypt-muted">
-                {update?.checkedAt
-                  ? `Last checked ${new Date(update.checkedAt).toLocaleString()}.`
-                  : 'Not checked yet this session.'}{' '}
-                Nothing is downloaded or installed automatically — updates are installed by you, from krypt.cc/mirror.
-              </div>
-            </div>
-            <div className="flex shrink-0 gap-2">
-              <button
-                onClick={() => void checkForUpdate()}
-                disabled={checking}
-                className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-semibold text-white/90 transition hover:bg-white/10 disabled:opacity-50"
-              >
-                {checking ? 'Checking…' : 'Check now'}
-              </button>
-              {update?.state === 'update' && (
-                <button
-                  onClick={() => window.krypt.app.openExternal('https://krypt.cc/mirror')}
-                  className="rounded-lg border border-krypt-purple/40 bg-krypt-purple/15 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-krypt-purple/25"
-                >
-                  Get {update.latest}
-                </button>
-              )}
-            </div>
-          </div>
-        </Card>
-      </Section>
-      )}
 
       <Section title="Onboarding">
         <Card>
@@ -204,14 +142,14 @@ export function About() {
             <div className="text-sm text-krypt-muted leading-relaxed space-y-2">
               <p>
                 Memecoin trading is extremely high risk: a large majority of new launches die the
-                same day they appear, and no filter catches every rug. The app runs in
-                <span className="text-white font-semibold"> Live mode by default on Solana</span> once a
-                wallet exists, so a trade you place spends real SOL; Paper mode in the top bar simulates
-                instead. It signs only with a dedicated hot wallet whose key is encrypted on this
-                machine, and on Solana is bounded by a per-trade cap, a balance cap and a kill switch.
+                same day they appear, and no filter catches every rug. The app starts in Paper mode, which only
+                simulates. Once a wallet exists and you switch the top bar to
+                <span className="text-white font-semibold"> Live</span>, a trade you place spends real SOL.
+                It signs only with a wallet made just for this app, whose key is encrypted on this
+                machine. On Solana there is a kill switch, and any per-trade cap or loss limit is yours to set: none is on by default.
                 The EVM chains (Robinhood Chain, BNB Smart Chain) start in Paper, are armed by hand per
-                chain, and have no caps yet. Krypt takes 0.5 % of each side of a trade on every chain.
-                Trade with lunch money, never your main wallet.
+                chain, and have a per-trade cap you can set. Krypt takes 0.5 % of each side of a trade on every chain.
+                Only use money you can afford to lose, never your main wallet.
                 Nothing here is financial advice.
               </p>
             </div>

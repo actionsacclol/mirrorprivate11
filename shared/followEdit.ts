@@ -34,7 +34,7 @@ import {
   type CopyMode,
 } from './copytrade';
 import type { ChainKind } from './evm';
-import { FOLLOW_FIELDS, type FollowField, type FollowFieldKey } from './mcp';
+import { DEFAULT_FOLLOW_DAILY_COPIES, FOLLOW_FIELDS, type FollowField, type FollowFieldKey } from './mcp';
 
 /** The settings an AI call carries. Only keys it sent are present. */
 export type FollowPatch = Partial<Pick<CopyConfig, FollowFieldKey | 'enabled'>>;
@@ -59,7 +59,7 @@ export type FollowPatch = Partial<Pick<CopyConfig, FollowFieldKey | 'enabled'>>;
  *   addOnly       a blocklist: entries may be added, never removed
  *   hours         trading hours: the new window must sit inside the old
  */
-type LiveRule = 'free' | 'fixed' | 'lower' | 'perMinute' | 'capOrAdd' | 'floorOrAdd' | 'sellMoreOnly' | 'exit' | 'onOnly' | 'addOnly' | 'hours';
+type LiveRule = 'free' | 'fixed' | 'lower' | 'capZeroOff' | 'perMinute' | 'capOrAdd' | 'floorOrAdd' | 'sellMoreOnly' | 'exit' | 'onOnly' | 'addOnly' | 'hours';
 
 export const LIVE_RULES: Record<FollowFieldKey, LiveRule> = {
   label: 'free',
@@ -67,8 +67,10 @@ export const LIVE_RULES: Record<FollowFieldKey, LiveRule> = {
   sizing: 'fixed',
   sizeValue: 'lower',
   maxTradeSol: 'lower',
-  dailyLossLimitSol: 'lower',
-  dailyTradeLimit: 'lower',
+  // 0 is no limit at all, not the lowest one. Adding a limit is safer; taking
+  // it away is not.
+  dailyLossLimitSol: 'capZeroOff',
+  dailyTradeLimit: 'capZeroOff',
   maxCopiesPerMinute: 'perMinute',
   // A smaller stop pauses the follow sooner: safer. Removing it is not.
   walletLossStopSol: 'capOrAdd',
@@ -125,7 +127,8 @@ export function readFollowPatch(args: Record<string, unknown>): { ok: true; patc
         break;
       case 'numberOrOff':
         if (v !== null && (typeof v !== 'number' || !Number.isFinite(v))) return { ok: false, why: `${f.key} must be a number, or null to switch it off` };
-        patch[f.key] = v;
+        // The limits stored as a plain number: their off is 0.
+        patch[f.key] = v === null && (f.key === 'dailyLossLimitSol' || f.key === 'dailyTradeLimit' || f.key === 'maxCopiesPerMinute') ? 0 : v;
         break;
       case 'boolean':
         if (typeof v !== 'boolean') return { ok: false, why: `${f.key} must be true or false` };
@@ -210,11 +213,19 @@ export function liveEditRefusals(before: CopyConfig, after: CopyConfig): string[
       case 'lower':
         if (num(now, 0) > num(was, 0)) out.push(`${key} ${shown(was)} → ${shown(now)} (higher)`);
         break;
-      case 'perMinute':
-        if (num(now, DEFAULT_COPIES_PER_MINUTE) > num(was, DEFAULT_COPIES_PER_MINUTE)) {
-          out.push(`${key} ${num(was, DEFAULT_COPIES_PER_MINUTE)} → ${num(now, DEFAULT_COPIES_PER_MINUTE)} (higher)`);
+      case 'capZeroOff': {
+        const cap = (v: unknown): number => (typeof v === 'number' && v > 0 ? v : Number.POSITIVE_INFINITY);
+        if (cap(now) > cap(was)) out.push(`${key} ${shown(was)} → ${cap(now) === Number.POSITIVE_INFINITY ? 'off' : shown(now)} (${cap(now) === Number.POSITIVE_INFINITY ? 'removed' : 'higher'})`);
+        break;
+      }
+      case 'perMinute': {
+        // Null is the old default of 10; 0 is no limit at all.
+        const rate = (v: unknown): number => (v === 0 ? Number.POSITIVE_INFINITY : num(v, DEFAULT_COPIES_PER_MINUTE));
+        if (rate(now) > rate(was)) {
+          out.push(rate(now) === Number.POSITIVE_INFINITY ? `${key} ${rate(was) === Number.POSITIVE_INFINITY ? 'off' : rate(was)} → off (removed)` : `${key} ${rate(was)} → ${rate(now)} (higher)`);
         }
         break;
+      }
       case 'capOrAdd':
         if (num(now, Number.POSITIVE_INFINITY) > num(was, Number.POSITIVE_INFINITY)) {
           out.push(`${key} ${shown(was)} → ${shown(now)} (${now === null || now === undefined ? 'removed' : 'higher'})`);
@@ -254,6 +265,19 @@ export function liveEditRefusals(before: CopyConfig, after: CopyConfig): string[
   return out;
 }
 
+/** The edits that can make a follow SELL on its own, in words. Tightening one
+ *  is safer for a live follow's risk, but it spends fees and can dump a whole
+ *  book, so a connection that may not spend may not do it to live copies. */
+export function sellTriggerEdits(before: CopyConfig, after: CopyConfig): string[] {
+  const b = before as unknown as Record<string, unknown>;
+  const a = after as unknown as Record<string, unknown>;
+  const keys: FollowFieldKey[] = ['exitTakeProfitPct', 'exitStopLossPct', 'exitMaxHoldMin', 'exitTrailingPct', 'exitOnCreatorSellPct', 'exitOnMigration', 'copySells', 'copyOtherExits', 'minLeaderSellPct'];
+  return keys.filter((k) => (b[k] ?? null) !== (a[k] ?? null)).map((k) => `${k} ${shown(b[k])} → ${shown(a[k])}`);
+}
+
+/** A per-minute limit in words: stored null runs at the old default. */
+const perMinuteShown = (v: unknown): string => (v === 0 ? 'off' : shown(v ?? DEFAULT_COPIES_PER_MINUTE));
+
 /** What changed, in words, for the notice and the answer. */
 export function describeFollowChanges(before: CopyConfig, after: CopyConfig): string[] {
   const out: string[] = [];
@@ -271,7 +295,10 @@ export function describeFollowChanges(before: CopyConfig, after: CopyConfig): st
     const was = b[f.key] ?? null;
     const now = a[f.key] ?? null;
     const same = Array.isArray(was) || Array.isArray(now) ? JSON.stringify(was) === JSON.stringify(now) : was === now;
-    if (!same) out.push(`${f.key} ${shown(was)} → ${shown(now)}`);
+    if (same) continue;
+    if (f.key === 'maxCopiesPerMinute') {
+      if (perMinuteShown(was) !== perMinuteShown(now)) out.push(`${f.key} ${perMinuteShown(was)} → ${perMinuteShown(now)}`);
+    } else out.push(`${f.key} ${shown(was)} → ${shown(now)}`);
   }
   return out;
 }
@@ -284,9 +311,16 @@ export function describeFollowChanges(before: CopyConfig, after: CopyConfig): st
  * Per copy is bounded by maxTradeSol alone: it caps a proportional copy, and
  * a fixed copy spends min(sizeValue, maxTradeSol).
  */
-export function followCeilingRefusals(cfg: Pick<CopyConfig, 'maxTradeSol' | 'dailyLossLimitSol'>, ceiling: { followMaxCopySol: number; followDailyLossSol: number }): string[] {
+export function followCeilingRefusals(cfg: Pick<CopyConfig, 'maxTradeSol' | 'dailyLossLimitSol' | 'dailyTradeLimit'>, ceiling: { followMaxCopySol: number; followDailyLossSol: number; followDailyCopies?: number }): string[] {
   const out: string[] = [];
   if (!(cfg.maxTradeSol <= ceiling.followMaxCopySol)) out.push(`maxTradeSol ${shown(cfg.maxTradeSol)} is above the AI’s per-copy ceiling of ${ceiling.followMaxCopySol}`);
-  if (!(cfg.dailyLossLimitSol <= ceiling.followDailyLossSol)) out.push(`dailyLossLimitSol ${shown(cfg.dailyLossLimitSol)} is above the AI’s daily-loss ceiling of ${ceiling.followDailyLossSol}`);
+  // No limit is the widest there is, so it cannot sit under a ceiling.
+  if (!(cfg.dailyLossLimitSol > 0)) out.push(`dailyLossLimitSol is not set, and the AI’s daily-loss ceiling needs one of at most ${ceiling.followDailyLossSol}`);
+  else if (!(cfg.dailyLossLimitSol <= ceiling.followDailyLossSol)) out.push(`dailyLossLimitSol ${shown(cfg.dailyLossLimitSol)} is above the AI’s daily-loss ceiling of ${ceiling.followDailyLossSol}`);
+  // A loss only counts once a copy closes, so copies left open never reach the
+  // daily loss limit. This is what bounds the money out: per copy times copies.
+  const copies = ceiling.followDailyCopies ?? DEFAULT_FOLLOW_DAILY_COPIES;
+  if (!(cfg.dailyTradeLimit > 0)) out.push(`dailyTradeLimit is not set, and the AI’s ceiling needs one of at most ${copies} copies a day`);
+  else if (!(cfg.dailyTradeLimit <= copies)) out.push(`dailyTradeLimit ${shown(cfg.dailyTradeLimit)} is above the AI’s ceiling of ${copies} copies a day`);
   return out;
 }

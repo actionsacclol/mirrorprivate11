@@ -94,13 +94,13 @@ function ChainStrip({ chain, evm, refresh }: { chain: EvmChainKind; evm: EvmStat
       </div>
       {/* The chain's automatic per-trade cap (2026-10-24): copy trading and the
           Trader refuse a trade above it; a trade placed by hand is not held to it. */}
-      <div className="min-w-[180px]" title="Copy trading and the Trader refuse an automatic trade above this, and record why. A trade you place by hand is not held to it.">
+      <div className="min-w-[180px]" title="Copy trading and the Trader refuse an automatic trade above this, and record why. 0 = no cap, the default. A trade you place by hand is not held to it.">
         <div className="text-label uppercase tracking-label text-krypt-muted mb-1">Max {meta.nativeSymbol} / automatic trade</div>
         <NumberInput
           value={cap}
           onChange={(n) => void updateSettings({ evm: { ...settings.evm, [chain]: { ...settings.evm[chain], maxLiveNative: n } } })}
           suffix={meta.nativeSymbol}
-          warn={(n) => (n <= 0 ? 'Must be greater than 0' : null)}
+          warn={(n) => (n < 0 ? 'Must be 0 or more' : null)}
         />
       </div>
       <div className="flex items-center gap-2">
@@ -334,14 +334,7 @@ export function EvmWalletPanel({
   };
 
   const doExport = async (): Promise<void> => {
-    const yes = await modal.confirm({
-      title: 'Export EVM wallets',
-      message:
-        'This writes the PRIVATE KEYS of every EVM wallet to a plain text file for MetaMask or Rabby. Anyone who gets that file can spend these wallets on every EVM chain. Save it offline and delete it when done. Continue?',
-      confirmLabel: 'Export private keys',
-      destructive: true,
-    });
-    if (!yes) return;
+    // The warning is a system dialog now, shown by the app itself.
     const r = await window.krypt.evm.wallet.exportAll();
     if (r.ok) toast.success(`Exported ${r.data?.count ?? ''} wallet(s) — delete that file once imported`);
     else toast.warn(r.message);
@@ -483,7 +476,7 @@ export function EvmWalletPanel({
                 </div>
               )}
               <div className="text-body text-krypt-muted/60 mt-1">
-                Each EVM chain starts in Paper and is armed by hand. Copy trading and the Trader are held to the per-trade cap above; trades you place by hand are not. To move {meta.nativeSymbol} or a
+                Each EVM chain starts in Paper and is armed by hand. Copy trading and the Trader are held to any per-trade cap set above; trades you place by hand are not. To move {meta.nativeSymbol} or a
                 token out, use Send below — any address, confirmed in a system dialog.
               </div>
             </div>

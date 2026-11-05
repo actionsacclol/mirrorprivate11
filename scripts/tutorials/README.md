@@ -96,10 +96,10 @@ endpoint is typed and cleared, and Measure times the saved public endpoints), `f
 follow the next take needs), `wallet-live` (generates the tutorial wallet),
 `ai-desk` (switches the AI connection on at Paper trading, gates that follow,
 then puts both back and fails its cleanup loudly if the gate stays on),
-`discover-check`, then `convergence` (run `instance.ps1 unfollow` again first: it starts a crowd follow, and seeds and removes its own address-book tag). A wallet that is already followed shows "Manage follow"
+`checklist` (needs that follow and wallet; it opens the wallet card but never presses Live, and draws the exchange steps as cards), `wallet-password` (turns the password on for that wallet, shows its window as a picture with the recovery key blurred, and turns it off again), `auto-rearm` (needs its seeded pause: see the top of its storyboard), `discover-check`, then `convergence` (run `instance.ps1 unfollow` again first: it starts a crowd follow, and seeds and removes its own address-book tag). A wallet that is already followed shows "Manage follow"
 instead of "Follow on paper", which is why the follows go first.
 
-The quickstart shows the first run, so for it the profile must be at its
+`install` and the quickstart show the first run, so for each the profile must be at its
 first run (`instance.ps1 firstrun`: with the instance closed, deletes
 `legal-acceptance.jsonl`, `copytrade.json`, `wallet.json`, `wallets.json`
 and `evm-wallets.json` from `…Profiles\tutorial`, sets `"onboarded": false`

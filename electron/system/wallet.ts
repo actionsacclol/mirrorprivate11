@@ -33,6 +33,8 @@ import { ed25519 } from '@noble/curves/ed25519';
 import { Keypair, VersionedTransaction } from '@solana/web3.js';
 import { base58Encode, base58Decode } from '../chain/base58';
 import { logger } from './logger';
+import { writeDurable } from './durableFile';
+import * as vault from './vault';
 import { getBalance } from '../chain/rpcClient';
 import { checkOutflow, type ApprovedSend, type SignPolicy } from './signPolicy';
 import {
@@ -59,6 +61,8 @@ export type { SignIntent, SignPolicy } from './signPolicy';
 const LAMPORTS_PER_SOL = 1_000_000_000;
 
 let cache: WalletsFile | null = null;
+
+vault.registerStore(() => loadFile().wallets.map((w) => ({ family: 'solana', id: w.id, address: w.publicKey, enc: w.secretEnc })));
 /** Balances are per WALLET — a cached figure from the previous wallet shown
  *  against the new one is the kind of small lie that gets someone to send
  *  funds to the wrong place. Keyed by public key, cleared on switch. */
@@ -164,25 +168,7 @@ function load(): StoredWallet | null {
 function persist(f: WalletsFile): void {
   // Never write over a file we failed to read: that is how keys are lost.
   if (loadFailure) throw new Error(`refusing to write wallets.json — ${loadFailure}`);
-  const tmp = `${file()}.tmp`;
-  // Flushed to disk before the rename (2026-10-28): without it a power cut
-  // in the seconds after a write — a wallet switch, a new wallet — could
-  // leave an empty file where the keys were. Owner-only, like the EVM store.
-  const fd = fs.openSync(tmp, 'w', 0o600);
-  try {
-    fs.writeFileSync(fd, JSON.stringify(f, null, 2), 'utf8');
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
-  }
-  // The previous good file is kept beside it, never read automatically: a
-  // person (or support) can recover keys from it if the new one is damaged.
-  try {
-    if (fs.existsSync(file())) fs.copyFileSync(file(), `${file()}.bak`);
-  } catch {
-    /* a missing backup must not block saving the keys */
-  }
-  fs.renameSync(tmp, file());
+  writeDurable(file(), JSON.stringify(f, null, 2), { backup: true });
   cache = f;
 }
 
@@ -205,13 +191,182 @@ const fromHex = (h: string): Uint8Array => new Uint8Array(Buffer.from(h, 'hex'))
 
 /** Decrypt the secret transiently. Callers must not persist or log it. */
 function decryptSecret(w: StoredWallet): Uint8Array {
-  const buf = Buffer.from(w.secretEnc, 'base64');
-  const hex = safeStorage.decryptString(buf);
-  return fromHex(hex);
+  if (vault.isSealed(w.secretEnc)) return new Uint8Array(vault.open('solana', w.id, w.publicKey, w.secretEnc));
+  const refused = vault.cannotOpen(w.secretEnc);
+  if (refused) throw new Error(refused);
+  return fromHex(safeStorage.decryptString(Buffer.from(w.secretEnc, 'base64')));
 }
 
-function encryptSecret(secret: Uint8Array): string {
+function encryptForOs(secret: Uint8Array): string {
   return safeStorage.encryptString(toHex(secret)).toString('base64');
+}
+
+/** The stored form of a new wallet's key, under the password when it is on. */
+function protect(secret: Uint8Array, id: string, publicKey: string): { secretEnc: string; mac?: string } {
+  if (!vault.sealsNewRecords()) return { secretEnc: encryptForOs(secret) };
+  return { secretEnc: vault.seal('solana', id, publicKey, 'hot', secret), mac: vault.macFor(id, publicKey, null) };
+}
+
+/** Why a new key cannot be stored right now, or null. */
+function cannotStore(): string | null {
+  if (!encAvailable()) return 'OS secure storage is unavailable — refusing to store a key unencrypted.';
+  if (vault.isLocked()) return 'Your wallet is locked. Unlock it first.';
+  return null;
+}
+
+/** Why the signing wallet cannot sign, in the user's words, or null. The engine
+ *  asks this before anything is built, so a locked app is a stated reason and
+ *  not a run of failed trades. */
+export function lockReason(): string | null {
+  const w = load();
+  if (!w) return vault.isLocked() ? 'Your wallet is locked. Type your wallet password to trade or send.' : null;
+  const refused = vault.cannotSignUnattended(w.secretEnc);
+  if (refused) return refused;
+  // Said up front, or Live reads as on while every trade and exit fails at signing.
+  return detailsOk(w) ? null : detailsRefusal(w.label);
+}
+
+function detailsRefusal(label: string): string {
+  return `The details of ${label} were changed outside Krypto Mirror, so it will not sign. Check its withdrawal address. If you changed nothing, an older version of the app may have saved it: turn the wallet password off and on to sign it again.`;
+}
+
+/** Can this wallet sign now, without anyone typing anything? */
+export function canSignUnattended(walletId: string): boolean {
+  const w = loadFile().wallets.find((x) => x.id === walletId);
+  return Boolean(w) && vault.cannotSignUnattended(w!.secretEnc) === null;
+}
+
+/** Labels of the wallets whose key cannot be opened and matched to its address. */
+export function unreadable(): string[] {
+  return loadFile()
+    .wallets.filter((w) => {
+      try {
+        const secret = decryptSecret(w);
+        const pub = base58Encode(ed25519.getPublicKey(secret));
+        secret.fill(0);
+        return pub !== w.publicKey;
+      } catch {
+        return true;
+      }
+    })
+    .map((w) => w.label);
+}
+
+/** Is the record's withdrawal address the one this app stored? True with the
+ *  password off, when there is nothing to check it against. */
+function detailsOk(w: StoredWallet): boolean {
+  if (vault.isLocked()) return true;
+  // A plain record in a protected store is not one this app wrote.
+  if (!vault.isSealed(w.secretEnc)) return !(vault.isOn() && vault.migrating() === null);
+  return vault.macOk(w.id, w.publicKey, w.homeAddress, w.mac);
+}
+
+/** Wallets whose details were edited outside the app. They will not sign. */
+export function tampered(): string[] {
+  return loadFile().wallets.filter((w) => !detailsOk(w)).map((w) => w.label);
+}
+
+/** May money be moved to this address as "your own wallet"? */
+export function isTrusted(publicKey: string): boolean {
+  const w = loadFile().wallets.find((x) => x.publicKey === publicKey);
+  return Boolean(w) && detailsOk(w!);
+}
+
+/** One row per wallet, for the password settings. */
+export function vaultRows(): { id: string; label: string; address: string; enc: string; active: boolean }[] {
+  const f = loadFile();
+  return f.wallets.map((w) => ({ id: w.id, label: w.label, address: w.publicKey, enc: w.secretEnc, active: w.id === f.activeId }));
+}
+
+/** Write a re-encrypted store and check every key back from the disk before the
+ *  old file goes, and leave no copy of the old form in the .bak. */
+function writeRewrapped(next: WalletsFile): void {
+  const text = JSON.stringify(next, null, 2);
+  writeDurable(file(), text, {
+    verify: (written) => {
+      const parsed = parseFile(JSON.parse(written), Date.now(), newId);
+      if (!parsed || parsed.wallets.length !== next.wallets.length) throw new Error('the rewritten wallet file did not read back');
+      for (const w of parsed.wallets) {
+        const secret = decryptSecret(w);
+        const pub = base58Encode(ed25519.getPublicKey(secret));
+        secret.fill(0);
+        if (pub !== w.publicKey) throw new Error(`${w.label}: the rewritten key does not match its address`);
+      }
+    },
+  });
+  writeDurable(`${file()}.bak`, text);
+  cache = next;
+}
+
+/** Move every key to the password (or back to the OS store). A record already in
+ *  the right form is left alone, so an interrupted run resumes where it stopped.
+ *  The caller holds the cold key. */
+export function rewrapAll(to: 'sealed' | 'os'): number {
+  const blocked = blockedByFailure();
+  if (blocked) throw new Error(blocked.message);
+  const f = loadFile();
+  let changedCount = 0;
+  const wallets = f.wallets.map((w) => {
+    const sealed = vault.isSealed(w.secretEnc);
+    // A sealed record is left as it is. One with no signature on its details was
+    // edited, and signing it here would launder the edit.
+    if ((to === 'sealed') === sealed) return w;
+    const secret = decryptSecret(w);
+    try {
+      if (base58Encode(ed25519.getPublicKey(secret)) !== w.publicKey) throw new Error(`${w.label}: the stored key does not match its address`);
+      changedCount += 1;
+      if (to === 'os') {
+        const { mac: _drop, ...rest } = w;
+        return { ...rest, secretEnc: encryptForOs(secret) };
+      }
+      return {
+        ...w,
+        secretEnc: vault.seal('solana', w.id, w.publicKey, 'hot', secret),
+        mac: vault.macFor(w.id, w.publicKey, w.homeAddress),
+      };
+    } finally {
+      secret.fill(0);
+    }
+  });
+  writeRewrapped({ ...f, wallets });
+  // Older installs carry a second copy of the first key in the old form. It
+  // stays useful only until the protected file above is proven good.
+  if (to === 'sealed') scrub(legacyFile());
+  return changedCount;
+}
+
+function scrub(p: string): void {
+  try {
+    const size = fs.statSync(p).size;
+    fs.writeFileSync(p, Buffer.alloc(size));
+    fs.rmSync(p);
+  } catch (err) {
+    // Absent is the normal case. Anything else leaves the old key on disk.
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') logger.warn(`wallet: could not remove the old wallet file, retrying at the next unlock: ${(err as Error).message}`);
+  }
+}
+
+/** Retried at each unlock: antivirus or a sync client can hold the file once. */
+export function scrubLegacy(): void {
+  if (vault.isOn() && vault.migrating() === null) scrub(legacyFile());
+}
+
+/** Make a wallet hot or cold. The caller holds the cold key. */
+export function setScope(id: string, scope: 'hot' | 'cold'): void {
+  const f = loadFile();
+  const wallets = f.wallets.map((w) => {
+    if (w.id !== id) return w;
+    const secret = decryptSecret(w);
+    try {
+      return { ...w, secretEnc: vault.seal('solana', w.id, w.publicKey, scope, secret) };
+    } finally {
+      secret.fill(0);
+    }
+  });
+  const next = { ...f, wallets };
+  // The copy first: a crash in between must not leave a hot copy of a savings key.
+  writeDurable(`${file()}.bak`, JSON.stringify(next, null, 2));
+  writeRewrapped(next);
 }
 
 export function exists(): boolean {
@@ -264,18 +419,18 @@ export function list(): WalletSummary[] {
 export function generate(label = ''): { ok: boolean; message: string; publicKey?: string } {
   const blocked = blockedByFailure();
   if (blocked) return blocked;
-  if (!encAvailable()) {
-    return { ok: false, message: 'OS secure storage is unavailable — refusing to store a key unencrypted.' };
-  }
+  const cannot = cannotStore();
+  if (cannot) return { ok: false, message: cannot };
   const f = loadFile();
   const secret = ed25519.utils.randomPrivateKey();
   const pub = ed25519.getPublicKey(secret);
   const publicKey = base58Encode(pub);
+  const id = newId();
   const res = addWallet(f, {
-    id: newId(),
+    id,
     label: label ? cleanLabel(label, f.wallets.length + 1) : nextLabel(f),
     publicKey,
-    secretEnc: encryptSecret(secret),
+    ...protect(secret, id, publicKey),
     homeAddress: null,
     maxBalanceSol: DEFAULT_MAX_BALANCE_SOL,
     createdAt: Date.now(),
@@ -291,7 +446,8 @@ export function generate(label = ''): { ok: boolean; message: string; publicKey?
 export function importSecret(input: string, label = ''): { ok: boolean; message: string; publicKey?: string } {
   const blocked = blockedByFailure();
   if (blocked) return blocked;
-  if (!encAvailable()) return { ok: false, message: 'OS secure storage is unavailable.' };
+  const cannot = cannotStore();
+  if (cannot) return { ok: false, message: cannot };
   let secret: Uint8Array;
   try {
     const trimmed = input.trim();
@@ -308,11 +464,12 @@ export function importSecret(input: string, label = ''): { ok: boolean; message:
   }
   const publicKey = base58Encode(ed25519.getPublicKey(secret));
   const f = loadFile();
+  const id = newId();
   const res = addWallet(f, {
-    id: newId(),
+    id,
     label: label ? cleanLabel(label, f.wallets.length + 1) : nextLabel(f),
     publicKey,
-    secretEnc: encryptSecret(secret),
+    ...protect(secret, id, publicKey),
     homeAddress: null,
     maxBalanceSol: DEFAULT_MAX_BALANCE_SOL,
     createdAt: Date.now(),
@@ -332,7 +489,8 @@ export function importSecret(input: string, label = ''): { ok: boolean; message:
 export function ensureFromSeed(seed: Uint8Array, label: string): { ok: boolean; message: string; id?: string; publicKey?: string; existed?: boolean } {
   const blocked = blockedByFailure();
   if (blocked) return blocked;
-  if (!encAvailable()) return { ok: false, message: 'OS secure storage is unavailable — refusing to store a key unencrypted.' };
+  const cannot = cannotStore();
+  if (cannot) return { ok: false, message: cannot };
   if (seed.length !== 32) return { ok: false, message: 'internal: a Solana seed is 32 bytes' };
   const publicKey = base58Encode(ed25519.getPublicKey(seed));
   const f = loadFile();
@@ -343,7 +501,7 @@ export function ensureFromSeed(seed: Uint8Array, label: string): { ok: boolean; 
     id,
     label: cleanLabel(label, f.wallets.length + 1),
     publicKey,
-    secretEnc: encryptSecret(seed),
+    ...protect(seed, id, publicKey),
     homeAddress: null,
     maxBalanceSol: DEFAULT_MAX_BALANCE_SOL,
     createdAt: Date.now(),
@@ -355,6 +513,11 @@ export function ensureFromSeed(seed: Uint8Array, label: string): { ok: boolean; 
 
 /** Make a held wallet the signer. */
 export function select(id: string): { ok: boolean; message: string } {
+  // The active wallet signs unattended, so it cannot be one that needs typing for.
+  const target = loadFile().wallets.find((w) => w.id === id);
+  if (target && vault.isSealed(target.secretEnc) && vault.scopeOf(target.secretEnc) === 'cold') {
+    return { ok: false, message: `${target.label} is a savings wallet. Turn on "Can auto-trade" for it in Settings first.` };
+  }
   return commit(selectWallet(loadFile(), id));
 }
 
@@ -391,7 +554,13 @@ export function setHomeAddress(addr: string): { ok: boolean; message: string } {
   } catch {
     return { ok: false, message: 'Not a valid Solana address' };
   }
-  const res = patchActive(loadFile(), { homeAddress: trimmed });
+  let mac: string | undefined;
+  if (vault.isSealed(w.secretEnc)) {
+    // Signed under the password, so an edit to the file alone will not sign.
+    if (vault.isLocked()) return { ok: false, message: 'Your wallet is locked. Unlock it first.' };
+    mac = vault.macFor(w.id, w.publicKey, trimmed);
+  }
+  const res = patchActive(loadFile(), { homeAddress: trimmed, ...(mac ? { mac } : {}) });
   if (!res.ok) return res;
   persist(res.file);
   return { ok: true, message: 'Withdrawal address saved' };
@@ -402,7 +571,7 @@ export function setMaxBalance(sol: number): { ok: boolean; message: string } {
   if (blocked) return blocked;
   const w = load();
   if (!w) return { ok: false, message: 'No wallet' };
-  if (!(sol > 0) || sol > 100) return { ok: false, message: 'Cap must be between 0 and 100 SOL' };
+  if (!(sol >= 0) || sol > 100) return { ok: false, message: 'Cap must be between 0 (no warning) and 100 SOL' };
   const res = patchActive(loadFile(), { maxBalanceSol: sol });
   if (!res.ok) return res;
   persist(res.file);
@@ -419,6 +588,18 @@ export function setMaxBalance(sol: number): { ok: boolean; message: string } {
 export function noteBalance(publicKey: string, lamports: number): void {
   if (!publicKey || !Number.isFinite(lamports) || lamports < 0) return;
   balances.set(publicKey, { lamports, at: Date.now() });
+}
+
+/** The last balance read for this address, while it is younger than maxAgeMs. */
+export function cachedBalance(publicKey: string, maxAgeMs: number): number | null {
+  const b = balances.get(publicKey);
+  return b && Date.now() - b.at < maxAgeMs ? b.lamports : null;
+}
+
+/** A settled fill moved this address's balance by this much. */
+export function adjustBalance(publicKey: string, deltaLamports: number): void {
+  const b = balances.get(publicKey);
+  if (b) b.lamports = Math.max(0, b.lamports + deltaLamports);
 }
 
 export async function refreshBalance(httpUrl: string): Promise<{ ok: boolean; message: string; balanceSol?: number }> {
@@ -624,6 +805,8 @@ export function signPumpLogin(
   }
   const w = loadFile().wallets.find((x) => x.id === walletId);
   if (!w) return { ok: false, message: 'No such wallet' };
+  const refused = vault.cannotOpen(w.secretEnc);
+  if (refused) return { ok: false, message: refused };
   let secret: Uint8Array | null = null;
   try {
     secret = decryptSecret(w);
@@ -659,6 +842,13 @@ function signWith(
 ): { ok: boolean; message: string; signed?: Uint8Array } {
   let secret: Uint8Array | null = null;
   let kp: Keypair | null = null;
+  // Before anything else, and before a send approval is spent: nothing about
+  // this transaction matters if the key cannot be opened.
+  const refused = vault.cannotOpen(w.secretEnc);
+  if (refused) return { ok: false, message: refused };
+  if (!detailsOk(w)) {
+    return { ok: false, message: `The details of ${w.label} were changed outside Krypto Mirror, so it will not sign. Check its withdrawal address.` };
+  }
   try {
     const tx = VersionedTransaction.deserialize(unsignedTx);
     // The tx must require exactly our signature as fee payer.
@@ -732,7 +922,16 @@ export function remove(id?: string): { ok: boolean; message: string } {
   const target = f.wallets.find((w) => w.id === targetId);
   const res = removeFromStore(f, targetId);
   if (!res.ok) return { ok: false, message: res.message };
+  // The signer signs unattended, so it should not fall to a savings wallet while
+  // another wallet could do it.
+  const active = res.file.wallets.find((w) => w.id === res.file.activeId);
+  if (active && vault.scopeOf(active.secretEnc) === 'cold') {
+    const hot = res.file.wallets.filter((w) => vault.scopeOf(w.secretEnc) !== 'cold').sort((a, b) => a.createdAt - b.createdAt)[0];
+    if (hot) res.file.activeId = hot.id;
+  }
   persist(res.file);
+  // Removed means removed: the backup copy just taken still holds this key.
+  writeDurable(`${file()}.bak`, fs.readFileSync(file(), 'utf8'));
   if (target) balances.delete(target.publicKey);
   if (!res.file.wallets.length) {
     // An EMPTY v2 file is written, never deleted.

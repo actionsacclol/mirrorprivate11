@@ -164,7 +164,7 @@ for (const [channel, expected] of Object.entries(CHANNELS)) {
       type: 'CopyConfig',
       // The engine's pause and the per-wallet stop's count start (2026-10-23)
       // are set in main only — a renderer must not be able to clear a pause.
-      ownedByMain: ['createdAt', 'lossStopFrom', 'pausedReason', 'pausedAt'],
+      ownedByMain: ['createdAt', 'lossStopFrom', 'pausedReason', 'pausedAt', 'pausedBy', 'rearmAt', 'rearmTries', 'stopTries'],
     },
     // The other three rebuilders. All complete when this was written
     // (2026-09-18) - they are here so the NEXT field added to one of these
@@ -238,7 +238,10 @@ for (const [channel, expected] of Object.entries(CHANNELS)) {
   // IPC call swallows. 'krypto:holding' lived that way for three days: the
   // fee waiver worked in main while the Hub card told a holder their wallets
   // were "not checked yet" (2026-09-19).
-  const handled = [...ipc.matchAll(/ipcMain\.handle\('([^']+)'/g)].map((m) => m[1]);
+  // The wallet password registers its own channels. The prompt:* ones are on the
+  // password window's own preload, not this one, on purpose.
+  const vaultFlows = fs.readFileSync(new URL('../electron/system/vaultFlows.ts', import.meta.url), 'utf8');
+  const handled = [...(ipc + vaultFlows).matchAll(/ipcMain\.handle\('([^']+)'/g)].map((m) => m[1]);
   const invoked = [...preload.matchAll(/ipcRenderer\.invoke\('([^']+)'/g)].map((m) => m[1]);
   const handledSet = new Set(handled);
   const invokedSet = new Set(invoked);

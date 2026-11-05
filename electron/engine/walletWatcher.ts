@@ -132,6 +132,9 @@ interface WalletStats {
   subscribed: boolean;
   /** When a catch-up last ran, so the heartbeat can round-robin. */
   recoveredAt: number;
+  /** When the current subscription was acked. Older transactions were not its
+   *  to deliver. */
+  subscribedAt: number;
 }
 
 /**
@@ -154,7 +157,36 @@ const SUB_GUARD = 64;
 /** Live subscriptions this socket refused to go past, once observed. */
 let observedSubCap: number | null = null;
 const PING_MS = 15_000;
+let pingMs = PING_MS;
 const SILENCE_MS = 25_000;
+/**
+ * The pulse (2026-11-04). A pong only proves the socket answers; it says nothing
+ * about whether the host is still streaming. A quiet leader and a dead stream
+ * look the same, and the 5-minute catch-up was too late to copy a buy. So the
+ * socket also subscribes to slots, which arrive about 2.5 times a second for as
+ * long as the stream is alive. Silence for this long reconnects, and the resubscribe
+ * catches up on the gap. About 30 MB a day, so about 600 credits a day at Helius's
+ * rate of 2 per 0.1 MB. Parsed Streams bills per event, so it has no pulse.
+ */
+const PULSE_SILENCE_MS = 30_000;
+let pulseSilenceMs = PULSE_SILENCE_MS;
+/** Silences in a row before the pulse is doubted: a cluster halt, or a host whose
+ *  slot stream stalls while its wallet stream works. Reconnecting cannot help. */
+const PULSE_TRIPS_MAX = 3;
+const PULSE_TRIPS_WINDOW_MS = 10 * 60_000;
+const PULSE_OFF_MS = 30 * 60_000;
+let pulseTrips: number[] = [];
+let pulseOffUntil = 0;
+/** A landed transaction the live feed has had this long to deliver and did not. */
+const MISS_GRACE_MS = 20_000;
+let missGraceMs = MISS_GRACE_MS;
+/** At most this often: a reconnect is the answer once, not on a loop. If misses
+ *  keep coming a resubscribe is not curing them (a host whose feed never carries
+ *  some kind of transaction, say), so the gap doubles, up to an hour. */
+const MISS_RECONNECT_MS = 5 * 60_000;
+const MISS_RECONNECT_MAX_MS = 60 * 60_000;
+let missReconnectGapMs = MISS_RECONNECT_MS;
+let lastMissReconnectAt = 0;
 /**
  * How hard a followed wallet's transaction is chased before it is given up
  * on.
@@ -215,6 +247,10 @@ const RECOVER_LIMIT = 25;
 const RECOVER_WINDOW_MS = 30 * 60_000;
 /** One wallet per tick, so following ten leaders costs one read a minute. */
 const RECOVER_TICK_MS = 60_000;
+/** A refusal that reads like a ceiling may only have been a rate limit, so it is
+ *  not believed for ever on a socket that can stay up for days. */
+const CAP_RETRY_MS = 10 * 60_000;
+let capRefusedAt = 0;
 /** A live subscription is still re-checked this often, in case it is dead. */
 const RECOVER_EVERY_MS = 5 * 60_000;
 
@@ -272,7 +308,7 @@ export function attach(h: WalletWatcherHost): void {
 function statsFor(wallet: string): WalletStats {
   let s = stats.get(wallet);
   if (!s) {
-    s = { lastSeenAt: null, lastSwapAt: null, seen: 0, swaps: 0, unreadable: 0, notSwap: 0, unseenExits: 0, overCap: false, subscribed: false, recoveredAt: 0 };
+    s = { lastSeenAt: null, lastSwapAt: null, seen: 0, swaps: 0, unreadable: 0, notSwap: 0, unseenExits: 0, overCap: false, subscribed: false, recoveredAt: 0, subscribedAt: 0 };
     stats.set(wallet, s);
   }
   return s;
@@ -284,6 +320,9 @@ export function setWallets(wallets: string[]): void {
   const want = new Set(wallets.filter(Boolean));
   for (const w of [...wanted.keys()]) if (!want.has(w)) unwatch(w);
   for (const w of want) if (!wanted.has(w)) watch(w);
+  // stop() keeps the list, and the only other way back is a NEW wallet, so one
+  // sleep used to end all copying until a follow was touched.
+  if (wanted.size && !running) start();
 }
 
 export function watchedWallets(): string[] {
@@ -495,6 +534,22 @@ function connect(): void {
 
   let lastAlive = Date.now();
   let everPonged = false;
+  /** The slot subscription on this socket, while its request is unanswered. */
+  let pulseId: number | null = null;
+  /** The last slot heard. 0 until the first: a host that never sends one has
+   *  proved nothing by not sending another. */
+  let lastPulseAt = 0;
+  let pulseAsked = false;
+  const askPulse = (): void => {
+    if (pulseAsked || sockMethod === 'parsed' || Date.now() < pulseOffUntil) return;
+    pulseAsked = true;
+    pulseId = nextId++;
+    try {
+      sock.send(JSON.stringify({ jsonrpc: '2.0', id: pulseId, method: 'slotSubscribe' }));
+    } catch {
+      pulseId = null;
+    }
+  };
   let pingTimer: NodeJS.Timeout | null = null;
   const stopPing = (): void => {
     if (pingTimer) clearInterval(pingTimer);
@@ -517,14 +572,34 @@ function connect(): void {
         }
         return;
       }
+      askPulse();
+      if (lastPulseAt > 0 && Date.now() >= pulseOffUntil && Date.now() - lastPulseAt > pulseSilenceMs && ws === sock) {
+        const now = Date.now();
+        lastPulseAt = 0;
+        pulseTrips = [...pulseTrips.filter((at) => now - at < PULSE_TRIPS_WINDOW_MS), now];
+        if (pulseTrips.length >= PULSE_TRIPS_MAX) {
+          pulseOffUntil = now + PULSE_OFF_MS;
+          pulseTrips = [];
+          host?.log('warn', 'wallet watcher: the slot stream keeps stopping and reconnecting does not help, so it is ignored for 30 min. The routine catch-up still runs.');
+        } else {
+          host?.log('warn', `wallet watcher: the socket answers but nothing has arrived for ${Math.round(pulseSilenceMs / 1000)} s; reconnecting`);
+          try {
+            sock.terminate();
+          } catch {
+            /* close handler reconnects */
+          }
+          return;
+        }
+      }
       try {
         sock.ping();
       } catch {
         /* surfaces as close/error */
       }
-    }, PING_MS);
+    }, pingMs);
     for (const s of stats.values()) s.overCap = false;
     for (const wallet of wanted.keys()) subscribe(wallet);
+    askPulse();
   });
 
   sock.on('message', (raw) => {
@@ -542,6 +617,15 @@ function connect(): void {
     try {
       msg = JSON.parse(String(raw));
     } catch {
+      return;
+    }
+    if (msg.method === 'slotNotification') {
+      lastPulseAt = Date.now();
+      return;
+    }
+    if (typeof msg.id === 'number' && msg.id === pulseId) {
+      // Refused or not, the wallets do not depend on it.
+      pulseId = null;
       return;
     }
     if (typeof msg.id === 'number' && msg.error) {
@@ -574,6 +658,7 @@ function connect(): void {
       if (wallet) {
         if (/too many|limit/i.test(text)) {
           statsFor(wallet).overCap = true;
+          capRefusedAt = Date.now();
           // Learn the real per-socket ceiling from the host rather than
           // assuming one: this many were accepted, the next was not.
           observedSubCap = Math.max(1, subCount());
@@ -597,6 +682,7 @@ function connect(): void {
         // session has no gap behind it.
         if (st.subscribed) void recoverGap(wallet, 'the subscription was re-established');
         st.subscribed = true;
+        st.subscribedAt = Date.now();
       }
       return;
     }
@@ -673,6 +759,7 @@ function subscribe(wallet: string): void {
     const ceiling = observedSubCap ?? SUB_GUARD;
     if (live >= ceiling) {
       statsFor(wallet).overCap = true;
+      capRefusedAt = Date.now();
       if (Date.now() - capNotedAt > 60_000) {
         capNotedAt = Date.now();
         host.log(
@@ -1160,7 +1247,7 @@ async function runRead(job: ReadJob): Promise<void> {
  * single transaction is fetched. Oldest first, so a buy and the sell that
  * followed it arrive in the order they happened.
  */
-async function recoverGap(wallet: string, why: string): Promise<void> {
+async function recoverGap(wallet: string, why: string, routine = false): Promise<void> {
   const h = host;
   if (!h || !wanted.has(wallet)) return;
   const s = statsFor(wallet);
@@ -1177,9 +1264,25 @@ async function recoverGap(wallet: string, why: string): Promise<void> {
     .reverse();
   if (!missed.length) return;
   h.log('info', `wallet watcher: catching up on ${missed.length} transaction(s) from ${wallet.slice(0, 6)}… (${why})`);
+  // Proof, not suspicion: this landed while the subscription was up, with time
+  // to spare, and the subscription never said so. One subscription can die with
+  // the socket and its pulse healthy, and if one has, others may have too.
+  const now = Date.now();
+  const proved =
+    routine &&
+    wanted.get(wallet) != null &&
+    s.subscribedAt > 0 &&
+    missed.some((x) => typeof x.blockTime === 'number' && x.blockTime * 1_000 >= s.subscribedAt && x.blockTime * 1_000 < now - missGraceMs);
   for (const x of missed) {
     if (!wanted.has(wallet)) return;
     await onNotification(wallet, x.signature, x.err, true);
+  }
+  if (proved && ws && Date.now() - lastMissReconnectAt >= missReconnectGapMs) {
+    // Quiet for a long while: this is a new failure, not the same one.
+    const sinceLast = Date.now() - lastMissReconnectAt;
+    missReconnectGapMs = sinceLast > MISS_RECONNECT_MAX_MS * 2 ? MISS_RECONNECT_MS : Math.min(missReconnectGapMs * 2, MISS_RECONNECT_MAX_MS);
+    lastMissReconnectAt = Date.now();
+    switchSocket(`the live feed missed a transaction from ${wallet.slice(0, 6)}… — resubscribing every followed wallet`);
   }
 }
 
@@ -1192,9 +1295,17 @@ async function recoverGap(wallet: string, why: string): Promise<void> {
  * leaders costs one `getSignaturesForAddress` a minute, and each wallet is
  * re-checked every `RECOVER_EVERY_MS`.
  */
-function recoverTick(): void {
+function recoverTick(now = Date.now()): void {
   if (!running || ws?.readyState !== WebSocket.OPEN) return;
-  const now = Date.now();
+  if (now - capRefusedAt >= CAP_RETRY_MS) {
+    observedSubCap = null;
+    for (const s of stats.values()) s.overCap = false;
+  }
+  // A refused subscribe has no ack coming and no timer of its own.
+  const asking = new Set([...pending.values()].map((p) => p.wallet));
+  for (const [wallet, id] of wanted) {
+    if (id === null && !asking.has(wallet) && !statsFor(wallet).overCap) subscribe(wallet);
+  }
   let oldest: string | null = null;
   let oldestAt = Infinity;
   for (const [wallet, id] of wanted) {
@@ -1206,7 +1317,7 @@ function recoverTick(): void {
       oldest = wallet;
     }
   }
-  if (oldest) void recoverGap(oldest, 'routine check that nothing was missed');
+  if (oldest) void recoverGap(oldest, 'routine check that nothing was missed', true);
 }
 
 function scheduleReconnect(why: string): void {
@@ -1223,7 +1334,26 @@ function scheduleReconnect(why: string): void {
 }
 
 /** Test seam. */
+export const _recoverTick = recoverTick;
+/** Test seam. */
+export function _setPulseTimes(silenceMs: number, tickMs: number): void {
+  pulseSilenceMs = silenceMs;
+  pingMs = tickMs;
+}
+/** Test seam. */
+export function _setMissGraceMs(ms: number): void {
+  missGraceMs = ms;
+}
+
 export function _reset(): void {
+  pulseTrips = [];
+  pulseOffUntil = 0;
+  lastMissReconnectAt = 0;
+  missReconnectGapMs = MISS_RECONNECT_MS;
+  pulseSilenceMs = PULSE_SILENCE_MS;
+  pingMs = PING_MS;
+  missGraceMs = MISS_GRACE_MS;
+  capRefusedAt = 0;
   txDenied = false;
   parsedDeniedUntil = 0;
   parsedFails = 0;

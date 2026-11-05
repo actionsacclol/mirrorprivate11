@@ -11,7 +11,7 @@
 // (measured 2026-09-11). Every guard below is aimed at that shape.
 
 import assert from 'node:assert';
-import { MAX_NOTE_LENGTH, compareVersions, parseVersion, readVersionDoc, updateStatus } from './.version.mjs';
+import { MAX_NOTE_LENGTH, compareVersions, judgeBuild, parseVersion, readVersionDoc, updateStatus } from './.version.mjs';
 
 let passed = 0;
 const ok = (label) => {
@@ -142,6 +142,59 @@ const at = { checkedAt: 1_700_000_000_000, failure: null };
   assert.equal(readVersionDoc({ version: '2.1.0', note: '  Fixes a crash.  ' }).note, 'Fixes a crash.');
   assert.equal(readVersionDoc({ version: '2.1.0', note: '' }).note, undefined);
   ok('a note is trimmed, bounded and markup-free, or it is not shown at all');
+}
+
+// ── "Is this the right app?" ────────────────────────────────────────────
+{
+  const good = 'a'.repeat(64);
+  const doc = readVersionDoc({
+    version: '1.2.0',
+    builds: { 'win32-x64': good.toUpperCase(), 'linux-x64': 'not-a-hash', 'BAD KEY': good, 'darwin-arm64': 42 },
+  });
+  assert.deepEqual(doc.builds, { 'win32-x64': good });
+  assert.equal(readVersionDoc({ version: '1.2.0', builds: ['x'] }).builds, undefined);
+  assert.equal(readVersionDoc({ version: '1.2.0' }).builds, undefined);
+  ok('only well-formed fingerprints are kept, so a typo cannot call a real install a fake');
+}
+
+{
+  const hash = 'b'.repeat(64);
+  const other = 'c'.repeat(64);
+  const doc = { version: '1.2.0', builds: { 'win32-x64': hash } };
+  const judge = (over) =>
+    judgeBuild({ current: '1.2.0', doc, failure: null, packaged: true, platform: 'win32-x64', ownHash: hash, ...over });
+
+  assert.equal(judge({}).verdict, 'official');
+  assert.equal(judge({ ownHash: hash.toUpperCase() }).verdict, 'official');
+  ok('same version and same files is the only pass');
+
+  const fake = judge({ ownHash: other });
+  assert.equal(fake.verdict, 'different');
+  assert.match(fake.detail, /Do not put money/);
+  ok('the right version number with the wrong files is the alarm');
+
+  assert.equal(judge({ current: '1.1.0', ownHash: other }).verdict, 'outdated');
+  ok('an old version is called old, never fake: only the newest fingerprint is published');
+
+  const ahead = judge({ current: '9.9.9' });
+  assert.equal(ahead.verdict, 'unknown');
+  assert.doesNotMatch(ahead.title, /official|latest/i);
+  ok('a version krypt.cc never published is not a pass: it is what a fake would claim');
+
+  assert.equal(judge({ platform: 'darwin-arm64' }).verdict, 'version-only');
+  assert.equal(judge({ ownHash: null }).verdict, 'version-only');
+  assert.doesNotMatch(judge({ ownHash: null }).title, /official/i);
+  ok('with nothing to compare the files against, it says only the version was compared');
+
+  const offline = judge({ doc: null, failure: 'krypt.cc answered HTTP 404', ownHash: null });
+  assert.equal(offline.verdict, 'unknown');
+  assert.match(offline.detail, /HTTP 404/);
+  assert.doesNotMatch(offline.title, /official|latest/i);
+  assert.equal(judge({ current: 'nonsense' }).verdict, 'unknown');
+  ok('could not check is never dressed up as a pass');
+
+  assert.equal(judge({ packaged: false, ownHash: null }).verdict, 'dev');
+  ok('a source run says so rather than failing the comparison');
 }
 
 console.log(`\nversion: ${passed}/${passed} passed`);

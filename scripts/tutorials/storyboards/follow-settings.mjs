@@ -53,7 +53,7 @@ export default {
       line: 4,
       do: async (ui) => {
         await ui.point(heading('Limits', PAGE), { hold: 1200 });
-        await opt(ui.point({ testid: 'follow-daily-loss' }, { hold: 1400 }));
+        await opt(ui.hover(heading('Stop for the day after losing', PAGE), { hold: 1400 }));
         await opt(ui.hover(heading('Pause this wallet after losing', PAGE), { hold: 1200 }));
         await opt(ui.hover(heading('At most this many copies a day', PAGE), { hold: 1200 }));
       },

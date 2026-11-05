@@ -21,6 +21,9 @@ export interface StoredWallet {
   homeAddress: string | null;
   maxBalanceSol: number;
   createdAt: number;
+  /** With the wallet password on: authenticates the withdrawal address, which
+   *  the signer trusts and which otherwise sits in this file in the clear. */
+  mac?: string;
 }
 
 /**
@@ -46,7 +49,8 @@ export interface LegacyWalletFile {
   createdAt: number;
 }
 
-export const DEFAULT_MAX_BALANCE_SOL = 2;
+/** 0 = no balance warning. A number already saved on a wallet stays. */
+export const DEFAULT_MAX_BALANCE_SOL = 0;
 const MAX_LABEL = 32;
 /**
  * At most ten Solana wallets, the main one included (2026-09-22, the owner's
@@ -108,7 +112,7 @@ function parseWallet(w: unknown): StoredWallet | null {
   if (typeof o.id !== 'string' || !o.id) return null;
   if (typeof o.publicKey !== 'string' || !o.publicKey) return null;
   if (typeof o.secretEnc !== 'string' || !o.secretEnc) return null;
-  const max = typeof o.maxBalanceSol === 'number' && o.maxBalanceSol > 0 ? o.maxBalanceSol : DEFAULT_MAX_BALANCE_SOL;
+  const max = typeof o.maxBalanceSol === 'number' && o.maxBalanceSol >= 0 ? o.maxBalanceSol : DEFAULT_MAX_BALANCE_SOL;
   return {
     id: o.id,
     label: typeof o.label === 'string' && o.label.trim() ? o.label.slice(0, MAX_LABEL) : 'Wallet',
@@ -117,6 +121,7 @@ function parseWallet(w: unknown): StoredWallet | null {
     homeAddress: typeof o.homeAddress === 'string' ? o.homeAddress : null,
     maxBalanceSol: max,
     createdAt: typeof o.createdAt === 'number' ? o.createdAt : 0,
+    ...(typeof o.mac === 'string' ? { mac: o.mac } : {}),
   };
 }
 
@@ -211,7 +216,7 @@ export function removeWallet(file: WalletsFile, id: string): StoreResult {
 }
 
 /** Patch the ACTIVE wallet's settings (withdrawal address, balance cap). */
-export function patchActive(file: WalletsFile, patch: Partial<Pick<StoredWallet, 'homeAddress' | 'maxBalanceSol'>>): StoreResult {
+export function patchActive(file: WalletsFile, patch: Partial<Pick<StoredWallet, 'homeAddress' | 'maxBalanceSol' | 'mac'>>): StoreResult {
   const active = activeWallet(file);
   if (!active) return { file, ok: false, message: 'No wallet' };
   const wallets = file.wallets.map((w) => (w.id === active.id ? { ...w, ...patch } : w));

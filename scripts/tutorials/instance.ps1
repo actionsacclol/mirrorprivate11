@@ -60,7 +60,7 @@ function Remove-Key {
 function Set-FirstRun {
   Remove-Item (Join-Path $prof 'legal-acceptance.jsonl') -Force -ErrorAction SilentlyContinue
   Remove-Follows
-  foreach ($f in @('wallet.json', 'wallets.json', 'evm-wallets.json')) { Remove-Item (Join-Path $prof $f) -Force -ErrorAction SilentlyContinue }
+  foreach ($f in @('wallet.json', 'wallets.json', 'wallets.json.bak', 'evm-wallets.json', 'evm-wallets.json.bak', 'vault.json', 'vault.json.bak')) { Remove-Item (Join-Path $prof $f) -Force -ErrorAction SilentlyContinue }
   Edit-Settings "s.onboarded=false;console.log('onboarded=false');"
 }
 

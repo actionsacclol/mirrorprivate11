@@ -154,6 +154,11 @@ const near = (a, b, label) => assert.ok(Math.abs(a - b) < 1e-9, `${label}: ${a} 
     specOf({ dailyLossLimitSol: 0.05 }),
   );
   assert.equal(count(r, 'dailyLoss'), 1, 'L3 is refused: L1 lost past the limit and had closed');
+  const noLimit = backtestCopies([trip('N1', T, 2 * MIN, lose), trip('N2', T + 10 * MIN, 2 * MIN)], specOf({ dailyLossLimitSol: 0 }));
+  assert.equal(count(noLimit, 'dailyLoss'), 0, 'no limit set: nothing is refused for a loss');
+  assert.equal(noLimit.copiesList.length, 2);
+  assert.equal(backtestConfigOf({ wallet: W, sizeValue: 1, maxTradeSol: 1 }).ok, true, 'and it needs no limit to run');
+  assert.equal(backtestConfigOf({ wallet: W, sizeValue: 1, maxTradeSol: 1, maxCopiesPerMinute: 0 }).config.maxCopiesPerMinute, 0, 'none stays none, not the old 10');
   assert.deepEqual(r.copiesList.map((c) => c.mint).sort(), ['L1', 'L2', 'L4'], 'L2 came before L1 had closed; tomorrow starts again');
   // The follow's own stop pauses it for good.
   r = backtestCopies([trip('S1', T, 2 * MIN, lose), trip('S2', T + 10 * MIN, 2 * MIN), trip('S3', T + DAY, 2 * MIN)], specOf({ walletLossStopSol: 0.05 }));

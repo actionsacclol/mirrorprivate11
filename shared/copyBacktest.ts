@@ -112,12 +112,12 @@ export function backtestConfigOf(raw: unknown): { ok: true; config: BacktestConf
   if (!BASE58.test(wallet)) return { ok: false, message: 'Choose a Solana wallet to backtest' };
   const sizeValue = pos(r.sizeValue);
   const maxTradeSol = pos(r.maxTradeSol);
-  const dailyTradeLimit = pos(r.dailyTradeLimit);
-  const dailyLossLimitSol = pos(r.dailyLossLimitSol);
+  // Absent or 0: no limit, the same as a follow with none.
+  const dailyTradeLimit = pos(r.dailyTradeLimit) ?? 0;
+  // Absent or 0: no daily loss limit, the same as a follow with none.
+  const dailyLossLimitSol = pos(r.dailyLossLimitSol) ?? 0;
   if (sizeValue === null) return { ok: false, message: 'Set a size per copy first' };
   if (maxTradeSol === null) return { ok: false, message: 'Set the most one copy may spend first' };
-  if (dailyTradeLimit === null) return { ok: false, message: 'Set a daily copy limit first' };
-  if (dailyLossLimitSol === null) return { ok: false, message: 'Set a daily loss limit first' };
   const direction: CopyDirection = r.direction === 'reverse' ? 'reverse' : r.direction === 'fomo' ? 'fomo' : r.direction === 'watch' ? 'watch' : 'copy';
   const ai = r.ai && typeof r.ai === 'object' ? (r.ai as Record<string, unknown>) : null;
   return {
@@ -141,7 +141,7 @@ export function backtestConfigOf(raw: unknown): { ok: true; config: BacktestConf
       onePositionPerCoin: r.onePositionPerCoin === true,
       maxBuysPerToken: pos(r.maxBuysPerToken),
       dailyTradeLimit,
-      maxCopiesPerMinute: pos(r.maxCopiesPerMinute),
+      maxCopiesPerMinute: num(r.maxCopiesPerMinute) === 0 ? 0 : pos(r.maxCopiesPerMinute),
       dailyLossLimitSol,
       walletLossStopSol: pos(r.walletLossStopSol),
       delayMs: Math.max(0, num(r.delayMs) ?? 0),
@@ -357,7 +357,7 @@ export function backtestRuleLabel(rule: BacktestRule, c: BacktestConfig, maxOpen
   }
 }
 
-const perMinuteOf = (c: BacktestConfig): number => (typeof c.maxCopiesPerMinute === 'number' && c.maxCopiesPerMinute > 0 ? c.maxCopiesPerMinute : DEFAULT_COPIES_PER_MINUTE);
+const perMinuteOf = (c: BacktestConfig): number => (c.maxCopiesPerMinute === 0 ? Number.POSITIVE_INFINITY : typeof c.maxCopiesPerMinute === 'number' && c.maxCopiesPerMinute > 0 ? c.maxCopiesPerMinute : DEFAULT_COPIES_PER_MINUTE);
 
 /** Their opening buy, SOL — the trade a copy is a copy OF. */
 export const openSolOf = (t: Pick<ReplayTrip, 'openSol' | 'cost'>): number => (typeof t.openSol === 'number' && t.openSol > 0 ? t.openSol : Math.max(0, t.cost));
@@ -431,6 +431,7 @@ export function backtestNotApplied(c: BacktestConfig, maxOpenCopies: number | nu
   if (c.onlyPumpfun) add('onlyPumpfun', 'pump.fun coins only', 'the replay does not read which launchpad made each coin');
   if (c.minTokenAgeSec != null || c.maxTokenAgeSec != null) add('tokenAge', 'Coin age when they buy', 'the backtest does not read each coin’s birth');
   if (c.blockedCreators?.length) add('blockedCreators', 'Blocked creators', 'the replay does not know who made each coin');
+  if (c.walletLossStopSol != null) add('lossStopComeback', 'Coming back after a loss stop', 'once the stop is hit the replay stays stopped. With that comeback on in Settings, live returns after an hour and can lose the stop again');
   if (c.ai && (c.ai.entries || c.ai.exits)) add('ai', 'The AI desk', 'its decisions cannot be replayed — every copy is taken as the rules allow');
   const x = ownExitsOf(c);
   if (x.takeProfitPct !== null) add('takeProfit', `Take profit (+${x.takeProfitPct}%)`, 'needs the price between their buy and their sell, which the replay does not read');
@@ -503,7 +504,7 @@ export function backtestCopies(trips: readonly ReplayTrip[], spec: BacktestSpec)
     // limitHit: the day's copies, the minute's, the day's realised loss, the
     // follow's own stop, the open ceiling.
     const today = taken.filter((x) => x.day === day);
-    if (today.length >= c.dailyTradeLimit) {
+    if (c.dailyTradeLimit > 0 && today.length >= c.dailyTradeLimit) {
       skip('dailyTrades');
       continue;
     }
@@ -512,7 +513,7 @@ export function backtestCopies(trips: readonly ReplayTrip[], spec: BacktestSpec)
       continue;
     }
     const realisedToday = today.filter(closedBy).reduce((a, x) => a + (x.pnlSol ?? 0), 0);
-    if (realisedToday <= -c.dailyLossLimitSol) {
+    if (c.dailyLossLimitSol > 0 && realisedToday <= -c.dailyLossLimitSol) {
       skip('dailyLoss');
       continue;
     }

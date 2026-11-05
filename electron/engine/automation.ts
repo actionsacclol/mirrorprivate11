@@ -93,7 +93,7 @@ import type { CopySnapshot } from '@shared/copytrade';
 import type { Alert } from '@shared/alerts';
 import type { OrderTemplate } from '@shared/orderTemplates';
 import type { CopyTrade } from '@shared/copytrade';
-import { nativeSymbolOf } from '@shared/evm';
+import { EVM_EXIT_GAS, nativeSymbolOf } from '@shared/evm';
 import type { ChainKind } from '@shared/evm';
 import type { EvmScanLaunch } from '@shared/evmScan';
 import type { EvmRunnerFlag } from '@shared/evmRunners';
@@ -3720,7 +3720,7 @@ const AIO_MOVES_PER_DAY = 20;
 const aioMoves = new Map<string, { day: string; n: number }>();
 
 /** What each chain keeps back to pay for selling (aioConvert CHAIN_RESERVE). */
-const EXIT_GAS: Record<string, number> = { bnb: 0.0005, robinhood: 0.0001 };
+const EXIT_GAS: Record<string, number> = EVM_EXIT_GAS;
 
 /** Where an EVM chain's runner flags are read (the chain scanner, wired in
  *  ipc.ts beside its launch hook). Null = none (tests, a build without it). */

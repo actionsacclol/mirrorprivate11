@@ -1,12 +1,14 @@
-import { app, BrowserWindow, Menu, Notification, dialog, nativeImage, powerMonitor, screen, session } from 'electron';
+import { app, BrowserWindow, Menu, Notification, Tray, dialog, nativeImage, powerMonitor, powerSaveBlocker, screen, session } from 'electron';
 import { postFlag, publicTokenUrl, redactWebhook } from './system/discordWebhook';
-import { EVM_CHAIN_META } from '@shared/evm';
+import { EVM_CHAIN_META, EVM_CHAINS } from '@shared/evm';
 import { UPDATE_CHECK_ENABLED } from '@shared/version';
 import type { NotifyTarget } from '@shared/types';
 import path from 'node:path';
 import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { registerIpc, getEngine, syncLiveMode, bridgeDeps, setWindowHost } from './ipc';
+import { registerIpc, getEngine, syncLiveMode, recoverCrashOnce, bridgeDeps, setWindowHost } from './ipc';
+import * as vault from './system/vault';
+import { promptUnlock } from './system/vaultFlows';
 import * as store from './system/settings-store';
 import * as wallet from './system/wallet';
 import { failure as evmWalletFailure } from './evm/evmWallet';
@@ -21,6 +23,8 @@ import { startDiscordRpc, stopDiscordRpc, setActivity } from './system/discord';
 import * as crashGuard from './system/crashGuard';
 import * as acceptance from './system/acceptance';
 import { ACCEPTANCE_LOG_FILE, ACCEPTANCE_RETENTION_DAYS } from '@shared/legal/entity';
+import { closeAction, trayNotice } from '@shared/trayClose';
+import { rearmClock } from '@shared/rearm';
 import * as recorder from './engine/recorder';
 import * as creators from './engine/creators';
 import { initTemplateStore } from './engine/txBuilder';
@@ -199,7 +203,10 @@ if (!gotLock) {
   else app.exit(1);
 } else {
   profiles.markRunning();
-  app.on('will-quit', () => profiles.clearRunning());
+  app.on('will-quit', () => {
+    profiles.clearRunning();
+    tray?.destroy();
+  });
   app.on('second-instance', () => {
     showMainWindow();
 
@@ -325,7 +332,11 @@ app.on('child-process-gone', (_e, details) => {
 // where the eleventh handshake is a 429 that parks the whole host for 30 s.
 // Measured 2026-09-09. So: put them down on the way out, bring them back
 // staggered. Nothing here touches positions, orders or the ability to exit.
+let suspendedAt = 0;
+/** The wallet watcher's catch-up window: sells older than this are not replayed. */
+const LONG_SLEEP_MS = 30 * 60_000;
 powerMonitor.on('suspend', () => {
+  suspendedAt = Date.now();
   try {
     getEngine().suspendSockets('system suspend');
   } catch {
@@ -346,6 +357,16 @@ powerMonitor.on('resume', () => {
     },
     3_000 + Math.random() * 2_000,
   );
+  // A sell made during a long sleep is past the catch-up window. Same check as a
+  // boot: recorded and alerted, never traded. After the sockets, so reads go last.
+  const before = suspendedAt;
+  if (before > 0 && Date.now() - before >= LONG_SLEEP_MS) {
+    setTimeout(() => {
+      void copyTrade
+        .checkLeadersAfterBoot(12, { text: 'while this computer was asleep', before })
+        .catch(() => {});
+    }, 20_000);
+  }
 });
 
 // `bootstrap` does ~160 lines of init before showMainWindow(). Without this
@@ -382,6 +403,74 @@ function bootstrapFailed(e: unknown): void {
 }
 
 let mainWindow: BrowserWindow | null = null;
+
+// ── Closing to the tray (2026-11-04) ──────────────────────────────────
+//
+// The X hides the window; the engine and any live trading carry on. The rules
+// are in shared/trayClose.ts. The icon appears the first time it is needed and
+// stays until the app quits, so the switch in Settings has nothing to keep in
+// step with.
+let tray: Tray | null = null;
+let quitting = false;
+/** The window exists to be reopened only after boot has made it once. */
+let booted = false;
+
+// A computer that sleeps copies nothing, and the Windows default sleeps after
+// half an hour with nobody at the keyboard. Only held while something is running;
+// the screen can still turn off, and a closed lid or choosing Sleep still wins.
+let awakeBlock: number | null = null;
+function syncKeepAwake(): void {
+  const want = store.load().keepAwake && (copyTrade.keepsRunning() || liveArmedAnywhere());
+  if (want === (awakeBlock !== null)) return;
+  if (want) {
+    awakeBlock = powerSaveBlocker.start('prevent-app-suspension');
+  } else if (awakeBlock !== null) {
+    powerSaveBlocker.stop(awakeBlock);
+    awakeBlock = null;
+  }
+  logger.info(`keep awake: ${want ? 'holding the computer awake' : 'released'}`);
+}
+
+function trayIcon(): Electron.NativeImage {
+  const img = nativeImage.createFromPath(path.join(__dirname, '..', 'resources', 'krypt.ico'));
+  if (img.isEmpty()) throw new Error('the tray icon did not decode');
+  return img;
+}
+
+function ensureTray(): void {
+  if (tray && !tray.isDestroyed()) return;
+  tray = new Tray(trayIcon());
+  tray.setToolTip(profiles.title());
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: 'Open Krypto Mirror', click: () => void showMainWindow() },
+      { type: 'separator' },
+      { label: 'Quit Krypto Mirror', click: () => app.quit() },
+    ]),
+  );
+  tray.on('click', () => void showMainWindow());
+  tray.on('balloon-click', () => void showMainWindow());
+}
+
+function liveArmedAnywhere(): boolean {
+  return getEngine().liveState().armed || EVM_CHAINS.some((c) => evmRail.armed(c));
+}
+
+function noticeClosedToTray(): void {
+  const armed = liveArmedAnywhere();
+  logger.info(`lifecycle: closed to the tray (live ${armed ? 'ARMED' : 'off'})`);
+  try {
+    // The tray's own balloon, not a Notification: Windows silently drops a
+    // Notification unless a Start Menu shortcut registers the app's ID, and this
+    // one is the only sign the app did not quit. Not behind the desktop-alerts
+    // switch either, because it answers the user's own click.
+    const back = getEngine().rearmPending()[0];
+    const { title, body } = trayNotice(armed, back ? rearmClock(back.at) : null);
+    tray?.displayBalloon({ title, content: body, icon: trayIcon(), noSound: true });
+  } catch (err) {
+    logger.warn(`lifecycle: the tray notification failed: ${(err as Error).message}`);
+  }
+}
 
 function showMainWindow(): BrowserWindow {
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -452,8 +541,13 @@ function showMainWindow(): BrowserWindow {
 
   // Reveal robustly: ready-to-show is the ideal trigger, but did-finish-load
   // + a hard timeout guarantee the window can never get stuck invisible.
+  // Once only: these triggers can outlive the first show, and a later one would
+  // pull a window the user just closed to the tray back onto the screen.
+  let revealed = false;
   const reveal = (): void => {
-    if (win.isDestroyed() || win.isVisible()) return;
+    if (revealed || win.isDestroyed()) return;
+    revealed = true;
+    if (win.isVisible()) return;
     win.show();
     win.focus();
   };
@@ -507,6 +601,31 @@ function showMainWindow(): BrowserWindow {
         logger.error(`mainWindow: reload failed: ${(err as Error).message}`);
       }
     }, 1_000);
+  });
+
+  win.on('close', (e) => {
+    const s = store.load();
+    const action = closeAction({
+      platform: process.platform,
+      enabled: s.closeToTray,
+      onboarded: s.onboarded,
+      quitting,
+      visible: win.isVisible(),
+    });
+    if (action === 'close') return;
+    e.preventDefault();
+    if (action === 'hide') {
+      try {
+        ensureTray();
+        win.hide();
+        noticeClosedToTray();
+        return;
+      } catch (err) {
+        // No icon means no way back to a hidden window, so the X means quit.
+        logger.warn(`lifecycle: could not close to the tray, quitting: ${(err as Error).message}`);
+      }
+    }
+    app.quit();
   });
 
   win.on('closed', () => {
@@ -794,6 +913,13 @@ async function bootstrap(): Promise<void> {
   paperBook.init(app.getPath('userData'));
   alertStore.init(app.getPath('userData'));
   copyTrade.init(app.getPath('userData'));
+  setInterval(() => {
+    try {
+      syncKeepAwake();
+    } catch (e) {
+      logger.warn(`keep awake: ${String(e)}`);
+    }
+  }, 30_000).unref();
   // The scripts store is still READ, so an unreadable file is reported with
   // the rest below, but Krypto Mirror ships no scripts and never runs one:
   // nothing is seeded and no sandbox is started.
@@ -927,9 +1053,8 @@ async function bootstrap(): Promise<void> {
   // Is there a newer build? Asked once, thirty seconds in, so it competes
   // with nothing at startup — and never awaited, because a slow or missing
   // endpoint must not hold up a boot. The renderer reads the answer from
-  // memory whenever it paints. Off for the private beta (UPDATE_CHECK_ENABLED
-  // in shared/version.ts): with no document to check, the network is never
-  // touched and About hides the box.
+  // memory whenever it paints. UPDATE_CHECK_ENABLED in shared/version.ts is the
+  // switch.
   if (UPDATE_CHECK_ENABLED) {
     setTimeout(() => {
       void import('./system/updateCheck').then((m) => m.check()).catch(() => undefined);
@@ -1057,7 +1182,7 @@ async function bootstrap(): Promise<void> {
   // the SAME two halves as the top-bar switch (live:setLive): arm the
   // engine, then save Live as the mode — so the top bar tells the truth.
   getEngine().onRearmAfterUpgrade = () => {
-    const r = getEngine().arm(wallet.exists());
+    const r = getEngine().arm(wallet.exists(), { keepSession: true });
     if (!r.ok) return r;
     const cur = store.load();
     store.update({ execution: { ...cur.execution, liveEnabled: true } });
@@ -1105,7 +1230,15 @@ async function bootstrap(): Promise<void> {
   logger.info(`recordings dir: ${recDir}${state.recordFirehose ? ' (firehose ON)' : ''}`);
   programWatch.init(app.getPath('userData'));
 
-  showMainWindow();
+  const firstWindow = showMainWindow();
+  booted = true;
+  // One unlock per launch, once there is a window to sit above. Until then the
+  // app reads and paper trades, and nothing can sign.
+  if (vault.isLocked()) {
+    const ask = (): void => void promptUnlock(firstWindow);
+    if (firstWindow.isVisible()) ask();
+    else firstWindow.once('show', ask);
+  }
 
   // Opt-in unattended collection (settings.scannersAutoStart). AFTER the
   // window, so a scanner can never be the reason the app fails to show — and
@@ -1135,7 +1268,7 @@ async function bootstrap(): Promise<void> {
   // chain once the window is up and auto-sell if the user opted in.
   setTimeout(() => {
     syncLiveMode();
-    getEngine().recoverAfterCrash().catch((err) => logger.warn(`crash recovery: ${err}`));
+    recoverCrashOnce();
   }, 6_000);
 
   // Discord Rich Presence — on by default, like the other Krypt tools
@@ -1160,7 +1293,8 @@ async function bootstrap(): Promise<void> {
         // Disarm live (onDisarm turns execution.liveEnabled off); open
         // positions can still be closed because a debugger disarm keeps the
         // breaker-exit allowance, exactly like the loss-limit breaker.
-        if (getEngine().liveState().armed) getEngine().disarm('debugger');
+        // Unconditional: it also ends a comeback planned for a loss limit.
+        getEngine().disarm('debugger');
       },
       onAnalysisTool: (label) => {
         try {
@@ -1200,11 +1334,10 @@ async function bootstrap(): Promise<void> {
  *
  * A sandbox is told apart by its session, not by counting: the main window
  * declares no `partition`, so it is the only window on the default session,
- * and this fires only when none of those is left. The app has no tray and
- * never hides the main window (`.hide()` appears nowhere), so "no
- * default-session window" means the user really did close the app. macOS is
- * left alone for the same reason `window-all-closed` was: the app lives on
- * in the Dock there.
+ * and this fires only when none of those is left. A main window closed to the
+ * tray is hidden, not gone, so it still counts: "no default-session window"
+ * means the user really did close the app. macOS is left alone for the same
+ * reason `window-all-closed` was: the app lives on in the Dock there.
  */
 function quitIfOnlySandboxesRemain(): void {
   if (process.platform === 'darwin') return;
@@ -1225,8 +1358,17 @@ app.on('window-all-closed', () => {
   }
 });
 
+// macOS keeps the app running when its window closes, live copies included, so
+// the Dock icon has to bring it back. Without this the only way back to a
+// running trade was to quit.
+app.on('activate', () => {
+  if (booted && !quitting) showMainWindow();
+});
+
 let quitDrained = false;
 app.on('before-quit', (e) => {
+  // First: from here on the window's close is real, not a trip to the tray.
+  quitting = true;
   // Scripts next: their sandboxes are windows, and a script must not fire
   // into a closing engine.
   void automation.shutdown();

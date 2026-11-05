@@ -149,6 +149,9 @@ export function parseFile(raw: unknown, chainId: number): EvmWalletsFile | null 
     const parsed = parseWallet(w);
     if (parsed && !wallets.some((x) => x.address.toLowerCase() === parsed.address.toLowerCase())) wallets.push(parsed);
   }
+  // A file that listed wallets and yielded none is one we failed to understand.
+  // Read as empty it stays writable, and the next write loses the only ciphertext.
+  if (wallets.length === 0 && (obj.wallets as unknown[]).length > 0) return null;
   // Migration: one signer becomes one signer PER CHAIN.
   //
   // A file written before 2026-09-11 has a single `activeId`. It seeds BOTH

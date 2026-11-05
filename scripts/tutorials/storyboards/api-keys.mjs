@@ -42,7 +42,14 @@ export default {
         await opt(ui.hover({ text: 'portal\\.jup\\.ag', sel: 'a, button', within: '[data-testid=apikey-jupiter]' }, { hold: 1600 }));
       },
     },
-    { line: 7, do: async (ui) => ui.point('[data-testid=apikey-birdeye]', { hold: 2600, glow: 2800 }) },
+    {
+      line: 7,
+      do: async (ui) => {
+        if (!(await ui.exists('[data-testid=apikey-birdeye]'))) await ui.click({ testid: 'apikey-more' });
+        await ui.waitFor('[data-testid=apikey-birdeye]', 4000);
+        await ui.point('[data-testid=apikey-birdeye]', { hold: 2600, glow: 2800 });
+      },
+    },
     {
       line: 8,
       do: async (ui) => {
@@ -54,7 +61,7 @@ export default {
     {
       line: 9,
       do: async (ui) => {
-        await opt(ui.point({ text: 'never sent', sel: 'p' }, { hold: 2000 }));
+        await opt(ui.point({ text: 'never to Krypt', sel: 'p' }, { hold: 2000 }));
         await removeKey(ui);
         await ui.pause(900);
       },

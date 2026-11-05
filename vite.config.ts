@@ -46,7 +46,7 @@ export default defineConfig(({ mode }) => {
               outDir: 'dist-electron',
               sourcemap,
               rollupOptions: {
-                external: ['ws', 'discord-rpc', 'bufferutil', 'utf-8-validate', 'undici'],
+                external: ['ws', 'discord-rpc', 'bufferutil', 'utf-8-validate', 'undici', 'original-fs'],
                 output: stableNames,
               },
             },
@@ -57,6 +57,19 @@ export default defineConfig(({ mode }) => {
           onstart(options) {
             options.reload();
           },
+          vite: {
+            resolve: { alias: { '@shared': path.resolve(__dirname, 'shared') } },
+            build: {
+              outDir: 'dist-electron',
+              sourcemap,
+              rollupOptions: { output: stableNames },
+            },
+          },
+        },
+        {
+          // The password window's preload. Its own entry, so that window never
+          // loads the app's API and the app window never loads this.
+          entry: 'electron/promptPreload.ts',
           vite: {
             resolve: { alias: { '@shared': path.resolve(__dirname, 'shared') } },
             build: {

@@ -33,6 +33,9 @@ import {
 
 export { CHAIN_KINDS, EVM_CHAINS, isEvmChain, isChainKind, type ChainKind, type EvmChainKind };
 
+/** Native a buy leaves behind to pay the gas of selling it again. */
+export const EVM_EXIT_GAS: Record<EvmChainKind, number> = { bnb: 0.0005, robinhood: 0.0001 };
+
 export interface EvmChainMeta {
   kind: EvmChainKind;
   id: number;
@@ -176,8 +179,8 @@ export interface EvmChainSettings {
    * Most one AUTOMATIC live trade on this chain may spend, in its own coin
    * (2026-10-24) — the EVM side of `execution.maxLiveSol`. Copy trading and
    * the Trader refuse a trade above it and record why; it is never a clamp,
-   * and a trade placed by hand is not held to it. Absent on a settings file
-   * from before it, which reads as the default.
+   * and a trade placed by hand is not held to it. 0 = no cap, the default since
+   * 2026-11-04. Absent on a settings file from before it, which reads the same.
    */
   maxLiveNative: number;
 }
@@ -206,8 +209,8 @@ export const DEFAULT_EVM_SETTINGS: EvmSettings = {
   referrer: '',
   // Per-trade caps near Solana's 0.05 SOL default in dollars (~$10–15 in
   // October 2026), so a chain switched on later is never uncapped.
-  robinhood: { enabled: false, rpcUrl: '', apiKey: '', runnerAlerts: { ...DEFAULT_EVM_RUNNER_ALERTS }, maxLiveNative: 0.003 },
-  bnb: { enabled: false, rpcUrl: '', apiKey: '', runnerAlerts: { ...DEFAULT_EVM_RUNNER_ALERTS }, maxLiveNative: 0.02 },
+  robinhood: { enabled: false, rpcUrl: '', apiKey: '', runnerAlerts: { ...DEFAULT_EVM_RUNNER_ALERTS }, maxLiveNative: 0 },
+  bnb: { enabled: false, rpcUrl: '', apiKey: '', runnerAlerts: { ...DEFAULT_EVM_RUNNER_ALERTS }, maxLiveNative: 0 },
 };
 
 /** Where the engine should actually connect for a chain. Key wins over URL

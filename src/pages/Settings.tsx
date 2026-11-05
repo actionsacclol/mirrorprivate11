@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
+import { ChevronDown } from 'lucide-react';
 import type { ProbeResult as RpcProbeResult } from '../../electron/engine/rpcProbe';
 import { Card, Copyable, GhostButton, Page, PrimaryButton, Section, Switch, TextInput } from '../components/common';
 import { MarketDataSettings } from '../components/terminal/MarketDataSettings';
@@ -13,6 +14,8 @@ import { Segmented } from '../ui/kit';
 import { useLocale } from '../state/useLocale';
 import { HeliusOnlyFeedSwitch } from '../components/HeliusOnlyFeedSwitch';
 import { PaperBankrollSection } from '../components/copy/PaperBankroll';
+import { VaultSection } from '../components/VaultPanel';
+import { RearmSection } from '../components/RearmSection';
 
 export function SettingsPage() {
   const { t } = useLocale();
@@ -95,10 +98,7 @@ export function SettingsPage() {
     <Page title={t('settings.title')} subtitle={t('settings.subtitle')}>
       {/* First, and above the data providers: someone who cannot read the
           page cannot use anything below it. */}
-      <Section
-        title={t('lang.title')}
-        description="Menus, buttons, settings and the first-run walkthrough. Legal documents and anything describing your money stay in English, which is the version that governs."
-      >
+      <Section title={t('lang.title')}>
         <Card>
           <LanguagePicker />
         </Card>
@@ -112,183 +112,37 @@ export function SettingsPage() {
         </Card>
       </Section>
 
-      {/* Every key in one place (2026-10-25), ahead of the sections that
-          spend them. */}
+      <VaultSection />
+
+      {/* Windows only, which is the only place the X goes to the tray. */}
+      {/Windows/.test(navigator.userAgent) && (
+        <Section title="Closing the window" description="What the X at the top right of the window does.">
+          <Card>
+            <Switch
+              checked={settings.closeToTray}
+              onChange={(v) => void updateSettings({ closeToTray: v })}
+              label="Keep running in the system tray"
+              description="On: the X hides the window, your follows and any live trading carry on, and a notification says so each time. Quit from the tray icon's right-click menu. Off: the X quits the app, which stops them."
+            />
+          </Card>
+        </Section>
+      )}
+
+      <Section title="Leaving it running" description="For a bot left on for hours or days. What comes back on by itself after a stop is in Auto re-arm, under Advanced.">
+        <Card>
+          <Switch
+            checked={settings.keepAwake}
+            onChange={(v) => void updateSettings({ keepAwake: v })}
+            label="Keep this computer awake"
+            description="On: while a follow or Live is running, the computer does not go to sleep by itself, so nothing is missed. The screen can still turn off. Closing a laptop's lid or choosing Sleep still sleeps it, and nothing copies while it sleeps. Uses more power, so a laptop on battery can run flat. Off: your computer's own sleep settings apply."
+          />
+        </Card>
+      </Section>
+
       <PaperBankrollSection />
 
       <ApiKeysSection settings={settings} updateSettings={updateSettings} />
 
-      {/* The walkthrough, on demand. It resets NOTHING - it only clears the
-          'you have seen this' bit, so the screens come back. */}
-      <Section title={t('settings.replay')} description={t('settings.replayHint')}>
-        <Card>
-          <GhostButton onClick={() => void updateSettings({ onboarded: false })}>
-            {t('settings.replay')}
-          </GhostButton>
-        </Card>
-      </Section>
-      <MarketDataSettings settings={settings} updateSettings={updateSettings} />
-      <Section
-        title={t('settings.solanaRpc')}
-        description="Works out of the box on free public endpoints. A free Helius key (under API keys above) upgrades the calls that decide real trades; the feed itself races multiple free sockets."
-      >
-        <Card className="space-y-3">
-          <div data-testid="rpc-helius">
-            <div className="text-xs font-semibold uppercase tracking-wider text-krypt-muted mb-1.5">Helius feed</div>
-            <div className="text-body text-krypt-muted/70 mb-2">
-              The key itself, its credit meter and the backtest allowance are under <span className="text-white/80">API keys</span> above
-              {(settings.rpc.heliusApiKey ?? '').trim() ? ' — a key is set.' : ' — no key is set, so these switches have nothing to run on.'} These decide what
-              the feed spends it on.
-            </div>
-            <div>
-              <Switch
-                checked={settings.rpc.heliusFeedSocket ?? false}
-                onChange={(v) => void updateSettings({ rpc: { ...settings.rpc, heliusFeedSocket: v } })}
-                label="Helius feed socket"
-                description="Adds the Helius websocket to the racing pool. MEASURED over 45s on the pump firehose: Helius delivered 92% of events FIRST, with the free sockets a median 150ms (mainnet-beta) and 578ms (publicnode) behind — decisive for sniping. It also costs ~800k credits/day at firehose rates, so it is a paid-plan switch, not a free-tier one."
-              />
-              <div className="mt-2">
-                <Switch
-                  checked={settings.rpc.heliusParsedFeed !== false}
-                  onChange={(v) => void updateSettings({ rpc: { ...settings.rpc, heliusParsedFeed: v } })}
-                  label="Watch followed wallets on Parsed Streams"
-                  description="Copy trading hears a followed wallet's trades through Helius Parsed Streams. Measured on the 20 busiest Scout wallets, it delivered every trade about 120 ms before the standard feed, and a plain pump buy arrives already decoded, so no read-back is needed. Sells are still read back. Free on every Helius plan; 1 credit per transaction a followed wallet makes, counted in the meter above. Falls back to the standard feed by itself if Helius refuses it."
-                />
-              </div>
-              <div className="mt-2">
-                <HeliusOnlyFeedSwitch />
-              </div>
-            </div>
-          </div>
-          <div data-testid="rpc-wss">
-            <div className="text-xs font-semibold uppercase tracking-wider text-krypt-muted mb-1.5">WebSocket (followed wallets, launch feed)</div>
-            <TextInput value={wss} onChange={setWss} placeholder="wss://api.mainnet-beta.solana.com" />
-            {/* The wallet watcher subscribes here when there is no key
-                (engine.ts walletWatcher.attach) — the label used to say
-                "launch feed" only, so nobody knew it carried their copies. */}
-            <div className="text-body text-krypt-muted/70 mt-1">
-              Hears the wallets you follow — with a Helius key, its socket does instead — and carries the launch feed.
-            </div>
-          </div>
-          <div data-testid="rpc-extra-wss">
-            <div className="text-xs font-semibold uppercase tracking-wider text-krypt-muted mb-1.5">
-              Extra WebSocket endpoints (raced in parallel, one per line)
-            </div>
-            <textarea
-              value={extraWss}
-              onChange={(e) => setExtraWss(e.target.value)}
-              placeholder={'wss://solana-rpc.publicnode.com'}
-              spellCheck={false}
-              rows={3}
-              className="w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-sm font-mono text-white placeholder-krypt-muted/50 outline-none focus:border-krypt-purple/60 resize-y"
-            />
-            <div className="text-body text-krypt-muted/70 mt-1">
-              All sockets subscribe at once; duplicates are dropped, first arrival wins. A single public socket
-              silently loses ~20% of events under load — every extra free endpoint cuts that loss.
-            </div>
-          </div>
-          <div data-testid="rpc-http">
-            <div className="text-xs font-semibold uppercase tracking-wider text-krypt-muted mb-1.5">HTTP (account lookups)</div>
-            <TextInput value={http} onChange={setHttp} placeholder="https://api.mainnet-beta.solana.com" />
-          </div>
-          <div data-testid="rpc-exec">
-            <div className="text-xs font-semibold uppercase tracking-wider text-krypt-muted mb-1.5">
-              Execution endpoint <span className="text-krypt-muted/50 normal-case tracking-normal">— optional, any provider</span>
-            </div>
-            <TextInput value={fastHttp} onChange={setFastHttp} placeholder="https://your-endpoint.example.com/?api-key=…" />
-            <div className="text-body text-krypt-muted/70 mt-1">
-              The same fast lane a Helius key buys, for a provider of your own — QuickNode, Triton, Shyft, your
-              own validator. Live buys, sells, confirmations, send-time fee estimates, template sampling and the
-              read-back of each trade a followed wallet makes go here; mint checks, balances and holder reads stay on the HTTP endpoint above, so you are not
-              paying for the bulk traffic. Set, it wins over the Helius key. Empty, nothing changes.
-            </div>
-          </div>
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-semibold uppercase tracking-wider text-krypt-muted">Commitment</span>
-              {(['processed', 'confirmed'] as const).map((c) => (
-                <button
-                  key={c}
-                  onClick={() => setCommitment(c)}
-                  className={
-                    commitment === c
-                      ? 'rounded-lg border border-krypt-purple/50 bg-krypt-purple/15 px-3 py-1.5 text-xs font-semibold text-white'
-                      : 'rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-semibold text-krypt-muted hover:text-white'
-                  }
-                >
-                  {c}
-                </button>
-              ))}
-            </div>
-            <span data-testid="rpc-save">
-              <PrimaryButton onClick={saveRpc}>Save RPC settings</PrimaryButton>
-            </span>
-          </div>
-
-          <EndpointProbe />
-
-          {/* ── the standby block feed ────────────────────────────────────
-              It has been on by default since it was built and had no control
-              anywhere in the app — `grep blockFeed src/` found nothing. It is
-              the single largest thing this app downloads, and a user on a
-              metered connection could not find it, let alone turn it off.
-              The DEFAULT is unchanged; what changes is that it is now
-              visible and switchable. */}
-          <div className="space-y-1.5 border-t border-white/5 pt-3">
-            <Switch
-              checked={settings.rpc.blockFeed ?? true}
-              onChange={(v) => void updateSettings({ rpc: { ...settings.rpc, blockFeed: v } })}
-              label="Standby block feed"
-              description={`Whole blocks over blockSubscribe, decoded from inner instructions. It loses every race while pump still emits log events and exists to take over the day those go quiet — measured 2026-09-09 at ~5.5 GB/h while scanning (~${(5.5 * 24).toFixed(0)} GB/day). Turn it off on a metered connection; nothing you do today depends on it.`}
-            />
-            {(settings.rpc.blockFeed ?? true) && (
-              <div className="flex items-center gap-2 text-xs text-amber-300">
-                <span>⚠</span> ~5.5 GB/h while the scanner runs. This is the largest thing the app downloads.
-              </div>
-            )}
-            <Switch
-              checked={settings.rpc.blockFeedAmm ?? false}
-              onChange={(v) => void updateSettings({ rpc: { ...settings.rpc, blockFeedAmm: v } })}
-              label="Standby block feed — post-graduation (pAMM)"
-              description="The same standby for graduated tokens. Off by default because the host ignores a program filter there, so it pulls ~11 GB/h. Unmetered connections only."
-            />
-          </div>
-          {status.running && (
-            <div className="space-y-1.5 border-t border-white/5 pt-3">
-              <p className="text-xs text-amber-300">Engine is running — RPC changes apply on next start.</p>
-              <div className="text-xs font-semibold uppercase tracking-wider text-krypt-muted">Feed pool health</div>
-              {status.feedSockets.map((s) => (
-                <div key={s.url} className="flex items-center justify-between text-xs font-mono">
-                  <span className="text-white/80">{s.host}</span>
-                  <span
-                    className={
-                      s.state === 'live' ? 'text-emerald-300' : s.state === 'stopped' ? 'text-krypt-muted' : 'text-amber-300'
-                    }
-                  >
-                    {s.state} · {s.events} events · {s.wins} first
-                  </span>
-                </div>
-              ))}
-              <div className="flex items-center justify-between text-xs font-mono">
-                <span className="text-white/80">estimated event loss (15m)</span>
-                <span
-                  className={
-                    status.feedLossPct === null
-                      ? 'text-krypt-muted'
-                      : status.feedLossPct > 5
-                        ? 'text-red-400'
-                        : status.feedLossPct > 2
-                          ? 'text-amber-300'
-                          : 'text-emerald-300'
-                  }
-                >
-                  {status.feedLossPct === null ? 'measuring…' : `~${status.feedLossPct}%`}
-                </span>
-              </div>
-            </div>
-          )}
-        </Card>
-      </Section>
 
       <Section title={t('settings.feesAndReferral')} description="What Krypt charges for a copy, and who gets credit for bringing you here.">
         <Card>
@@ -321,7 +175,7 @@ export function SettingsPage() {
                 <p className="mt-2 text-body text-krypt-muted">Make a wallet first — it becomes your referral address.</p>
               )}
               <p className="mt-2 text-label text-krypt-muted/70">
-                On Robinhood Chain and BNB it is your EVM address instead, under EVM chains below.
+                On Robinhood Chain and BNB it is your EVM address instead, under Advanced, in EVM chains.
               </p>
             </div>
           )}
@@ -349,35 +203,15 @@ export function SettingsPage() {
         </Card>
       </Section>
 
-      <EvmSettingsCard settings={settings} updateSettings={updateSettings} />
-      <Section title={t('settings.general')}>
-        <div className="grid lg:grid-cols-2 gap-3">
-          <Switch
-            checked={settings.alerts.desktopNotifications}
-            onChange={(v) => void updateSettings({ alerts: { ...settings.alerts, desktopNotifications: v } })}
-            label="Desktop notifications"
-            description="Windows pop-ups for runner flags, price alerts, scripts and fills. Off stops only the pop-ups: runner flags, scripts and the in-app list keep working."
-          />
-        </div>
+      {/* The walkthrough, on demand. It resets NOTHING - it only clears the
+          'you have seen this' bit, so the screens come back. */}
+      <Section title={t('settings.replay')} description={t('settings.replayHint')}>
+        <Card>
+          <GhostButton onClick={() => void updateSettings({ onboarded: false })}>
+            {t('settings.replay')}
+          </GhostButton>
+        </Card>
       </Section>
-
-      <Section title={t('settings.display')} description="For a slow machine, or one whose graphics driver does not like the app: stutter, a blue screen mid-session, or a driver that keeps crashing.">
-        <div className="grid lg:grid-cols-2 gap-3">
-          <Switch
-            checked={settings.reduceEffects}
-            onChange={(v) => void updateSettings({ reduceEffects: v })}
-            label="Lite mode (reduce effects)"
-            description="Turns off every animation and transition — the app at its lightest, for a slow machine. Applies at once."
-          />
-          <Switch
-            checked={settings.hardwareAcceleration}
-            onChange={(v) => void updateSettings({ hardwareAcceleration: v })}
-            label="Hardware acceleration"
-            description="Render through the GPU. Turn it off if the graphics driver has crashed under the app or a blue screen followed a session: software rendering is slower but never touches the driver. Turns itself off after the GPU process dies twice in one run. Applies on restart."
-          />
-        </div>
-      </Section>
-
       <Section
         title="Logs"
         description="If something goes wrong, this puts the app’s log and what it was doing into one file you can attach when you ask for help. Nothing is sent anywhere — the app has no telemetry, and this only writes a file where you choose."
@@ -385,7 +219,246 @@ export function SettingsPage() {
         <LogsPanel />
       </Section>
 
+      {/* Everything else (2026-11-04): every control is still here, one click
+          further in, so the page a new user opens has only what they need. */}
+      <AdvancedSettings>
+        <RearmSection settings={settings} updateSettings={updateSettings} />
+
+        <MarketDataSettings settings={settings} updateSettings={updateSettings} />
+        <Section
+          title={t('settings.solanaRpc')}
+          description="Works out of the box on free public endpoints. A free Helius key (under API keys above) upgrades the calls that decide real trades; the feed itself races multiple free sockets."
+        >
+          <Card className="space-y-3">
+            <div data-testid="rpc-helius">
+              <div className="text-xs font-semibold uppercase tracking-wider text-krypt-muted mb-1.5">Helius feed</div>
+              <div className="text-body text-krypt-muted/70 mb-2">
+                The key itself, its credit meter and the backtest allowance are under <span className="text-white/80">API keys</span> above
+                {(settings.rpc.heliusApiKey ?? '').trim() ? ' — a key is set.' : ' — no key is set, so these switches have nothing to run on.'} These decide what
+                the feed spends it on.
+              </div>
+              <div>
+                <Switch
+                  checked={settings.rpc.heliusFeedSocket ?? false}
+                  onChange={(v) => void updateSettings({ rpc: { ...settings.rpc, heliusFeedSocket: v } })}
+                  label="Helius feed socket"
+                  description="Adds the Helius websocket to the racing pool. MEASURED over 45s on the pump firehose: Helius delivered 92% of events FIRST, with the free sockets a median 150ms (mainnet-beta) and 578ms (publicnode) behind — decisive for sniping. It also costs ~800k credits/day at firehose rates, so it is a paid-plan switch, not a free-tier one."
+                />
+                <div className="mt-2">
+                  <Switch
+                    checked={settings.rpc.heliusParsedFeed !== false}
+                    onChange={(v) => void updateSettings({ rpc: { ...settings.rpc, heliusParsedFeed: v } })}
+                    label="Watch followed wallets on Parsed Streams"
+                    description="Copy trading hears a followed wallet's trades through Helius Parsed Streams. Measured on the 20 busiest Scout wallets, it delivered every trade about 120 ms before the standard feed, and a plain pump buy arrives already decoded, so no read-back is needed. Sells are still read back. Free on every Helius plan; 1 credit per transaction a followed wallet makes, counted in the meter above. Falls back to the standard feed by itself if Helius refuses it."
+                  />
+                </div>
+                <div className="mt-2">
+                  <HeliusOnlyFeedSwitch />
+                </div>
+              </div>
+            </div>
+            <div data-testid="rpc-wss">
+              <div className="text-xs font-semibold uppercase tracking-wider text-krypt-muted mb-1.5">WebSocket (followed wallets, launch feed)</div>
+              <TextInput value={wss} onChange={setWss} placeholder="wss://api.mainnet-beta.solana.com" />
+              {/* The wallet watcher subscribes here when there is no key
+                  (engine.ts walletWatcher.attach) — the label used to say
+                  "launch feed" only, so nobody knew it carried their copies. */}
+              <div className="text-body text-krypt-muted/70 mt-1">
+                Hears the wallets you follow — with a Helius key, its socket does instead — and carries the launch feed.
+              </div>
+            </div>
+            <div data-testid="rpc-extra-wss">
+              <div className="text-xs font-semibold uppercase tracking-wider text-krypt-muted mb-1.5">
+                Extra WebSocket endpoints (raced in parallel, one per line)
+              </div>
+              <textarea
+                value={extraWss}
+                onChange={(e) => setExtraWss(e.target.value)}
+                placeholder={'wss://solana-rpc.publicnode.com'}
+                spellCheck={false}
+                rows={3}
+                className="w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-sm font-mono text-white placeholder-krypt-muted/50 outline-none focus:border-krypt-purple/60 resize-y"
+              />
+              <div className="text-body text-krypt-muted/70 mt-1">
+                All sockets subscribe at once; duplicates are dropped, first arrival wins. A single public socket
+                silently loses ~20% of events under load — every extra free endpoint cuts that loss.
+              </div>
+            </div>
+            <div data-testid="rpc-http">
+              <div className="text-xs font-semibold uppercase tracking-wider text-krypt-muted mb-1.5">HTTP (account lookups)</div>
+              <TextInput value={http} onChange={setHttp} placeholder="https://api.mainnet-beta.solana.com" />
+            </div>
+            <div data-testid="rpc-exec">
+              <div className="text-xs font-semibold uppercase tracking-wider text-krypt-muted mb-1.5">
+                Execution endpoint <span className="text-krypt-muted/50 normal-case tracking-normal">— optional, any provider</span>
+              </div>
+              <TextInput value={fastHttp} onChange={setFastHttp} placeholder="https://your-endpoint.example.com/?api-key=…" />
+              <div className="text-body text-krypt-muted/70 mt-1">
+                The same fast lane a Helius key buys, for a provider of your own — QuickNode, Triton, Shyft, your
+                own validator. Live buys, sells, confirmations, send-time fee estimates, template sampling and the
+                read-back of each trade a followed wallet makes go here; mint checks, balances and holder reads stay on the HTTP endpoint above, so you are not
+                paying for the bulk traffic. Set, it wins over the Helius key. Empty, nothing changes.
+              </div>
+            </div>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-semibold uppercase tracking-wider text-krypt-muted">Commitment</span>
+                {(['processed', 'confirmed'] as const).map((c) => (
+                  <button
+                    key={c}
+                    onClick={() => setCommitment(c)}
+                    className={
+                      commitment === c
+                        ? 'rounded-lg border border-krypt-purple/50 bg-krypt-purple/15 px-3 py-1.5 text-xs font-semibold text-white'
+                        : 'rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-semibold text-krypt-muted hover:text-white'
+                    }
+                  >
+                    {c}
+                  </button>
+                ))}
+              </div>
+              <span data-testid="rpc-save">
+                <PrimaryButton onClick={saveRpc}>Save RPC settings</PrimaryButton>
+              </span>
+            </div>
+
+            <EndpointProbe />
+
+            {/* ── the standby block feed ────────────────────────────────────
+                It has been on by default since it was built and had no control
+                anywhere in the app — `grep blockFeed src/` found nothing. It is
+                the single largest thing this app downloads, and a user on a
+                metered connection could not find it, let alone turn it off.
+                The DEFAULT is unchanged; what changes is that it is now
+                visible and switchable. */}
+            <div className="space-y-1.5 border-t border-white/5 pt-3">
+              <Switch
+                checked={settings.rpc.blockFeed ?? true}
+                onChange={(v) => void updateSettings({ rpc: { ...settings.rpc, blockFeed: v } })}
+                label="Standby block feed"
+                description={`Whole blocks over blockSubscribe, decoded from inner instructions. It loses every race while pump still emits log events and exists to take over the day those go quiet — measured 2026-09-09 at ~5.5 GB/h while scanning (~${(5.5 * 24).toFixed(0)} GB/day). Turn it off on a metered connection; nothing you do today depends on it.`}
+              />
+              {(settings.rpc.blockFeed ?? true) && (
+                <div className="flex items-center gap-2 text-xs text-amber-300">
+                  <span>⚠</span> ~5.5 GB/h while the scanner runs. This is the largest thing the app downloads.
+                </div>
+              )}
+              <Switch
+                checked={settings.rpc.blockFeedAmm ?? false}
+                onChange={(v) => void updateSettings({ rpc: { ...settings.rpc, blockFeedAmm: v } })}
+                label="Standby block feed — post-graduation (pAMM)"
+                description="The same standby for graduated tokens. Off by default because the host ignores a program filter there, so it pulls ~11 GB/h. Unmetered connections only."
+              />
+            </div>
+            {status.running && (
+              <div className="space-y-1.5 border-t border-white/5 pt-3">
+                <p className="text-xs text-amber-300">Engine is running — RPC changes apply on next start.</p>
+                <div className="text-xs font-semibold uppercase tracking-wider text-krypt-muted">Feed pool health</div>
+                {status.feedSockets.map((s) => (
+                  <div key={s.url} className="flex items-center justify-between text-xs font-mono">
+                    <span className="text-white/80">{s.host}</span>
+                    <span
+                      className={
+                        s.state === 'live' ? 'text-emerald-300' : s.state === 'stopped' ? 'text-krypt-muted' : 'text-amber-300'
+                      }
+                    >
+                      {s.state} · {s.events} events · {s.wins} first
+                    </span>
+                  </div>
+                ))}
+                <div className="flex items-center justify-between text-xs font-mono">
+                  <span className="text-white/80">estimated event loss (15m)</span>
+                  <span
+                    className={
+                      status.feedLossPct === null
+                        ? 'text-krypt-muted'
+                        : status.feedLossPct > 5
+                          ? 'text-red-400'
+                          : status.feedLossPct > 2
+                            ? 'text-amber-300'
+                            : 'text-emerald-300'
+                    }
+                  >
+                    {status.feedLossPct === null ? 'measuring…' : `~${status.feedLossPct}%`}
+                  </span>
+                </div>
+              </div>
+            )}
+          </Card>
+        </Section>
+
+        <EvmSettingsCard settings={settings} updateSettings={updateSettings} />
+        <Section title={t('settings.general')}>
+          <div className="grid lg:grid-cols-2 gap-3">
+            <Switch
+              checked={settings.alerts.desktopNotifications}
+              onChange={(v) => void updateSettings({ alerts: { ...settings.alerts, desktopNotifications: v } })}
+              label="Desktop notifications"
+              description="Windows pop-ups for runner flags, price alerts, scripts and fills. Off stops only the pop-ups: runner flags, scripts and the in-app list keep working."
+            />
+          </div>
+        </Section>
+
+        <Section title={t('settings.display')} description="For a slow machine, or one whose graphics driver does not like the app: stutter, a blue screen mid-session, or a driver that keeps crashing.">
+          <div className="grid lg:grid-cols-2 gap-3">
+            <Switch
+              checked={settings.reduceEffects}
+              onChange={(v) => void updateSettings({ reduceEffects: v })}
+              label="Lite mode (reduce effects)"
+              description="Turns off every animation and transition — the app at its lightest, for a slow machine. Applies at once."
+            />
+            <Switch
+              checked={settings.hardwareAcceleration}
+              onChange={(v) => void updateSettings({ hardwareAcceleration: v })}
+              label="Hardware acceleration"
+              description="Render through the GPU. Turn it off if the graphics driver has crashed under the app or a blue screen followed a session: software rendering is slower but never touches the driver. Turns itself off after the GPU process dies twice in one run. Applies on restart."
+            />
+          </div>
+        </Section>
+      </AdvancedSettings>
     </Page>
+  );
+}
+
+const ADVANCED_KEY = 'krypt.settings.advanced';
+
+/** The fold under the basics. Remembered, as the Follow page's is. */
+function AdvancedSettings({ children }: { children: ReactNode }) {
+  const [open, setOpen] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(ADVANCED_KEY) === '1';
+    } catch {
+      return false;
+    }
+  });
+  const toggle = (): void =>
+    setOpen((o) => {
+      try {
+        localStorage.setItem(ADVANCED_KEY, o ? '0' : '1');
+      } catch {
+        /* a remembered panel is a nicety */
+      }
+      return !o;
+    });
+  return (
+    <div className="mb-8">
+      <section className="rounded-xl border border-white/8 bg-card shadow-soft">
+        <button onClick={toggle} aria-expanded={open} className="flex w-full items-center justify-between px-5 py-4 text-left" data-testid="settings-advanced">
+          <div>
+            <div className="text-[15px] font-semibold text-white">Advanced</div>
+            <div className="mt-0.5 text-note text-krypt-muted">
+              Auto re-arm, market data, RPC and speed, other chains, notifications and display. You can leave all of this as it is.
+            </div>
+          </div>
+          <ChevronDown className={`h-5 w-5 flex-shrink-0 text-krypt-muted transition ${open ? 'rotate-180' : ''}`} />
+        </button>
+      </section>
+      {open && (
+        <div className="mt-8" data-testid="settings-advanced-body">
+          {children}
+        </div>
+      )}
+    </div>
   );
 }
 

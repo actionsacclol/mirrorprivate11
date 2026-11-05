@@ -256,4 +256,37 @@ const UPSELL = /helius|api key|lifts this|allows \d+ subscription/i;
   console.log('ok  a node with no accountSubscribe costs nothing but the curve feed');
 }
 
+// A computer sleeping: the socket goes down and the list stays.
+{
+  const m = mint(0);
+  let conns = 0;
+  const wss = new WebSocketServer({ port: 0 });
+  await new Promise((r) => wss.on('listening', r));
+  wss.on('connection', (ws) => {
+    conns += 1;
+    ws.on('message', (raw) => {
+      const req = JSON.parse(String(raw));
+      ws.send(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: 100 + conns }));
+    });
+  });
+  feed._reset();
+  feed.attach({
+    wssUrl: () => `ws://127.0.0.1:${wss.address().port}`,
+    execHttpUrl: () => '',
+    commitment: () => 'confirmed',
+    onLogs: () => {},
+    onAccount: () => {},
+    billHttp: () => {},
+    log: () => {},
+  });
+  feed.watch(m);
+  assert.ok(await waitFor(() => feed.subscribedMints().length === 1), 'subscribed before the sleep');
+  feed.stop();
+  feed.resume();
+  assert.ok(await waitFor(() => conns === 2 && feed.subscribedMints().length === 1), 'waking brings it back, with no new coin needed');
+  feed._reset();
+  await new Promise((r) => wss.close(r));
+  console.log('ok  waking from sleep brings the priority feed back');
+}
+
 console.log('\npriorityfeed: all tests passed');

@@ -103,12 +103,13 @@ import { buildShadowPlan } from './sender';
 import { shouldRetrySell, shouldRetryPreBroadcast, escalatedSellSlippagePct, nextConsecutiveLosses, liveBreakerReason } from '@shared/liveBreakers';
 import { pctForClaim } from '@shared/botStrategy';
 import * as pumpChain from '../data/pumpChain';
-import { LEAN_EXIT_LAMPORTS, PRIORITY_FEE_FLOOR_SOL, UNATTENDED_MIN_FILL_SHARE, leanExec, leanPriorityFeeSol, paperFixedFeeSol, planBuySize, planExitBudget, shouldHoldAsDust, type FeeLane } from '@shared/exitBudget';
+import { LEAN_EXIT_LAMPORTS, PRIORITY_FEE_FLOOR_SOL, UNATTENDED_MIN_FILL_SHARE, leanExec, leanPriorityFeeSol, paperFixedFeeSol, planBuySize, BUY_OVERHEAD_LAMPORTS, planExitBudget, shouldHoldAsDust, type FeeLane } from '@shared/exitBudget';
 import { describeTemplate, ordersForTemplate } from '@shared/orderTemplates';
 import { isPctKind } from '@shared/orders';
 import * as templateStore from '../system/templateStore';
 import type { DisarmReason, ExecutionSnapshot, LiveState, ShadowSendPlan } from '@shared/types';
 import { DEFAULT_BLOCK_FEED_WSS_URL, LIVE_EXECUTION_AVAILABLE } from '@shared/types';
+import { nextRearm, readRearm, rearmClock, type RearmPending } from '@shared/rearm';
 import { traderClaimFor } from './traderClaims';
 
 /**
@@ -121,6 +122,19 @@ import { traderClaimFor } from './traderClaims';
  * use until it does, and it is undefined on every path that never broadcast.
  */
 type EngineTradeResult = import('./liveSigner').LiveTradeResult & { sentSol?: number };
+
+/** SOL a buy already sent has committed, until the ledger settles it. */
+interface CommittedBuy {
+  lamports: number;
+  until: number;
+  signature: string | null;
+}
+interface HeldBuy {
+  owner: string | null;
+  entry: CommittedBuy | null;
+}
+const COMMITTED_BUY_TTL_MS = 90_000;
+const PINNED_BALANCE_FRESH_MS = 20_000;
 
 interface TrackedTrade {
   at: number;
@@ -268,7 +282,7 @@ const PROGRAM_UPGRADE_PAUSE = 'Pump program was redeployed — decoder must be r
 
 /** What main hands the engine so copy trading can reach the EVM rail. */
 export interface EvmCopyBridge {
-  buy(chain: EvmChainKind, token: string, amountNative: number, walletId?: string, opts?: { slippagePct?: number }): Promise<{ ok: boolean; message: string; signature?: string; pending?: boolean; spentSol?: number }>;
+  buy(chain: EvmChainKind, token: string, amountNative: number, walletId?: string, opts?: { slippagePct?: number; atHead?: () => string | null }): Promise<{ ok: boolean; message: string; signature?: string; pending?: boolean; spentSol?: number }>;
   /** `amountRaw` sells EXACTLY that many base units and the percent is
    *  ignored — the rail has taken an exact size since the BNB audit, and
    *  copy trading is the caller that knows one (2026-09-15). */
@@ -340,6 +354,10 @@ export interface EvmCopyBridge {
    */
   ensureLeaderFeed?(chain: EvmChainKind): string | null;
 }
+
+/** A held sell asking whether its unconfirmed send landed. */
+const PENDING_READ_EVERY_MS = 60_000;
+let lastPendingRead = 0;
 
 export class SniperEngine {
   private feed: FeedManager | null = null;
@@ -423,6 +441,13 @@ export class SniperEngine {
   // RPC, relayer change) — NOT market losses. Without this, an underfunded
   // wallet made every buy silently no-op for two days (found 2026-07-21).
   private liveConsecutiveSendFails = 0;
+  // Auto re-arm (shared/rearm.ts): a loss limit can come back if its switch is
+  // on, on the wallet that hit it. Only arming by hand ends the count.
+  private lossRearmOwner: string | null = null;
+  private lossRearmAt: number | null = null;
+  private lossRearmTimer: ReturnType<typeof setTimeout> | null = null;
+  private lossRearmTries = 0;
+  private lossRearmWhy = '';
   private liveBlockedReason: string | null = null;
   /** Wallet balance (lamports) captured when live first went active. */
   private liveBaselineLamports: number | null = null;
@@ -712,7 +737,10 @@ export class SniperEngine {
     // follows to settle any drift.
     ledger.onSettled((f) => {
       if (f.state !== 'reconciled' || f.solDeltaLamports === null) return;
+      this.releaseSettled(f.signature ?? null);
       const owner = wallet.publicKey();
+      // A pinned wallet's cached balance follows its own fills.
+      if (f.wallet && f.wallet !== owner) wallet.adjustBalance(f.wallet, f.solDeltaLamports);
       if (!owner || (f.wallet && f.wallet !== owner)) return;
       if (this.walletBalanceLamports !== null) {
         this.walletBalanceLamports = Math.max(0, this.walletBalanceLamports + f.solDeltaLamports);
@@ -747,7 +775,7 @@ export class SniperEngine {
         const pause = this.running ? this.entriesPauseReason() : null;
         return pause ? `entries are paused (${pause})` : null;
       },
-      maxLiveSol: () => this.getSettings().execution.maxLiveSol,
+      maxLiveSol: () => this.liveCap(),
       // The wallet an order is written over (advOrders §7): the ACTIVE signer,
       // whose bag is what "sell 100%" means. Null when this install has no
       // wallet — advOrders reads that as "the host cannot name a signer" and
@@ -800,7 +828,7 @@ export class SniperEngine {
         if (opts?.chain && opts.chain !== 'solana') {
           if (!this.evmCopy) return { ok: false, message: 'EVM copy trading is not available in this build' };
           // The follow's own slippage reaches the rail, as a script's does.
-          return this.evmCopy.buy(opts.chain, mint, sol, opts.walletId, opts.slippagePct !== undefined ? { slippagePct: opts.slippagePct } : undefined);
+          return this.evmCopy.buy(opts.chain, mint, sol, opts.walletId, { ...(opts.slippagePct !== undefined ? { slippagePct: opts.slippagePct } : {}), ...(opts.atHead ? { atHead: opts.atHead } : {}) });
         }
         // A config that names its own wallet buys through the per-wallet
         // pipeline (the same one a fan-out uses: every gate, fee and record,
@@ -866,7 +894,7 @@ export class SniperEngine {
           const labShare = pct >= 100 ? pct : ((await this.pctForTokens(mint, opts.tokensRaw, opts.walletId)) ?? pct);
           const lr = await this.labSell(opts.walletId, mint, labShare, { slippagePct: opts.slippagePct, breakerExit });
           if (lr.ok) return { ok: true, message: lr.message, signature: lr.signature ?? undefined };
-          return { ok: false, message: lr.stage === 'pending' ? `broadcast but not confirmed in time — check Trades (${lr.message})` : lr.message, signature: lr.signature ?? undefined };
+          return { ok: false, message: lr.stage === 'pending' ? `broadcast but not confirmed in time — check Trades (${lr.message})` : lr.message, signature: lr.signature ?? undefined, pending: lr.stage === 'pending' };
         }
         // An exact quantity beats a percentage of the whole account: the
         // copier knows how many base units the copy holds, and this converts
@@ -883,10 +911,29 @@ export class SniperEngine {
           ok: false,
           message: r.stage === 'pending' ? `broadcast but not confirmed in time — check Trades (${r.message})` : r.message,
           signature: r.signature,
+          pending: r.stage === 'pending',
         };
       },
       liveBlockedReason: (chain) => (chain && chain !== 'solana' ? (this.evmCopy ? this.evmCopy.blocked(chain) : 'EVM copy trading is not available in this build') : this.executionBlockedReason()),
       exitBlockedReason: (chain) => (chain && chain !== 'solana' ? (this.evmCopy ? this.evmCopy.blocked(chain) : 'EVM copy trading is not available in this build') : this.copyExitBlockedReason()),
+      signerOf: (walletId, chain) => (chain !== 'solana' ? null : walletId ? wallet.publicKeyOf(walletId) : wallet.publicKey()),
+      sendLanded: (signature, chain) => {
+        if (chain !== 'solana') return null;
+        const f = ledger.all().find((x) => x.signature === signature);
+        if (!f) return null;
+        if (f.state === 'pending') {
+          // Unattended, no page is asking the ledger to read: ask it here, no
+          // faster than a page would. Each pass uses up one of a fill's rounds.
+          if (Date.now() - lastPendingRead >= PENDING_READ_EVERY_MS) {
+            lastPendingRead = Date.now();
+            const rpc = this.getSettings().rpc;
+            void ledger.reconcilePending(rpc.execHttpUrl ?? rpc.httpUrl, wallet.publicKey() ?? null).catch(() => undefined);
+          }
+          return 'reading';
+        }
+        if (f.state === 'reconciled') return true;
+        return f.note === ledger.FAILED_ON_CHAIN_NOTE || ledger.provedNotLanded(f) ? false : null;
+      },
       // The entry breakers, which `liveBlockedReason` deliberately omits so an
       // exit is never trapped. Without this a copy could OPEN a position
       // during a decoder hard-pause or on a stale feed (copy-11). Same wording
@@ -902,6 +949,8 @@ export class SniperEngine {
       // Open copies across every follow (2026-10-23); absent on a settings
       // file from before it, which reads as the default.
       maxOpenCopies: () => this.getSettings().execution.maxOpenCopies ?? DEFAULT_MAX_OPEN_COPIES,
+      rearm: () => readRearm(this.getSettings().execution.rearm),
+      syncWatch: () => this.syncCopyWatch(),
       // Pauses, a day's stop, failed copies and sells (2026-10-23): the same
       // notify as everything else, so the desktop switch and the chat push
       // mean the same thing here.
@@ -1095,7 +1144,7 @@ export class SniperEngine {
       maxLiveSol: (chain) =>
         chain && chain !== 'solana'
           ? (this.evmCopy?.maxLive(chain) ?? 0)
-          : this.getSettings().execution.maxLiveSol,
+          : this.liveCap(),
       priceSol: (mint, chain) =>
         chain && chain !== 'solana' ? (this.evmCopy?.price(chain, mint) ?? null) : this.cheapPriceSol(mint),
       launch: (mint) => {
@@ -1843,7 +1892,7 @@ export class SniperEngine {
       // script refusing every buy for eight hours with nobody the wiser. A
       // desktop notification (and the paired chat bot) is what reaches
       // someone who is not looking. No target: never posted to a channel.
-      this.notify('Live trading switched OFF', 'pump.fun upgraded its program. Krypto Mirror disarmed live trading as a safety check. Scripts and orders cannot buy until you re-arm.');
+      this.notify('Live trading switched OFF', `pump.fun upgraded its program, so live trading is off while the app re-checks it. Follows and orders cannot buy until then. ${s.execution.rearmAfterVerifiedUpgrade !== false ? 'It comes back on by itself if the check passes.' : 'It stays off until you turn it back on.'}`);
       recorder.record('program_upgrade', { programId: PUMP_PROGRAM_ID, detail: r.message });
     } else if (!r.changed) {
       this.log('info', `program watchdog: ${r.message}`);
@@ -1911,7 +1960,8 @@ export class SniperEngine {
       this.hardPauseReason = null;
       // Re-arm only what the upgrade itself disarmed, only when asked to,
       // and only if nothing else has touched the mode since (a user who
-      // armed or disarmed in between has decided for themselves).
+      // armed or disarmed in between has decided for themselves: disarm()
+      // clears this flag for every reason but the upgrade's own).
       const wanted = this.armedWhenUpgradeHit;
       this.armedWhenUpgradeHit = false;
       if (
@@ -1923,7 +1973,7 @@ export class SniperEngine {
       ) {
         const r = this.onRearmAfterUpgrade();
         if (r.ok) {
-          this.log('warn', `program watchdog: ${v.summary} — entries resume and live is RE-ARMED automatically (Wallet → "Re-arm after a checked pump upgrade")`);
+          this.log('warn', `program watchdog: ${v.summary} — entries resume and live is RE-ARMED automatically (Settings → Auto re-arm → pump.fun upgrades)`);
           this.emit({ kind: 'toast', level: 'success', message: 'pump.fun upgrade checked out — live trading is back ON.' });
           this.notify('Live trading is back ON', 'The pump.fun upgrade checked out against real launches, so live was re-armed automatically.');
           return;
@@ -1972,7 +2022,10 @@ export class SniperEngine {
   resumeSockets(): void {
     this.log('info', 'sockets resuming');
     const steps: Array<() => void> = [
-      () => this.priorityTick(),
+      () => {
+        priorityFeed.resume();
+        this.priorityTick();
+      },
       () => this.syncCopyWatch(),
       () => {
         if (this.running) this.feed?.start();
@@ -2070,6 +2123,11 @@ export class SniperEngine {
 
   isRunning(): boolean {
     return this.running;
+  }
+
+  /** Real holdings the engine is tracking, for what a lock would leave exposed. */
+  heldLiveCount(): number {
+    return this.stuckMints.size + this.liveMints.size;
   }
 
   snapshot(): EngineSnapshot {
@@ -2180,8 +2238,65 @@ export class SniperEngine {
     );
     if (!reason) return;
     this.disarm('loss_limit');
-    this.log('error', `${reason} — live trading disarmed`);
-    this.emit({ kind: 'toast', level: 'error', message: `${reason} — disarmed` });
+    const plan = nextRearm(readRearm(e.rearm), 'loss', this.lossRearmTries, Date.now());
+    const next = plan ? ` Live comes back on by itself at ${rearmClock(plan.at)}.` : '';
+    this.log('error', `${reason} — live trading disarmed.${next}`);
+    this.emit({ kind: 'toast', level: 'error', message: `${reason} — disarmed.${next}` });
+    if (plan) {
+      this.lossRearmTries = plan.tries;
+      this.scheduleLossRearm(plan.at, reason);
+    }
+    // Whether or not it comes back, someone away from the screen should hear.
+    this.notify('Live trading switched OFF', `${reason}.${next || ' It stays off until you turn it back on.'}`);
+  }
+
+  /** Come back after a loss limit, if nothing has touched the mode since: any
+   *  arm or disarm by anyone else clears this timer first. */
+  private scheduleLossRearm(at: number, why: string): void {
+    this.clearLossRearm();
+    this.lossRearmAt = at;
+    this.lossRearmWhy = why;
+    this.lossRearmOwner = wallet.publicKey();
+    this.lossRearmTimer = setTimeout(() => {
+      this.lossRearmTimer = null;
+      this.lossRearmAt = null;
+      if (this.armed || !this.onRearmAfterUpgrade) return;
+      if (!readRearm(this.getSettings().execution.rearm).lossLimits) return;
+      // The limit was this wallet's. Another one never chose to go live.
+      if (wallet.publicKey() !== this.lossRearmOwner) {
+        this.log('warn', 'not re-arming after the loss limit: the active wallet changed. Live stays off.');
+        return;
+      }
+      const tries = this.lossRearmTries;
+      const r = this.onRearmAfterUpgrade();
+      this.lossRearmTries = tries; // arm() is also the user's reset; this one is not the user
+      if (r.ok) {
+        this.log('warn', `live trading RE-ARMED by itself after: ${why}. The loss count starts again (${tries} in a row).`);
+        this.notify('Live trading is back ON', 'It came back on by itself after a loss limit and will spend real money. Change this in Settings, Auto re-arm.');
+      } else {
+        this.log('warn', `could not re-arm after a loss limit: ${r.message}. Live stays off.`);
+        this.notify('Live trading stays OFF', `It could not come back on by itself: ${r.message}`);
+      }
+    }, Math.max(0, at - Date.now()));
+    this.lossRearmTimer.unref?.();
+  }
+
+  private clearLossRearm(): void {
+    if (this.lossRearmTimer) clearTimeout(this.lossRearmTimer);
+    this.lossRearmTimer = null;
+    this.lossRearmAt = null;
+  }
+
+  /** What the live engine has waiting to come back on. */
+  rearmPending(): RearmPending[] {
+    const out: RearmPending[] = [];
+    if (this.lossRearmAt !== null) out.push({ kind: 'live', id: 'loss', name: 'Live trading', at: this.lossRearmAt, why: this.lossRearmWhy });
+    return out;
+  }
+
+  /** Keep it off. */
+  cancelRearm(): void {
+    this.clearLossRearm();
   }
 
   status(): EngineStatus {
@@ -2348,7 +2463,80 @@ export class SniperEngine {
    * `simulateOnly` stops before broadcast (free, safe dry run). A real
    * broadcast additionally requires the engine armed + execution.liveEnabled.
    */
+  /**
+   * SOL that buys already sent have committed and the cached balance does not
+   * show yet, per wallet. Without it, overlapping buys all pass the sell
+   * reserve against one number, and with no copy limits set nothing else
+   * bounds how many overlap. Released when the buy fails or the ledger settles
+   * it; the expiry is for a fill the ledger never reads, by which time the
+   * balance poll has caught up.
+   */
+  private committed = new Map<string, CommittedBuy[]>();
+
+  private committedLamports(owner: string): number {
+    const now = Date.now();
+    const live = (this.committed.get(owner) ?? []).filter((c) => c.until > now);
+    if (live.length) this.committed.set(owner, live);
+    else this.committed.delete(owner);
+    return live.reduce((a, c) => a + c.lamports, 0);
+  }
+
+  private commitBuy(owner: string, lamports: number): CommittedBuy {
+    const entry: CommittedBuy = { lamports, until: Date.now() + COMMITTED_BUY_TTL_MS, signature: null };
+    const list = this.committed.get(owner);
+    if (list) list.push(entry);
+    else this.committed.set(owner, [entry]);
+    return entry;
+  }
+
+  /** What a finished send does to its hold: a failure gives it straight back. */
+  private settleCommit(owner: string, entry: CommittedBuy, sent: boolean, signature: string | null): void {
+    if (sent) {
+      entry.signature = signature;
+      return;
+    }
+    const left = (this.committed.get(owner) ?? []).filter((c) => c !== entry);
+    if (left.length) this.committed.set(owner, left);
+    else this.committed.delete(owner);
+  }
+
+  private releaseSettled(signature: string | null): void {
+    if (!signature) return;
+    for (const [owner, list] of this.committed) {
+      const left = list.filter((c) => c.signature !== signature);
+      if (left.length) this.committed.set(owner, left);
+      else this.committed.delete(owner);
+    }
+  }
+
+  /** A pinned wallet's balance: the cached one while it is fresh, else one read. */
+  private async pinnedBalance(owner: string, httpUrl: string): Promise<number | null> {
+    const cached = wallet.cachedBalance(owner, PINNED_BALANCE_FRESH_MS);
+    if (cached !== null) return cached;
+    const r = await getBalance(httpUrl, owner).catch(() => null);
+    if (!r?.ok || r.data === undefined) return null;
+    wallet.noteBalance(owner, r.data);
+    return r.data;
+  }
+
   async testTrade(
+    mint: string,
+    sol: number,
+    simulateOnly: boolean,
+    opts: NonNullable<Parameters<SniperEngine['testTradeInner']>[3]> = {},
+  ): Promise<EngineTradeResult> {
+    const held: HeldBuy = { owner: null, entry: null };
+    try {
+      const r = await this.testTradeInner(mint, sol, simulateOnly, opts, held);
+      if (held.owner && held.entry) this.settleCommit(held.owner, held.entry, r.ok || r.stage === 'pending', r.signature ?? null);
+      return r;
+    } catch (err) {
+      if (held.owner && held.entry) this.settleCommit(held.owner, held.entry, false, null);
+      throw err;
+    }
+  }
+
+  async testTradeInner(
     mint: string,
     sol: number,
     simulateOnly: boolean,
@@ -2376,6 +2564,7 @@ export class SniperEngine {
       /** Refuse a Jupiter-routed buy into an unsafe mint (copy trading). */
       mintGuard?: boolean;
     } = {},
+    held: HeldBuy = { owner: null, entry: null },
   ): Promise<EngineTradeResult> {
     // A hand-placed trade takes the Execution page's fee mode unless the
     // caller named one; everything else is fast unless it asked.
@@ -2416,7 +2605,7 @@ export class SniperEngine {
     // The caller's own cap when it brought one (a script's budget), else the
     // app-wide manual cap. Either way there is exactly one number, and it is
     // named in the refusal so nobody hunts for which limit bit.
-    const unattendedCap = opts.ownCapSol ?? s.execution.maxLiveSol;
+    const unattendedCap = opts.ownCapSol ?? this.liveCap();
     if (!opts.manual && !simulateOnly && sol > unattendedCap) {
       return {
         ok: false,
@@ -2431,7 +2620,7 @@ export class SniperEngine {
     // modelling the trade at the size live would have been allowed, rather
     // than refusing a rehearsal over a limit no money is crossing.
     let capped = opts.manual || !simulateOnly ? sol : Math.min(sol, unattendedCap);
-    if (opts.manual && sol > s.execution.maxLiveSol && !simulateOnly) {
+    if (opts.manual && sol > this.liveCap() && !simulateOnly) {
       this.log('info', `manual buy ${sol} SOL is above the ${s.execution.maxLiveSol} SOL per-trade cap — allowed (manual)`);
     }
     // Whatever the size, the wallet keeps enough SOL to SELL this again. A
@@ -2444,7 +2633,8 @@ export class SniperEngine {
       // refused instead once less than 80 % of it is affordable: a script that
       // was told "bought 0.0151" while the wallet paid 0.0063 held a bag it
       // could neither call nor sell for its fee (2026-09-28).
-      const plan = planBuySize(this.walletBalanceLamports, Math.round(capped * 1e9), opts.manual ? {} : { minShare: UNATTENDED_MIN_FILL_SHARE });
+      const reserveOwner = wallet.publicKey();
+      const plan = planBuySize(this.walletBalanceLamports - (reserveOwner ? this.committedLamports(reserveOwner) : 0), Math.round(capped * 1e9), opts.manual ? {} : { minShare: UNATTENDED_MIN_FILL_SHARE });
       if (plan.refused) {
         this.log('warn', `buy refused: ${plan.note}`);
         return { ok: false, stage: 'validate', message: plan.note ?? 'Not enough SOL to trade' };
@@ -2453,6 +2643,11 @@ export class SniperEngine {
         capped = Math.floor((plan.lamports / 1e9) * 1e6) / 1e6;
         this.log('warn', `buy trimmed: ${plan.note}`);
         this.emit({ kind: 'toast', level: 'warn', message: plan.note });
+      }
+      // Taken NOW, before the next await, so an overlapping buy sees it.
+      if (reserveOwner) {
+        held.owner = reserveOwner;
+        held.entry = this.commitBuy(reserveOwner, Math.round(capped * 1e9) + BUY_OVERHEAD_LAMPORTS);
       }
     }
     const httpUrl = s.rpc.execHttpUrl ?? s.rpc.httpUrl;
@@ -2771,7 +2966,7 @@ export class SniperEngine {
     const { planFanout } = await import('@shared/fanout');
     const plan = planFanout(walletIds, { mode: sizing.mode, amountSol: sizing.amountSol, jitter: sizing.jitter, minSol: 0.002 });
     if (!plan.ok) return plan.message;
-    if (plan.totalLamports / 1e9 > s.execution.maxLiveSol) {
+    if (plan.totalLamports / 1e9 > this.liveCap()) {
       return `Fan-out total ${(plan.totalLamports / 1e9).toFixed(3)} SOL exceeds the ${s.execution.maxLiveSol} SOL live cap`;
     }
     return null;
@@ -3252,7 +3447,7 @@ export class SniperEngine {
     // Balance preflight — the exact failure mode that silently killed live
     // trading for two days: buys that can never clear simulation. Self-heals
     // when the balance recovers (e.g. user tops up the wallet).
-    const sol = Math.min(this.getSettings().strategy.positionSizeSol, this.getSettings().execution.maxLiveSol);
+    const sol = Math.min(this.getSettings().strategy.positionSizeSol, this.liveCap());
     const needLamports = (sol + SniperEngine.LIVE_BALANCE_HEADROOM_SOL) * 1e9;
     if (this.walletBalanceLamports !== null) {
       if (this.walletBalanceLamports < needLamports) {
@@ -4368,6 +4563,9 @@ export class SniperEngine {
    * so wherever a live copy is open.
    */
   private copyExitBlockedReason(): string | null {
+    // A locked key is the one thing a breaker's exit allowance cannot get past.
+    const locked = wallet.lockReason();
+    if (locked) return locked;
     const reason = this.executionBlockedReason();
     if (!reason || !wallet.exists()) return reason;
     if (!this.armed && this.breakerExitsAllowed) return null;
@@ -4388,6 +4586,8 @@ export class SniperEngine {
     if (!s.execution.liveEnabled) return 'live execution is off in settings';
     if (!this.armed) return 'the engine is not armed';
     if (!wallet.exists()) return 'there is no trading wallet';
+    const locked = wallet.lockReason();
+    if (locked) return locked;
     // NOTE: `entriesPauseReason` gates new STRATEGY entries (loss limit,
     // program upgrade, decoder drift). Those breakers should stop an
     // order-driven BUY for the same reasons they stop an automated entry —
@@ -5234,6 +5434,8 @@ export class SniperEngine {
   async recoverAfterCrash(): Promise<void> {
     const s = this.getSettings();
     if (!s.execution.liveEnabled || !s.execution.autoSellOnExit || !wallet.exists()) return;
+    // Runs again from the unlock (main.ts): these sells cannot be signed yet.
+    if (wallet.lockReason()) return;
     const h = await this.holdings();
     if (!h.ok || !h.data) return;
     const held = h.data.filter((x) => x.mint !== SniperEngine.WSOL_MINT);
@@ -5318,12 +5520,23 @@ export class SniperEngine {
       this.updateLiveBreakers();
       return { ok: false, message: `live buys paused — ${breaker}`, signature: null, costSol: null, stage: 'validate' };
     }
-    const cap = capSol ?? s.execution.maxLiveSol;
-    const sol = Math.min(wantSol, cap);
+    const cap = capSol ?? this.liveCap();
+    let sol = Math.min(wantSol, cap);
     if (sol < wantSol) this.log('info', `lab buy sized down to the ${cap} SOL per-trade cap (asked ${wantSol})`);
     const { executeTrade } = await import('./liveSigner');
     const owner = wallet.publicKeyOf(walletId);
     if (!owner) return { ok: false, message: 'no such wallet', signature: null, costSol: null, stage: 'validate' };
+    // This wallet keeps enough SOL to sell again, as the active one does.
+    const heldBalance = await this.pinnedBalance(owner, s.rpc.execHttpUrl ?? s.rpc.httpUrl);
+    if (heldBalance !== null) {
+      const plan = planBuySize(heldBalance - this.committedLamports(owner), Math.round(sol * 1e9), { minShare: UNATTENDED_MIN_FILL_SHARE });
+      if (plan.refused) {
+        this.log('warn', `lab buy refused: ${plan.note}`);
+        return { ok: false, message: plan.note ?? 'Not enough SOL to trade', signature: null, costSol: null, stage: 'validate' };
+      }
+      if (plan.note) sol = Math.floor((plan.lamports / 1e9) * 1e6) / 1e6;
+    }
+    const labHold = this.commitBuy(owner, Math.round(sol * 1e9) + BUY_OVERHEAD_LAMPORTS);
     const res = await executeTrade({
       action: 'buy',
       mint,
@@ -5338,7 +5551,11 @@ export class SniperEngine {
       walletId,
       wssUrl: this.confirmWssUrl(),
       mintGuard: extra.mintGuard === true,
+    }).catch((err: unknown) => {
+      this.settleCommit(owner, labHold, false, null);
+      throw err;
     });
+    this.settleCommit(owner, labHold, res.ok || res.stage === 'pending', res.signature ?? null);
     if ((res.ok || res.stage === 'pending') && res.signature) {
       ledger.recordFill({ mint, symbol: this.tokens.get(mint)?.row.symbol ?? '', side: 'buy', requested: sol, signature: res.signature }, { httpUrl: s.rpc.execHttpUrl ?? s.rpc.httpUrl, owner });
     }
@@ -5583,6 +5800,12 @@ export class SniperEngine {
     if (!s.execution.liveEnabled) return 'live execution is switched off';
     if (!this.armed) return 'the engine is not armed';
     return side === 'buy' ? this.liveBreakerReason() : null;
+  }
+
+  /** The per-trade cap as a number to compare with: none set is no ceiling. A
+   *  bare `sol > maxLiveSol` would refuse every trade at the default of 0. */
+  private liveCap(): number {
+    return this.maxLiveSol() ?? Number.POSITIVE_INFINITY;
   }
 
   /** The per-trade cap every bot trade meets (D5). */
@@ -5955,11 +6178,15 @@ export class SniperEngine {
     if (p.state === 'closed') this.posEmit.delete(id);
   }
 
-  arm(hasWallet: boolean): { ok: boolean; message: string } {
+  arm(hasWallet: boolean, opts: { keepSession?: boolean } = {}): { ok: boolean; message: string } {
     if (!hasWallet) {
       this.disarm('no_wallet');
       return { ok: false, message: 'Generate and fund a trading wallet first' };
     }
+    // Refused rather than armed into a run of failed signatures. Live stays the
+    // saved mode, so the unlock arms it (syncLiveMode).
+    const locked = wallet.lockReason();
+    if (locked) return { ok: false, message: locked };
     this.armed = true;
     this.armedAt = Date.now();
     this.breakerExitsAllowed = false;
@@ -5968,14 +6195,20 @@ export class SniperEngine {
     // now, so maxLiveSessionLossSol measures this live session.
     this.liveBlockedReason = null;
     this.liveConsecutiveSendFails = 0;
-    this.liveConsecutiveLosses = 0;
-    this.sweptLamports = 0;
-    this.liveBaselineLamports = this.walletBalanceLamports;
-    this.liveBalanceAtLastSell = this.walletBalanceLamports;
-    // Re-arming rebaselines the loss breakers on purpose (above). That also
-    // zeroes what the session ledger shows, so the ledger is told why.
-    this.liveSessionAt = Date.now();
-    this.liveSessionWhy = 'live execution was armed';
+    this.clearLossRearm();
+    // An automatic comeback after a checked upgrade keeps the session's count:
+    // nobody chose to start the loss limit again.
+    if (!(opts.keepSession && this.liveBaselineLamports !== null)) {
+      this.liveConsecutiveLosses = 0;
+      this.lossRearmTries = 0;
+      this.sweptLamports = 0;
+      this.liveBaselineLamports = this.walletBalanceLamports;
+      this.liveBalanceAtLastSell = this.walletBalanceLamports;
+      // Re-arming rebaselines the loss breakers on purpose (above). That also
+      // zeroes what the session ledger shows, so the ledger is told why.
+      this.liveSessionAt = Date.now();
+      this.liveSessionWhy = 'live execution was armed';
+    }
     if (this.liveBaselineLamports === null) void this.captureLiveBaseline();
     this.log('warn', 'live trading ARMED — real transactions will be signed');
     recorder.record('armed', { available: LIVE_EXECUTION_AVAILABLE });
@@ -6011,10 +6244,18 @@ export class SniperEngine {
   }
 
   disarm(reason: DisarmReason): { ok: boolean; message: string } {
+    // Only the upgrade's own disarm keeps its comeback. Anything else stopping
+    // live while the re-check is pending has decided: Live stays off.
+    if (reason !== 'program_upgrade') this.armedWhenUpgradeHit = false;
+    // A person's stop is remembered even when Live was already off, so an AI
+    // cannot switch back on past it (set_trading_mode reads this).
+    if (!this.armed && (reason === 'kill_switch' || reason === 'debugger')) this.lastDisarmReason = reason;
     // A stop the user chose (Paper, the kill switch, a wallet change) ends
     // the breakers' exit-only allowance even when live was already off.
     if (reason === 'user' || reason === 'kill_switch' || reason === 'no_wallet' || reason === 'restart') this.breakerExitsAllowed = false;
     else if (this.armed) this.breakerExitsAllowed = true;
+    // Anything else stopping live ends a comeback planned for a loss limit.
+    if (reason !== 'loss_limit') this.clearLossRearm();
     if (this.armed) {
       this.armed = false;
       this.lastDisarmReason = reason;

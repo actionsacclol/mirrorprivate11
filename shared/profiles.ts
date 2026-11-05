@@ -250,7 +250,7 @@ export const DUPLICATE_DIRS = ['Local Storage', 'card-background'] as const;
  * file cannot be decrypted in the new folder. Pump sessions are per wallet,
  * so they go with the wallets.
  */
-export const WALLET_FILES = ['wallets.json', 'wallet.json', 'evm-wallets.json', 'pump-session.json', 'pump-profiles.json', 'Local State'] as const;
+export const WALLET_FILES = ['wallets.json', 'wallet.json', 'evm-wallets.json', 'vault.json', 'pump-session.json', 'pump-profiles.json', 'Local State'] as const;
 
 /** Never copied from a leveldb folder: the lock the source instance holds. */
 export const SKIP_IN_DIRS = new Set(['LOCK']);

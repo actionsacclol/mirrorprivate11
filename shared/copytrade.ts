@@ -246,9 +246,11 @@ export interface CopyConfig {
    */
   walletId?: string | null;
 
-  /** Stop copying for the day after losing this much (paper or live). */
+  /** Stop copying for the day after losing this much (paper or live). 0 = none,
+   *  which is the default: a limit is the user's to set. Ask dailyLossHit, since
+   *  a bare `realized <= -limit` is true at zero and would stop every copy. */
   dailyLossLimitSol: number;
-  /** Stop after this many copies in a day. */
+  /** Stop after this many copies in a day. 0 = none, the default: ask dailyTradesHit. */
   dailyTradeLimit: number;
   /**
    * Burst wall: at most this many copies in any rolling 60 s (2026-09-09).
@@ -260,7 +262,8 @@ export interface CopyConfig {
    *
    * Optional so a config persisted before this field, or one arriving from an
    * IPC payload that does not carry it yet, still validates; the engine reads
-   * it as DEFAULT_COPIES_PER_MINUTE when absent.
+   * it as DEFAULT_COPIES_PER_MINUTE when absent. 0 = none, the default for a
+   * new follow since 2026-11-04.
    */
   maxCopiesPerMinute?: number | null;
 
@@ -278,6 +281,15 @@ export interface CopyConfig {
    *  the user switches it back on. Null when it is on, or the user paused it. */
   pausedReason?: string | null;
   pausedAt?: number | null;
+  /** What paused it, for auto re-arm (shared/rearm.ts). Main's own. */
+  pausedBy?: 'fails' | 'stop' | 'restart' | null;
+  /** When it comes back on by itself, or null if it stays off. Main's own. */
+  rearmAt?: number | null;
+  /** Comebacks since a copy last landed. Main's own. */
+  rearmTries?: number;
+  /** Comebacks after its loss stop, since the user last switched it on. A copy
+   *  landing does not reset this: only landing copies can lose the stop again. */
+  stopTries?: number;
 
   createdAt: number;
 }
@@ -286,8 +298,8 @@ export interface CopyConfig {
  * Failed LIVE copies in a row that pause a follow (2026-10-23). A buy that
  * was sent and failed — not a filter's skip. Three in a row is a broken
  * route, an empty wallet or a leader on a venue we cannot fill, and every
- * further try costs fees for nothing. Always on: it is a guardrail, not a
- * strategy (GMGN ships the same rule).
+ * further try costs fees for nothing. Slippage failures are left out unless
+ * switched on (`slippagePauses`), and the whole pause is a choice in Auto re-arm.
  */
 export const COPY_FAIL_PAUSE = 3;
 
@@ -305,6 +317,56 @@ export function curveMigrating(message: string): boolean {
   if (/BondingCurveComplete/.test(message)) return true;
   return /graduated/.test(message) && /no PumpSwap pool for this mint/.test(message);
 }
+/**
+ * A failed live sell is tried again by itself (2026-11-04): the bag is real and
+ * a bot left for days has nobody to press Sell. The wait doubles from 30 s up to
+ * an hour, and it keeps going until the sell lands (owner, 2026-11-05). A coin
+ * that truly cannot be sold costs a fee on each try that reaches the chain. Only
+ * the person's own stop ends it, or finding there is nothing it can safely sell.
+ */
+export const SELL_RETRY_PENDING_MS = 120_000;
+/** A send that has not come back after this will not: the chain it runs on is stuck. */
+export const SELL_SEND_HUNG_MS = 3_600_000;
+export function sellRetryWaitMs(tries: number): number {
+  return Math.min(3_600_000, 30_000 * 2 ** Math.min(Math.max(0, tries), 10));
+}
+
+/**
+ * A failure because the price moved past the slippage set: the coin is fast, and
+ * nothing is broken (owner, 2026-11-05: does not stop copying unless switched on).
+ */
+export function slippageFailed(message: string): boolean {
+  return /slippage|TooMuchSolRequired|TooLittleSolReceived|Too little received|INSUFFICIENT_OUTPUT_AMOUNT/i.test(message);
+}
+
+/**
+ * A revert on chain reports only a number, and the number means different things
+ * per program: pump's 6040 is not enough SOL for rent, and PumpSwap's is slippage.
+ * From the published lists (pump-fun/pump-public-docs idl, read 2026-11-05). The
+ * relayer can build for either pump program, so it takes those that are slippage in
+ * one and could not come from a sound trade in the other, and not 6040. Jupiter: its
+ * 6001, which a program it routes through could also give; a real failure read
+ * that way is one not counted toward a pause, nothing more.
+ */
+const SLIPPAGE_CODES: Record<string, number[]> = {
+  local: [6002, 6003, 6042],
+  pumpswap: [6004, 6040],
+  jupiter: [6001],
+  relayer: [6002, 6003, 6004, 6042],
+};
+export function revertIsSlippage(chainError: unknown, source: string): boolean {
+  const code = /"Custom":(\d+)/.exec(JSON.stringify(chainError ?? null))?.[1];
+  return code !== undefined && (SLIPPAGE_CODES[source] ?? []).includes(Number(code));
+}
+
+/** Why a follow paused on failed copies, in words a person can act on. The send
+ *  route notes are dropped: they read as if one route had caused the pause. */
+export function failPauseReason(n: number, message: string): string {
+  const last = message.replace(/\s*\[?[^\[]*\blanes:.*$/s, '').trim().slice(0, 120) || 'no error was given';
+  const jito = /jito/i.test(message) ? ' A Jito error alone is usually not the cause: a copy goes out on several routes at once.' : '';
+  return `${n} copies in a row failed, so it paused to stop paying fees on more tries. The last error: ${last}.${jito}`;
+}
+
 /** How often a sell refused by a migration is tried again, and for how long. */
 export const MIGRATION_RETRY_MS = 15_000;
 export const MIGRATION_WAIT_MAX_MS = 10 * 60_000;
@@ -315,10 +377,13 @@ export const MIGRATION_WAIT_MAX_MS = 10 * 60_000;
  * position at once is five sizes at risk on coins that can go to zero in a
  * minute; the per-follow limits never saw the total. A refusal, recorded.
  */
-export const DEFAULT_MAX_OPEN_COPIES = 5;
+export const DEFAULT_MAX_OPEN_COPIES = 0;
 
-/** Applied when a config does not carry `maxCopiesPerMinute`. */
+/** Applied when a config does not carry `maxCopiesPerMinute` (a follow saved
+ *  before it could be off), and what the form suggests when it is switched on. */
 export const DEFAULT_COPIES_PER_MINUTE = 10;
+/** What the form suggests when the daily copy limit is switched on. */
+export const SUGGESTED_DAILY_COPIES = 20;
 /** Blocked mints / creators per config. */
 export const MAX_BLOCKLIST = 100;
 
@@ -503,6 +568,9 @@ export interface CopyTrade {
   mint: string;
   symbol: string;
   at: number;
+  /** A held sell of this copy was handed to the person, because what is in the
+   *  wallet can no longer be told to be this copy's. No automatic exit touches it. */
+  handedBack?: boolean;
   /** What they did. */
   theirSol: number;
   /** What we did (or would have done). */
@@ -1022,10 +1090,12 @@ export const SIMPLE_MAX_SOL = 5;
  * 10). A median mirrored copy loses 4–7 %, so twenty copies cost about 1–1.4
  * sizes on an ordinary day; three trips on a bad day, not a normal one. Ten
  * let a bad day run to ten whole sizes (wallet-finder research §6).
+ * Only what the form suggests when the user switches the limit on: since
+ * 2026-11-04 a follow has no loss limit unless they do.
  */
 export const SIMPLE_LOSS_MULTIPLE = 3;
 /** The per-wallet stop as a multiple of the size: four sizes lost since the
- *  follow was switched on pauses that follow alone. */
+ *  follow was switched on pauses that follow alone. Suggested the same way. */
 export const SIMPLE_WALLET_STOP_MULTIPLE = 4;
 /**
  * The missed-sell backstop on every simple follow (2026-10-23): a copy still
@@ -1107,8 +1177,8 @@ export function followConfig(
     sizing: pct ? 'proportional' : 'fixed',
     sizeValue: pct ? share : most,
     maxTradeSol: most,
-    dailyLossLimitSol: Math.round(most * SIMPLE_LOSS_MULTIPLE * 1_000) / 1_000,
-    walletLossStopSol: Math.round(most * SIMPLE_WALLET_STOP_MULTIPLE * 1_000) / 1_000,
+    dailyLossLimitSol: 0,
+    walletLossStopSol: null,
     copySells: true,
     exitMaxHoldMin: SIMPLE_BACKSTOP_MIN,
     // Every size, not only small copies (2026-10-25): mirroring a trim under
@@ -1183,10 +1253,21 @@ export function defaultConfig(wallet: string, label: string, chain: ChainKind = 
     maxSlippagePct: 8,
     copySells: true,
     walletId: null,
-    dailyLossLimitSol: 0.25,
-    dailyTradeLimit: 20,
-    maxCopiesPerMinute: DEFAULT_COPIES_PER_MINUTE,
+    dailyLossLimitSol: 0,
+    // Every limit is the user's to set (2026-11-04): none unless they do.
+    dailyTradeLimit: 0,
+    maxCopiesPerMinute: 0,
   };
+}
+
+/** Has today's result reached this follow's daily loss limit? Never, with none set. */
+export function dailyLossHit(c: Pick<CopyConfig, 'dailyLossLimitSol'>, realized: number): boolean {
+  return c.dailyLossLimitSol > 0 && realized <= -c.dailyLossLimitSol;
+}
+
+/** Are today's copies used up? Never, with no limit set. */
+export function dailyTradesHit(c: Pick<CopyConfig, 'dailyTradeLimit'>, used: number): boolean {
+  return c.dailyTradeLimit > 0 && used >= c.dailyTradeLimit;
 }
 
 export function validateConfig(c: Omit<CopyConfig, 'id' | 'createdAt'>): { ok: boolean; message: string } {
@@ -1238,14 +1319,14 @@ export function validateConfig(c: Omit<CopyConfig, 'id' | 'createdAt'>): { ok: b
   if (c.maxSlippagePct <= 0 || c.maxSlippagePct > 50) {
     return { ok: false, message: 'Slippage must be between 0% and 50%' };
   }
-  if (!(c.dailyLossLimitSol > 0)) return { ok: false, message: 'Set a daily loss limit' };
-  if (!(c.dailyTradeLimit > 0) || c.dailyTradeLimit > 500) {
-    return { ok: false, message: 'Daily trade limit must be between 1 and 500' };
+  if (!(c.dailyLossLimitSol >= 0)) return { ok: false, message: 'The daily loss limit cannot be negative' };
+  if (!(c.dailyTradeLimit >= 0) || c.dailyTradeLimit > 500) {
+    return { ok: false, message: 'Daily trade limit must be between 1 and 500, or 0 for none' };
   }
   // Absent is allowed and means the default; present must be sane.
   if (c.maxCopiesPerMinute !== undefined && c.maxCopiesPerMinute !== null) {
-    if (!(c.maxCopiesPerMinute > 0) || c.maxCopiesPerMinute > 120) {
-      return { ok: false, message: 'Copies per minute must be between 1 and 120' };
+    if (!(c.maxCopiesPerMinute >= 0) || c.maxCopiesPerMinute > 120) {
+      return { ok: false, message: 'Copies per minute must be between 1 and 120, or 0 for none' };
     }
   }
   const stop = c.walletLossStopSol;

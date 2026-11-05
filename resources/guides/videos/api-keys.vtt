@@ -1,41 +1,41 @@
 WEBVTT
 
 1
-00:00:00.967 --> 00:00:09.989
-Krypto Mirror runs with no keys at all. Keys make it faster and unlock a little more data. Every key lives in one place: Settings, under API keys.
+00:00:00.968 --> 00:00:11.786
+Krypto Mirror runs with no keys at all. An API key is a free pass to a data service, and it makes the app faster. Every key lives in one place: Settings, under API keys.
 
 2
-00:00:10.694 --> 00:00:18.004
+00:00:12.494 --> 00:00:19.804
 Helius first. It is the biggest speed upgrade: trades are heard sooner and copies land faster, and the free plan is enough.
 
 3
-00:00:18.726 --> 00:00:28.113
-Get a free key at helius.dev: create an account, open the dashboard, and copy the API key. You can paste the key itself or the whole RPC URL.
+00:00:20.523 --> 00:00:28.964
+Get a free key at helius.dev: create an account, open the dashboard, and copy the API key. You can paste the key itself or the whole link.
 
 4
-00:00:28.820 --> 00:00:33.152
+00:00:29.670 --> 00:00:34.002
 Paste it here and save. The app shows only the last four characters afterwards.
 
 5
-00:00:35.800 --> 00:00:41.589
+00:00:36.476 --> 00:00:42.265
 Check the key asks Helius directly and tells you whether it works. The key goes to Helius and nowhere else.
 
 6
-00:00:42.407 --> 00:00:49.365
+00:00:43.054 --> 00:00:50.012
 The meter under it tracks this month’s credits and the share the app may spend on chain reads. The free plan gives a million a month.
 
 7
-00:00:50.067 --> 00:01:01.523
-Jupiter is free too. A key moves every quote off lite-api.jup.ag, which Jupiter is retiring, onto api.jup.ag. Make one at portal.jup.ag.
+00:00:50.725 --> 00:01:01.145
+Jupiter is free too. It gives the prices for your buys and sells. Without a key the app uses an old Jupiter address that is being shut down. Make a key at portal.jup.ag.
 
 8
-00:01:02.244 --> 00:01:08.605
-Birdeye is optional: sub-minute price candles, holder lists and trade history. Everything else works without it.
+00:01:01.854 --> 00:01:09.738
+More keys unfolds the optional ones. Birdeye adds charts shorter than a minute, holder lists and trade history. Everything else works without it.
 
 9
-00:01:09.371 --> 00:01:16.753
-GIPHY and Tenor only matter for callout GIFs on pump.fun. Alchemy, for Robinhood Chain, is set under EVM chains.
+00:01:10.466 --> 00:01:18.673
+GIPHY and Tenor only matter for callout GIFs on pump.fun. Alchemy, for Robinhood Chain, is set under Advanced, in EVM chains.
 
 10
-00:01:19.516 --> 00:01:26.422
-Keys are stored on this machine only, never sent to Krypt, and stripped from recordings. Replace or remove one any time.
+00:01:20.963 --> 00:01:28.025
+Keys stay on this computer, and each one goes only to its own service, never to Krypt. Replace or remove one any time.

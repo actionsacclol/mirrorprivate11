@@ -103,7 +103,7 @@ export const es: Catalogue = {
   'settings.dataCollection': 'Recolección de datos',
   'settings.creatorBlocklist': 'Lista de bloqueo de creadores',
   'settings.feesAndReferral': 'Comisiones y referidos',
-  'settings.subtitle': 'Proveedores de datos, endpoints RPC.',
+  'settings.subtitle': 'Lo básico está arriba. Todo lo demás está en Advanced, al final.',
 
   'settings.theme': 'Tema',
   'settings.themeHint': 'Elige un estilo — tipografías, superficies, esquinas, efectos — y luego un color de acento. El verde de subida, el rojo de bajada y el dorado del dinero se mantienen igual.',

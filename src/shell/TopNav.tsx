@@ -7,8 +7,7 @@
 // Live always asks first.
 
 import { useEffect, useRef, useState } from 'react';
-import { Activity, BookOpen, Bot, Check, Compass, Home, Moon, ScanSearch, Settings as SettingsIcon, Sun, Users, Wallet as WalletIcon } from 'lucide-react';
-import type { WalletSummary } from '@shared/types';
+import { Activity, BookOpen, Bot, Compass, Home, Moon, ScanSearch, Settings as SettingsIcon, Sun, Users, Wallet as WalletIcon } from 'lucide-react';
 import { EVM_CHAIN_META, isEvmChain, nativeSymbolOf, type ChainKind, type EvmChainKind } from '@shared/evm';
 import { useAppState } from '../state/AppStateProvider';
 import { useTerminal } from '../state/TerminalProvider';
@@ -22,6 +21,8 @@ import { fmtNative } from '../utils/evm';
 import { cls, shortAddr } from '../utils/format';
 import { useNav, type RouteId } from '../state/nav';
 import { PaperBalanceChip } from '../components/copy/PaperBankroll';
+import { WalletCard } from '../components/WalletCard';
+import { VaultChip } from '../components/VaultPanel';
 
 const ITEMS: Array<{ id: RouteId; label: string; icon: typeof Home }> = [
   { id: 'home', label: 'Home', icon: Home },
@@ -146,35 +147,34 @@ function Balance({ onOpen }: { onOpen: () => void }) {
   const { evm, refresh } = useEvmState(evmChain);
   const [addr, setAddr] = useState<string | null>(null);
   const [sol, setSol] = useState<number | null>(null);
-  // The wallet switcher (2026-10-28): every Solana wallet, its balance and its
-  // pump.fun account, one click to make it the active one. The rule that
-  // refuses a switch while live is armed stays in the main process.
-  const nav = useNav();
-  const toast = useToast();
-  const [menu, setMenu] = useState(false);
-  const [wallets, setWallets] = useState<WalletSummary[]>([]);
-  const [pumpNames, setPumpNames] = useState<Record<string, string>>({});
-  const box = useRef<HTMLDivElement>(null);
+  const [cardOpen, setCardOpen] = useState(false);
   const statusRef = useRef(status);
   statusRef.current = status;
 
   // Solana: the engine's figure while it runs (pushed every second), a
   // direct read otherwise — every 60 s is enough to notice a deposit.
+  //
+  // wallet.info() only answers from a cache, and with the scanner stopped and
+  // live disarmed nothing refills it but the Wallet page's own poll: a deposit
+  // never reached this chip on any other page (user report 2026-11-03). So the
+  // direct read asks the chain; info() is the fallback for a failed read and
+  // for "no wallet", which the refresh reports as a failure.
   useEffect(() => {
     let alive = true;
-    const read = (force = false): void => {
+    const read = async (force = false): Promise<void> => {
       const st = statusRef.current;
       const engineHas = st.running && st.walletBalanceSol !== null && st.walletBalanceSol !== undefined;
-      void window.krypt.wallet.info().then((r) => {
-        if (!alive || !r.ok || !r.data) return;
-        setAddr(r.data.publicKey);
-        if (force || !engineHas) setSol(r.data.balanceSol);
-      });
+      const askChain = force || !engineHas;
+      const fresh = askChain ? await window.krypt.wallet.refreshBalance() : null;
+      const r = fresh?.ok && fresh.data ? fresh : await window.krypt.wallet.info();
+      if (!alive || !r.ok || !r.data) return;
+      setAddr(r.data.publicKey);
+      if (askChain) setSol(r.data.balanceSol);
     };
-    read(true);
-    const t = setInterval(() => read(), 60_000);
+    void read(true);
+    const t = setInterval(() => void read(), 60_000);
     const off = window.krypt.engine.onEvent((ev) => {
-      if (ev.kind === 'walletSwitched') read(true);
+      if (ev.kind === 'walletSwitched') void read(true);
     });
     return () => {
       alive = false;
@@ -208,99 +208,30 @@ function Balance({ onOpen }: { onOpen: () => void }) {
       })();
   const who = evmChain ? evm?.wallet.address ?? null : addr;
 
-  const loadWallets = (): void => {
-    void window.krypt.wallet.list().then((r) => r.ok && r.data && setWallets(r.data));
-  };
-  useEffect(() => loadWallets(), [addr]);
-  useEffect(() => {
-    if (!menu) return;
-    const down = (e: MouseEvent): void => {
-      if (box.current && !box.current.contains(e.target as Node)) setMenu(false);
-    };
-    const key = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') setMenu(false);
-    };
-    document.addEventListener('mousedown', down);
-    document.addEventListener('keydown', key);
-    return () => {
-      document.removeEventListener('mousedown', down);
-      document.removeEventListener('keydown', key);
-    };
-  }, [menu]);
-  const openMenu = (): void => {
-    loadWallets();
-    void window.krypt.pump.status().then((r) => {
-      if (!r.ok || !r.data) return;
-      const names: Record<string, string> = {};
-      for (const s of r.data.sessions) names[s.walletId] = s.username ? `@${s.username}` : 'pump.fun account';
-      setPumpNames(names);
-    });
-    setMenu(true);
-  };
-  const pick = async (id: string): Promise<void> => {
-    const r = await window.krypt.wallet.select(id);
-    if (!r.ok) return void toast.error(r.message);
-    toast.success(r.message);
-    setMenu(false);
-    loadWallets();
-  };
-  const go = (walletTab: 'solana' | 'pump'): void => {
-    setMenu(false);
-    nav.go('wallet', { walletTab });
-  };
-  // A menu once there is a Solana wallet to show; otherwise straight to setup.
-  const switcher = !evmChain && wallets.length > 0;
-
   return (
-    <div ref={box} className="relative">
+    <>
       {/* The balance alone, on one line (2026-10-28): the address under it was
           squeezed by the bar's height and the two lines cut each other off.
-          The address is in the tooltip and the switcher. */}
+          The address is on the wallet card it opens. No wallet: straight to setup. */}
       <button
-        onClick={() => (switcher ? (menu ? setMenu(false) : openMenu()) : onOpen())}
+        onClick={() => (who ? setCardOpen(true) : onOpen())}
         className="flex h-9 items-center whitespace-nowrap rounded-lg px-2.5 text-body font-semibold tabular-nums text-white transition hover:bg-white/5"
-        title={who ? (switcher ? `Your wallet ${shortAddr(who, 4)} — switch wallets` : `Your wallet ${shortAddr(who, 4)} — open it`) : 'Set up a wallet'}
-        aria-expanded={switcher ? menu : undefined}
+        title={who ? `Your wallet ${shortAddr(who, 4)} — open the wallet card` : 'Set up a wallet'}
+        aria-haspopup={who ? 'dialog' : undefined}
         data-testid="nav-balance"
       >
         {value}
       </button>
-      {menu && (
-        <div className="absolute right-0 top-11 z-50 w-80 rounded-xl border border-white/10 bg-card p-1.5 shadow-soft" data-testid="nav-wallets">
-          <div className="px-2.5 pb-1 pt-1.5 text-label text-krypt-muted">Trading wallet</div>
-          {wallets.map((w) => (
-            <button
-              key={w.id}
-              onClick={() => void (w.active ? go('solana') : pick(w.id))}
-              className={cls('flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition', w.active ? 'bg-accent/10' : 'hover:bg-white/5')}
-              data-testid="nav-wallet-row"
-            >
-              <span className="flex h-4 w-4 flex-shrink-0 items-center justify-center text-accent">{w.active && <Check className="h-4 w-4" />}</span>
-              <span className="min-w-0 flex-1">
-                <span className="block truncate text-note font-semibold text-white">{w.label || 'Wallet'}</span>
-                <span className="block truncate text-label text-krypt-muted">
-                  <span className="font-mono">{shortAddr(w.publicKey)}</span>
-                  {' · '}
-                  {pumpNames[w.id] ?? 'no pump.fun account'}
-                </span>
-              </span>
-              <span className="font-mono text-note tabular-nums text-white/85">{w.balanceSol != null ? `${w.balanceSol.toFixed(3)}` : '—'}</span>
-            </button>
-          ))}
-          <p className="px-2.5 pb-1 pt-1.5 text-label leading-relaxed text-krypt-muted/80">
-            Follows set to “Active wallet” copy with the one ticked. Switching waits until live is off and their open live copies have closed.
-          </p>
-          <div className="mt-1 flex gap-1 border-t border-white/8 pt-1.5">
-            <button onClick={() => go('solana')} className="flex-1 rounded-lg px-2.5 py-1.5 text-note text-white/90 transition hover:bg-white/5" data-testid="nav-wallets-manage">
-              Add or manage
-            </button>
-            <button onClick={() => go('pump')} className="flex-1 rounded-lg px-2.5 py-1.5 text-note text-white/90 transition hover:bg-white/5" data-testid="nav-wallets-pump">
-              pump.fun accounts
-            </button>
-          </div>
-        </div>
+      {cardOpen && (
+        <WalletCard
+          key={chain}
+          chain={chain}
+          onClose={() => setCardOpen(false)}
+          onSolBalance={setSol}
+          onEvmChanged={refresh}
+        />
       )}
-    </div>
+    </>
   );
 }
 
@@ -354,6 +285,7 @@ export function TopNav({ current }: { current: RouteId }) {
         <ChainPicker />
         <ModeSwitch />
         {chain === 'solana' && !status.liveActive && <PaperBalanceChip onOpen={() => nav.go('settings')} />}
+        <VaultChip />
         <Balance onOpen={() => nav.go('wallet')} />
         <AppearanceToggle />
         {/* The Guides (tutorial videos) live under Settings; this is their own door. */}

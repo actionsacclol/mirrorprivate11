@@ -38,6 +38,8 @@ export function SendCard({
   className,
   bare,
   onSent,
+  initialTo,
+  onBusyChange,
 }: {
   chain: ChainKind;
   /** Why sending is unavailable here (shown instead of the form). */
@@ -47,10 +49,14 @@ export function SendCard({
   bare?: boolean;
   /** After a send went out — e.g. to refresh a balance shown elsewhere. */
   onSent?: () => void;
+  /** Fills the recipient at first, e.g. the saved withdrawal address. */
+  initialTo?: string | null;
+  /** True while a send is in flight, so a host can stay open for its result. */
+  onBusyChange?: (busy: boolean) => void;
 }) {
   const toast = useToast();
   const [assets, setAssets] = useState<Asset[]>([]);
-  const [to, setTo] = useState('');
+  const [to, setTo] = useState(initialTo ?? '');
   const [token, setToken] = useState<string | null>(null);
   // "Other token…": any mint / contract, typed — for tokens the lists above
   // do not carry (a stablecoin someone sent in, say).
@@ -167,9 +173,11 @@ export function SendCard({
   const send = async (): Promise<void> => {
     if (!ready || !review) return;
     setSending(true);
+    onBusyChange?.(true);
     setError(null);
     const r = await window.krypt.wallet.sendExecute(req());
     setSending(false);
+    onBusyChange?.(false);
     if (r.data) setLast(r.data);
     if (r.data?.txid) setLastTo(toTrim);
     void loadBook();

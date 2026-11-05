@@ -22,6 +22,27 @@ function sha256(file) {
   return crypto.createHash('sha256').update(buf).digest('hex');
 }
 
+/**
+ * The document the app's "is this the right app?" check reads. Publish it at
+ * krypt.cc/mirror/version.json with each release. A build made on another
+ * machine adds its own line to `builds`. Hashes the shipped app.asar, the file
+ * the installed app can hash for itself; the installer's own hash is in
+ * SHA256SUMS.txt.
+ */
+function versionDoc(outDir) {
+  const { version } = require('../package.json');
+  const builds = {};
+  const add = (platform, file) => {
+    if (fs.existsSync(file)) builds[platform] = sha256(file);
+  };
+  add('win32-x64', path.join(outDir, 'win-unpacked', 'resources', 'app.asar'));
+  add('win32-arm64', path.join(outDir, 'win-arm64-unpacked', 'resources', 'app.asar'));
+  add('linux-x64', path.join(outDir, 'linux-unpacked', 'resources', 'app.asar'));
+  add('darwin-x64', path.join(outDir, 'mac', 'Krypto Mirror.app', 'Contents', 'Resources', 'app.asar'));
+  add('darwin-arm64', path.join(outDir, 'mac-arm64', 'Krypto Mirror.app', 'Contents', 'Resources', 'app.asar'));
+  return { version, builds };
+}
+
 module.exports = async function afterAllArtifactBuild(result) {
   // result.artifactPaths: absolute paths to every artifact just built.
   // result.outDir: the release directory (fallback for where to write).
@@ -42,6 +63,13 @@ module.exports = async function afterAllArtifactBuild(result) {
   console.log(`  checksums: wrote SHA256SUMS.txt for ${targets.length} artifact(s)`);
   for (const l of lines) console.log(`    ${l}`);
 
+  const docPath = path.join(outDir, 'version.json');
+  const doc = versionDoc(outDir);
+  fs.writeFileSync(docPath, `${JSON.stringify(doc, null, 2)}\n`, 'utf8');
+  console.log(`  version doc: wrote version.json for ${doc.version} (${Object.keys(doc.builds).join(', ') || 'no builds found'})`);
+
   // Returned paths are treated by electron-builder as additional artifacts.
-  return [sumsPath];
+  return [sumsPath, docPath];
 };
+
+module.exports.versionDoc = versionDoc;
